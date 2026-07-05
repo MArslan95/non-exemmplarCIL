@@ -1,0 +1,45 @@
+# ===========================================
+# NECIL-HSI Environment Requirements
+# ===========================================
+
+# Core Deep Learning (PyTorch with CUDA 12.6)
+# Install PyTorch first with:
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# Then install remaining requirements:
+# pip install -r requirements.txt
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# Data Loading
+h5py>=3.8.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Image Processing
+opencv-python>=4.7.0
+Pillow>=9.4.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Logging & Experiment Tracking
+tensorboard>=2.12.0
+wandb>=0.14.0
+
+# Utilities
+einops>=0.6.0
+
+# Testing
+pytest>=7.2.0
+
+python main.py --dataset IP --data_dir ./datasets --save_dir ./results_pg_rga_base_only_v1 --patch_size 11 --pca_components 30 --base_classes 6 --increment 6 --epochs_base 80 --epochs_inc 0 --base_only true --batch_size 64 --lr 1e-4 --lr_inc 0.0 --d_model 128 --subspace_rank 5 --base_ce_weight 1.0 --base_srpgr_weight 1.0 --base_gics_weight 0.20 --pgr_weight 0.10 --pgr_compact_weight 0.15 --pgr_center_weight 0.25 --pgr_subspace_weight 0.20 --pgr_band_weight 0.10 --pgr_volume_weight 0.05 --pgr_center_margin 1.10 --pgr_band_overlap_max 0.60 --pgr_max_subspace_overlap 0.55 --pgr_min_class_variance 0.015 --pgr_max_class_variance 0.75 --base_spectral_shape_weight 0.10 --base_require_physical_spectral_shape true --geom_var_floor 5e-4 --geometry_variance_shrinkage 0.25 --geometry_max_variance_ratio 50.0 --rank_energy_threshold 0.90 --rank_eigen_ratio_threshold 1e-2 --min_active_rank 1 --classifier_mode geometry_only --base_classifier_mode geometry_only --incremental_classifier_mode geometry_only --eval_classifier_mode geometry_only --incremental_update_mode geometry_gated_adapter --strict_non_exemplar true --strict_feature_contract true --strict_updated_stack true --strict_base_component_coverage true --base_class_balance true --freeze_projection_during_incremental true --allow_incremental_projection_training false --use_geometry_transport false --use_sglat_transport false --allow_old_model_transport false --use_energy_calibrator false --use_adaptive_boundary false --save_geometry_diagnostics true --save_classification_report true --save_final_classification_report true --viz_class_cmap nipy_spectral --seed 42

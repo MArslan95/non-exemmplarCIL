@@ -1,0 +1,6 @@
+datasets/
+*.log
+*.ckpt  
+checkpoints/
+results/*
+results_*/
