@@ -5,7 +5,7 @@ import json
 import math
 import os
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,7 @@ def _finite(x: torch.Tensor, name: str) -> torch.Tensor:
 
 
 class IncrementalPhaseTrainer:
-    """Clean descriptor-only incremental trainer for NECIL-HSI.
+    """Spectral-coupled descriptor-only incremental trainer for NECIL-HSI.
 
     Main-path contract
     ------------------
@@ -43,9 +43,11 @@ class IncrementalPhaseTrainer:
     * Old GeometryBank rows are frozen and checked after every mutating operation.
     * New rows may be inserted/refined; old rows may not move.
 
-    The default path is descriptor-only / SCBGR.  A bounded geometry-gated adapter
-    is left as an explicit ablation, but old-row affine/SGLAT transport is disabled
-    in the clean path because it mutates frozen memory.
+    The SCTGR-RGA path keeps the certified base z-space fixed, builds paired
+    physical-spectral/feature geometry for every new class, replays old classes
+    through spectral-consistent core and risk-directed spectral tangent samples,
+    and refines only bounded new descriptor parameters. Feature adapters,
+    transport, calibrators, KD, shell replay, and raw exemplars are forbidden.
     """
 
     # ------------------------------------------------------------------
@@ -66,20 +68,25 @@ class IncrementalPhaseTrainer:
         return _as_bool(getattr(self, name, getattr(self.args, name, default)))
 
     def _classifier_mode(self) -> str:
-        mode = str(getattr(self.args, "incremental_classifier_mode", "geometry")).lower().strip()
-        aliases = {
-            "geometry_only": "geometry",
-            "calibrated_geometry": "calibrated_geometry",
-            "topology_calibrated_geometry": "calibrated_geometry",
-            "anchor": "geometry",
-            "anchor_concept": "geometry",
-            "srgp": "geometry",
-        }
-        return aliases.get(mode, mode)
+        """Clean incremental path uses geometry-only scoring.
 
-    # ------------------------------------------------------------------
-    # Phase/class resolution and label mapping
-    # ------------------------------------------------------------------
+        Calibrated/topology/anchor aliases are intentionally rejected here so a
+        command cannot silently switch the classifier away from the GeometryBank
+        energy field produced by the certified base phase.
+        """
+        mode = str(getattr(self.args, "incremental_classifier_mode", "geometry_only")).lower().strip()
+        aliases = {
+            "": "geometry",
+            "geometry_only": "geometry",
+            "geometry": "geometry",
+        }
+        mode = aliases.get(mode, mode)
+        if mode != "geometry":
+            raise RuntimeError(
+                f"Unsupported incremental_classifier_mode={mode!r}. "
+                "Use geometry_only/geometry for the clean SCTGR-RGA incremental path."
+            )
+        return "geometry"
     def _ordered_unique(self, values: Iterable[int]) -> List[int]:
         out: List[int] = []
         seen = set()
@@ -174,40 +181,52 @@ class IncrementalPhaseTrainer:
     # ------------------------------------------------------------------
     # Canonical feature extraction and classifier scoring
     # ------------------------------------------------------------------
-    def _prepare_real_spectral_summary(self, x: torch.Tensor, spectra: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], bool]:
+    def _prepare_real_spectral_summary(
+        self,
+        x: torch.Tensor,
+        spectra: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        """Return aligned physical centre spectra for spectral-coupled replay.
+
+        PCA affects the model input only. Raw centre spectra with a different width
+        remain physical metadata and are required to fit the spectral tangent and
+        spectral-to-feature coupling. A same-width tensor under PCA is treated as
+        non-physical unless explicitly allowed.
+        """
         if not torch.is_tensor(spectra) or spectra.numel() == 0:
             return None, False
-        s = spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
+        s = spectra.to(device=x.device, dtype=torch.float32, non_blocking=True)
         if s.dim() == 4:
             s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
         elif s.dim() == 3:
-            # [B,S,L] metadata: use the center token/spectrum.
-            # Flattening would mix neighboring pixels into the spectral summary
-            # and corrupt spectral-shape/risk calculations.
-            if s.size(0) == x.size(0) and s.size(1) > 0 and s.size(2) > 1:
+            if s.size(0) == x.size(0) and s.size(1) > 0:
                 s = s[:, :, s.size(-1) // 2]
             else:
-                s = s.reshape(s.size(0), -1)
+                s = s.flatten(1)
         elif s.dim() == 1:
-            if s.numel() % max(int(x.size(0)), 1) == 0:
-                s = s.view(x.size(0), -1)
-            else:
+            if s.numel() % max(int(x.size(0)), 1) != 0:
                 return None, False
+            s = s.view(x.size(0), -1)
         elif s.dim() > 4:
             s = s.flatten(1)
-        if s.size(0) != x.size(0):
+        if s.dim() != 2 or s.size(0) != x.size(0):
             return None, False
-        # Raw metadata from the dataloader can stay physical even when model
-        # input uses PCA. PCA channels themselves are never physical spectra.
-        physical = self._inc_cfg_bool(
-            "incremental_spectral_summary_is_physical",
-            self._inc_cfg_bool("raw_spectral_summary_is_physical", False),
-        )
-        input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
+        s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+
+        input_channels = int(x.size(1)) if x.dim() >= 2 else 0
         pca_active = int(getattr(self.args, "pca_components", 0) or 0) > 0 and not bool(getattr(self.args, "no_pca", False))
+        explicit = getattr(self.args, "incremental_spectral_summary_is_physical", None)
+        if explicit is None:
+            explicit = getattr(self.args, "raw_spectral_summary_is_physical", None)
+        if explicit is None:
+            physical = not (pca_active and input_channels > 0 and int(s.size(1)) == input_channels)
+        else:
+            physical = _as_bool(explicit)
+        if self._inc_cfg_bool("force_nonphysical_spectral_summary", False):
+            physical = False
         if pca_active and input_channels > 0 and int(s.size(1)) == input_channels and not self._inc_cfg_bool("allow_nonphysical_spectral_summary", False):
             physical = False
-        return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), bool(physical)
+        return s, bool(physical)
 
     def extract_incremental_features(self, x: torch.Tensor, spectra: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         x = x.float().to(self.device, non_blocking=True)
@@ -275,6 +294,7 @@ class IncrementalPhaseTrainer:
         new_classes: Optional[Sequence[int]] = None,
         targets_local: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor | Dict[str, float]]:
+        """Score exactly the requested seen classes; global-width fallbacks are forbidden."""
         features = _finite(features.float(), "features for seen logits")
         if features.dim() != 2:
             raise RuntimeError(f"features must be [B,D], got {tuple(features.shape)}")
@@ -284,27 +304,25 @@ class IncrementalPhaseTrainer:
         self.assert_geometry_exists(seen, context="compute_seen_logits")
         mode = str(mode or self._classifier_mode()).lower().strip()
         mode = "geometry" if mode == "geometry_only" else mode
-        out: Any
+        if mode != "geometry":
+            raise RuntimeError(f"Only geometry scoring is supported, got {mode!r}.")
         if hasattr(self.model, "compute_logits_from_features"):
-            try:
-                out = self.model.compute_logits_from_features(
-                    features,
-                    seen_classes=seen,
-                    geometry_bank=getattr(self.model, "geometry_bank", None),
-                    mode=mode,
-                    old_classes=list(old_classes or []),
-                    new_classes=list(new_classes or []),
-                    targets=targets_local,
-                    return_diagnostics=return_diagnostics,
-                )
-            except TypeError:
-                out = self.model.compute_logits_from_features(features, classifier_mode=mode)
+            out = self.model.compute_logits_from_features(
+                features,
+                seen_classes=seen,
+                geometry_bank=self._bank_object(),
+                mode="geometry",
+                old_classes=list(old_classes or []),
+                new_classes=list(new_classes or []),
+                targets=targets_local,
+                return_diagnostics=return_diagnostics,
+            )
         elif hasattr(self.model, "classifier"):
             out = self.model.classifier(
                 features,
                 seen_classes=seen,
-                geometry_bank=getattr(self.model, "geometry_bank", None),
-                mode=mode,
+                geometry_bank=self._bank_object(),
+                mode="geometry",
                 old_classes=list(old_classes or []),
                 new_classes=list(new_classes or []),
                 targets=targets_local,
@@ -312,39 +330,30 @@ class IncrementalPhaseTrainer:
             )
         else:
             raise AttributeError("model must expose compute_logits_from_features() or classifier().")
-
-        if isinstance(out, dict):
-            logits = out.get("logits", None)
-            result = dict(out)
-        else:
-            logits = out
-            result = {"logits": logits}
+        result = dict(out) if isinstance(out, dict) else {"logits": out}
+        logits = result.get("logits", None)
         if not torch.is_tensor(logits):
             raise RuntimeError("Classifier output does not contain tensor logits.")
         logits = _finite(logits.float(), "seen logits")
-        # Clean classifier returns [B, len(seen)].  Legacy classifier may return full global width; convert once here.
-        if logits.dim() != 2:
-            raise RuntimeError(f"logits must be [B,C], got {tuple(logits.shape)}")
-        if logits.size(0) != features.size(0):
-            raise RuntimeError(f"logit batch {logits.size(0)} != feature batch {features.size(0)}")
-        if logits.size(1) == len(seen):
-            seen_logits = logits
-        elif logits.size(1) > max(seen):
-            idx = torch.as_tensor(seen, device=logits.device, dtype=torch.long)
-            seen_logits = logits.index_select(1, idx)
-        else:
+        expected = (features.size(0), len(seen))
+        if tuple(logits.shape) != expected:
             raise RuntimeError(
-                f"Classifier logits width={logits.size(1)} cannot represent seen_classes={seen}. "
-                "Use repaired classifier with explicit seen_classes."
+                f"Geometry classifier must return exact seen-local logits {expected}; got {tuple(logits.shape)}. "
+                "Do not return global logits and slice them in the trainer."
             )
-        if seen_logits.size(1) != len(seen):
-            raise RuntimeError("Internal error: seen logits width mismatch.")
-        result["logits"] = _finite(seen_logits, "seen logits")
+        result["logits"] = logits
         if targets_local is not None:
-            self.assert_valid_seen_targets(targets_local.to(seen_logits.device), len(seen), context="seen logits CE")
+            self.assert_valid_seen_targets(targets_local.to(logits.device), len(seen), context="seen logits CE")
         return result
 
-    def _stable_ce_seen(self, logits_seen: torch.Tensor, labels_global: torch.Tensor, seen_classes: Sequence[int], context: str) -> torch.Tensor:
+    def _stable_ce_seen(
+        self,
+        logits_seen: torch.Tensor,
+        labels_global: torch.Tensor,
+        seen_classes: Sequence[int],
+        context: str,
+    ) -> torch.Tensor:
+        """Class-balanced CE so class count, replay count, and imbalance cannot bias training."""
         logits_seen = _finite(logits_seen.float(), f"{context} logits")
         if logits_seen.dim() != 2 or logits_seen.size(1) != len(seen_classes):
             raise RuntimeError(f"{context}: logits must be [B,{len(seen_classes)}], got {tuple(logits_seen.shape)}")
@@ -353,18 +362,23 @@ class IncrementalPhaseTrainer:
         if labels_local.numel() != logits_seen.size(0):
             raise RuntimeError(f"{context}: label/logit batch mismatch {labels_local.numel()} vs {logits_seen.size(0)}")
         clip = self._inc_cfg_float("ce_logit_clip", 50.0)
-        return F.cross_entropy(
-            logits_seen.clamp(-clip, clip),
-            labels_local,
+        per_sample = F.cross_entropy(
+            logits_seen.clamp(-clip, clip), labels_local, reduction="none",
             label_smoothing=self._inc_cfg_float("label_smoothing", 0.0),
         )
+        class_losses = [per_sample[labels_local == c].mean() for c in torch.unique(labels_local, sorted=True)]
+        return torch.stack(class_losses).mean()
 
     # Backward-compatible old helper: expects local labels for seen-width logits.
     def _stable_ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         labels = labels.to(device=logits.device).long().view(-1)
         self.assert_valid_seen_targets(labels, logits.size(1), context="legacy CE")
         clip = self._inc_cfg_float("ce_logit_clip", 50.0)
-        return F.cross_entropy(logits.clamp(-clip, clip), labels, label_smoothing=self._inc_cfg_float("label_smoothing", 0.0))
+        per_sample = F.cross_entropy(
+            logits.clamp(-clip, clip), labels, reduction="none",
+            label_smoothing=self._inc_cfg_float("label_smoothing", 0.0),
+        )
+        return torch.stack([per_sample[labels == c].mean() for c in torch.unique(labels, sorted=True)]).mean()
 
     # ------------------------------------------------------------------
     # GeometryBank access and immutability checks
@@ -377,21 +391,18 @@ class IncrementalPhaseTrainer:
 
     def _bank_dict(self) -> Dict[str, torch.Tensor]:
         gb = self._bank_object()
-        if hasattr(gb, "get_seen_class_bank"):
-            # Use all currently allocated rows when possible.
-            try:
-                counts = getattr(gb, "sample_counts", None)
-                if torch.is_tensor(counts):
-                    ids = list(range(int(counts.numel())))
-                    return gb.get_seen_class_bank(ids)
-            except Exception:
-                pass
-        if hasattr(gb, "get_subspace_bank"):
+        if hasattr(gb, "get_bank"):
+            bank = gb.get_bank()
+        elif hasattr(gb, "get_subspace_bank"):
             bank = gb.get_subspace_bank()
         elif hasattr(self.model, "get_subspace_bank"):
             bank = self.model.get_subspace_bank()
         else:
-            bank = {name: getattr(gb, name) for name in ("means", "bases", "eigvals", "res_vars", "sample_counts", "active_ranks") if torch.is_tensor(getattr(gb, name, None))}
+            names = (
+                "means", "bases", "eigvals", "res_vars", "sample_counts", "active_ranks",
+                "reliability", "spectral_prototypes", "band_importances",
+            )
+            bank = {name: getattr(gb, name) for name in names if torch.is_tensor(getattr(gb, name, None))}
         if not isinstance(bank, dict):
             raise RuntimeError("GeometryBank export must be a dict.")
         return self._canonical_bank_dict(bank)
@@ -406,8 +417,25 @@ class IncrementalPhaseTrainer:
             "sample_counts": ("sample_counts", "counts", "n"),
             "active_ranks": ("active_ranks", "ranks"),
             "reliability": ("reliability", "feature_reliability"),
-            "spectral_prototypes": ("spectral_prototypes", "spectral_prototype", "spectral"),
+            "feature_reliability": ("feature_reliability",),
+            "spectral_prototypes": ("spectral_prototypes", "spectral_prototype", "spectral_means"),
             "band_importance": ("band_importance", "band_importances", "band"),
+            "band_reliability": ("band_reliability",),
+            "spectral_reliability": ("spectral_reliability",),
+            "spectral_bases": ("spectral_bases",),
+            "spectral_eigvals": ("spectral_eigvals",),
+            "spectral_res_vars": ("spectral_res_vars",),
+            "spectral_active_ranks": ("spectral_active_ranks",),
+            "spectral_to_feature": ("spectral_to_feature",),
+            "coupling_residual_vars": ("coupling_residual_vars",),
+            "coupling_reliability": ("coupling_reliability",),
+            "spectral_sam_limits": ("spectral_sam_limits",),
+            "spectral_d1_limits": ("spectral_d1_limits",),
+            "spectral_d2_limits": ("spectral_d2_limits",),
+            "energy_quantiles": ("energy_quantiles",),
+            "margin_quantiles": ("margin_quantiles",),
+            "phase_created": ("phase_created",),
+            "frozen_class_mask": ("frozen_class_mask",),
         }
         for key, names in aliases.items():
             for name in names:
@@ -417,8 +445,6 @@ class IncrementalPhaseTrainer:
                     break
         if "eigvals" not in out and torch.is_tensor(bank.get("variances", None)):
             out["eigvals"] = bank["variances"].to(self.device)[:, :-1]
-            out["res_vars"] = bank["variances"].to(self.device)[:, -1]
-        if "res_vars" not in out and torch.is_tensor(bank.get("variances", None)):
             out["res_vars"] = bank["variances"].to(self.device)[:, -1]
         required = ("means", "bases", "eigvals", "res_vars", "sample_counts")
         missing = [k for k in required if k not in out]
@@ -470,43 +496,42 @@ class IncrementalPhaseTrainer:
     def snapshot_old_geometry(self, old_classes: Sequence[int]) -> Dict[str, torch.Tensor]:
         old = [int(c) for c in old_classes]
         self.assert_geometry_exists(old, context="snapshot_old_geometry")
+        gb = self._bank_object()
+        if hasattr(gb, "snapshot_rows"):
+            return gb.snapshot_rows(old)
         bank = self._bank_dict()
         ids = torch.as_tensor(old, device=self.device, dtype=torch.long)
-        snap = {
-            "class_ids": ids.detach().clone(),
-            "means": bank["means"].index_select(0, ids).detach().clone(),
-            "bases": bank["bases"].index_select(0, ids).detach().clone(),
-            "eigvals": bank["eigvals"].index_select(0, ids).detach().clone(),
-            "res_vars": bank["res_vars"].index_select(0, ids).detach().clone(),
-            "active_ranks": bank["active_ranks"].index_select(0, ids).detach().clone(),
-            "sample_counts": bank["sample_counts"].flatten().index_select(0, ids).detach().clone(),
-        }
-        for k in ("reliability", "spectral_prototypes", "band_importance"):
-            v = bank.get(k, None)
-            if torch.is_tensor(v) and v.size(0) > int(ids.max().item()):
-                snap[k] = v.index_select(0, ids).detach().clone()
-        if bool((snap["sample_counts"] <= 0).any().item()):
-            bad = ids[snap["sample_counts"] <= 0].detach().cpu().tolist()
-            raise RuntimeError(f"Old GeometryBank has invalid old rows: {bad}")
+        snap: Dict[str, torch.Tensor] = {"class_ids": ids.detach().clone()}
+        for key, value in bank.items():
+            if torch.is_tensor(value) and value.dim() > 0 and value.size(0) > int(ids.max().item()):
+                snap[key] = value.index_select(0, ids).detach().clone()
         return snap
 
     # Compatibility name used by uploaded code.
     def _snapshot_old_bank_clean(self, old_class_count: int) -> Dict[str, torch.Tensor]:
         return self.snapshot_old_geometry(list(range(int(old_class_count))))
 
-    def assert_old_geometry_unchanged(self, snapshot: Dict[str, torch.Tensor], context: str, atol: float = 1e-6) -> Dict[str, float]:
+    def assert_old_geometry_unchanged(
+        self,
+        snapshot: Dict[str, torch.Tensor],
+        context: str,
+        atol: float = 1e-6,
+    ) -> Dict[str, float]:
+        gb = self._bank_object()
+        if hasattr(gb, "assert_rows_unchanged"):
+            gb.assert_rows_unchanged(snapshot, context=context, atol=atol, rtol=0.0)
         ids = snapshot["class_ids"].to(self.device).long()
         bank = self._bank_dict()
         drift: Dict[str, float] = {}
-        for key, bank_key in (("means", "means"), ("bases", "bases"), ("eigvals", "eigvals"), ("res_vars", "res_vars")):
-            cur = bank[bank_key].index_select(0, ids).detach()
+        for key in ("means", "bases", "eigvals", "res_vars", "spectral_bases", "spectral_to_feature"):
+            if key not in snapshot or key not in bank:
+                continue
+            cur = bank[key].index_select(0, ids).detach()
             ref = snapshot[key].to(cur.device, cur.dtype)
-            if cur.shape != ref.shape:
-                raise RuntimeError(f"{context}: old {key} shape changed {tuple(ref.shape)} -> {tuple(cur.shape)}")
-            delta = (cur - ref).abs().max()
-            drift[f"old_{key}_max_abs_drift"] = float(delta.detach().cpu().item())
-            if float(delta.detach().cpu().item()) > float(atol):
-                raise RuntimeError(f"{context}: frozen old geometry changed for {key}. max_abs={float(delta):.6g}")
+            delta = (cur - ref).abs().max() if cur.numel() else torch.tensor(0.0, device=self.device)
+            drift[f"old_{key}_max_abs_drift"] = float(delta.cpu().item())
+            if float(delta.cpu().item()) > float(atol):
+                raise RuntimeError(f"{context}: frozen old geometry changed for {key}; max_abs={float(delta):.6g}")
         return drift
 
     # ------------------------------------------------------------------
@@ -526,12 +551,17 @@ class IncrementalPhaseTrainer:
         raise RuntimeError("Cannot unpack HSI batch.")
 
     @torch.no_grad()
-    def collect_current_phase_features(self, loader, new_classes: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    def collect_current_phase_features(
+        self,
+        loader,
+        new_classes: Sequence[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         self.model.eval()
         feats: List[torch.Tensor] = []
         labs: List[torch.Tensor] = []
         spectra_rows: List[torch.Tensor] = []
         bands: List[torch.Tensor] = []
+        physical_flags: List[bool] = []
         for batch in loader:
             x, y, spectra, _ = self._unpack_batch(batch)
             x = x.float().to(self.device, non_blocking=True)
@@ -542,17 +572,24 @@ class IncrementalPhaseTrainer:
             feats.append(z)
             labs.append(y.detach())
             s = out.get("spectral_summary", None)
-            if torch.is_tensor(s) and s.size(0) == z.size(0):
+            if torch.is_tensor(s) and s.dim() == 2 and s.size(0) == z.size(0):
                 spectra_rows.append(s.detach().float())
+                physical_flags.append(bool(out.get("spectral_summary_is_physical", False)))
             b = out.get("band_summary", out.get("band_importance", None))
-            if torch.is_tensor(b) and b.size(0) == z.size(0):
+            if torch.is_tensor(b) and b.dim() == 2 and b.size(0) == z.size(0):
                 bands.append(b.detach().float())
         if not feats:
             raise RuntimeError("Current phase train loader produced no features.")
         z_all = torch.cat(feats, dim=0)
         y_all = torch.cat(labs, dim=0)
-        s_all = torch.cat(spectra_rows, dim=0) if spectra_rows else None
-        b_all = torch.cat(bands, dim=0) if bands else None
+        s_all = torch.cat(spectra_rows, dim=0) if spectra_rows and sum(s.size(0) for s in spectra_rows) == z_all.size(0) else None
+        b_all = torch.cat(bands, dim=0) if bands and sum(b.size(0) for b in bands) == z_all.size(0) else None
+        physical = bool(s_all is not None and physical_flags and all(physical_flags))
+        self._current_spectral_summary_is_physical = physical
+        if self._inc_cfg_bool("use_spectral_coupled_replay", True) and s_all is None:
+            print("[SCTGR WARN] Raw centre spectra were unavailable; new rows will use conservative feature-geometry fallback.")
+        elif self._inc_cfg_bool("use_spectral_coupled_replay", True) and not physical:
+            print("[SCTGR WARN] Spectral metadata is non-physical; coupling is disabled for these new rows.")
         return z_all, y_all, s_all, b_all
 
     def _estimate_geometry_from_features(
@@ -563,92 +600,45 @@ class IncrementalPhaseTrainer:
         spectral_summary: Optional[torch.Tensor] = None,
         band_summary: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        """Delegate all feature/spectral/coupling estimation to GeometryBank."""
         features = _finite(features.float(), "new descriptor features")
         labels_global = labels_global.long().view(-1).to(features.device)
-        D = int(features.size(1))
-        rank = int(getattr(getattr(self.model, "geometry_bank", None), "rank", getattr(self.args, "subspace_rank", 5)))
-        rank = max(1, min(rank, D))
-        means: List[torch.Tensor] = []
-        bases: List[torch.Tensor] = []
-        eigvals: List[torch.Tensor] = []
-        res_vars: List[torch.Tensor] = []
-        active: List[int] = []
-        counts: List[int] = []
-        reliability: List[torch.Tensor] = []
-        spectral_proto: List[torch.Tensor] = []
-        band_proto: List[torch.Tensor] = []
-        var_floor = self._inc_cfg_float("geom_var_floor", 1e-4)
-        for cls in [int(c) for c in class_ids]:
-            mask = labels_global == int(cls)
-            if not bool(mask.any().item()):
-                raise RuntimeError(f"Cannot estimate new geometry for class {cls}: no samples.")
-            zc = features[mask]
-            n = int(zc.size(0))
-            mu = zc.mean(dim=0)
-            xc = zc - mu
-            denom = float(max(n - 1, 1))
-            if n >= 2:
-                try:
-                    U, S, _ = torch.linalg.svd(xc / math.sqrt(denom), full_matrices=False)
-                    # For data matrix [N,D], right singular vectors are Vh.T. Recompute from covariance for clarity.
-                    cov = xc.t().matmul(xc) / denom
-                    evals, evecs = torch.linalg.eigh(cov)
-                    order = torch.argsort(evals, descending=True)
-                    evals = evals.index_select(0, order).clamp_min(var_floor)
-                    evecs = evecs.index_select(1, order)
-                    r_eff = min(rank, int((evals > var_floor * 1.01).sum().detach().cpu().item()), D)
-                    r_eff = max(1, r_eff)
-                    Uc = evecs[:, :rank]
-                    if Uc.size(1) < rank:
-                        pad = torch.eye(D, device=features.device, dtype=features.dtype)[:, : rank - Uc.size(1)]
-                        Uc = torch.cat([Uc, pad], dim=1)
-                    q, _ = torch.linalg.qr(Uc, mode="reduced")
-                    Uc = q[:, :rank]
-                    lam = evals[:rank]
-                    if lam.numel() < rank:
-                        lam = torch.cat([lam, lam.new_full((rank - lam.numel(),), var_floor)])
-                    total_var = torch.diag(cov).sum().clamp_min(var_floor)
-                    res = ((total_var - lam[:r_eff].sum()).clamp_min(var_floor) / float(max(D - r_eff, 1))).clamp_min(var_floor)
-                except RuntimeError:
-                    Uc = torch.eye(D, device=features.device, dtype=features.dtype)[:, :rank]
-                    lam = torch.full((rank,), var_floor, device=features.device, dtype=features.dtype)
-                    res = torch.tensor(var_floor, device=features.device, dtype=features.dtype)
-                    r_eff = 1
-            else:
-                Uc = torch.eye(D, device=features.device, dtype=features.dtype)[:, :rank]
-                lam = torch.full((rank,), var_floor, device=features.device, dtype=features.dtype)
-                res = torch.tensor(var_floor, device=features.device, dtype=features.dtype)
-                r_eff = 1
-            means.append(mu)
-            bases.append(Uc)
-            eigvals.append(lam.clamp_min(var_floor))
-            res_vars.append(res.clamp_min(var_floor).view(()))
-            active.append(int(r_eff))
-            counts.append(n)
-            rel = torch.tensor(min(1.0, math.log1p(n) / math.log1p(64.0)), device=features.device, dtype=features.dtype)
-            reliability.append(rel)
-            if torch.is_tensor(spectral_summary) and spectral_summary.size(0) == labels_global.numel():
-                spectral_proto.append(spectral_summary.to(features.device).float()[mask].mean(dim=0))
-            if torch.is_tensor(band_summary) and band_summary.size(0) == labels_global.numel():
-                b = band_summary.to(features.device).float()[mask].mean(dim=0)
-                b = b.clamp_min(0.0)
-                b = b / b.sum().clamp_min(_EPS)
-                band_proto.append(b)
-        result: Dict[str, torch.Tensor] = {
-            "class_ids": torch.as_tensor([int(c) for c in class_ids], device=features.device, dtype=torch.long),
-            "means": torch.stack(means, dim=0),
-            "bases": torch.stack(bases, dim=0),
-            "eigvals": torch.stack(eigvals, dim=0),
-            "res_vars": torch.stack(res_vars, dim=0),
-            "active_ranks": torch.as_tensor(active, device=features.device, dtype=torch.long),
-            "sample_counts": torch.as_tensor(counts, device=features.device, dtype=torch.float32),
-            "reliability": torch.stack(reliability, dim=0),
+        gb = self._bank_object()
+        builder = getattr(gb, "build_candidate_geometry_rows", getattr(gb, "extract_geometry", None))
+        if not callable(builder):
+            raise AttributeError("GeometryBank must expose build_candidate_geometry_rows/extract_geometry.")
+        rows = builder(
+            features,
+            labels_global,
+            spectral_summary=spectral_summary,
+            band_weights=band_summary,
+            spectral_summary_is_physical=bool(getattr(self, "_current_spectral_summary_is_physical", False)),
+            class_ids=class_ids,
+        )
+        ids = [int(c) for c in class_ids]
+        missing = [c for c in ids if c not in rows]
+        if missing:
+            raise RuntimeError(f"GeometryBank failed to build new rows for classes {missing}.")
+        singular_to_block = {
+            "mean": "means", "basis": "bases", "eigvals": "eigvals", "res_var": "res_vars",
+            "active_rank": "active_ranks", "sample_count": "sample_counts",
+            "reliability": "reliability", "feature_reliability": "feature_reliability",
+            "band_importance": "band_importance", "band_reliability": "band_reliability",
+            "spectral_prototype": "spectral_prototypes", "spectral_reliability": "spectral_reliability",
+            "spectral_basis": "spectral_bases", "spectral_eigvals": "spectral_eigvals",
+            "spectral_res_var": "spectral_res_vars", "spectral_active_rank": "spectral_active_ranks",
+            "spectral_to_feature": "spectral_to_feature", "coupling_residual_vars": "coupling_residual_vars",
+            "coupling_reliability": "coupling_reliability", "spectral_sam_limit": "spectral_sam_limits",
+            "spectral_d1_limit": "spectral_d1_limits", "spectral_d2_limit": "spectral_d2_limits",
+            "energy_quantiles": "energy_quantiles", "margin_quantiles": "margin_quantiles",
         }
-        if spectral_proto:
-            result["spectral_prototypes"] = torch.stack(spectral_proto, dim=0)
-        if band_proto:
-            result["band_importance"] = torch.stack(band_proto, dim=0)
-        self._assert_descriptor_block_valid(result, context="estimated new geometry")
+        result: Dict[str, torch.Tensor] = {
+            "class_ids": torch.as_tensor(ids, device=features.device, dtype=torch.long)
+        }
+        for singular, plural in singular_to_block.items():
+            if all(torch.is_tensor(rows[c].get(singular, None)) for c in ids):
+                result[plural] = torch.stack([rows[c][singular].to(features.device) for c in ids], dim=0)
+        self._assert_descriptor_block_valid(result, context="estimated replay-ready new geometry")
         return result
 
     def _assert_descriptor_block_valid(self, desc: Dict[str, torch.Tensor], context: str) -> None:
@@ -674,91 +664,117 @@ class IncrementalPhaseTrainer:
         if float(err.detach().cpu().item()) > 5e-3:
             raise RuntimeError(f"{context}: bases are not orthonormal; max gram error={float(err):.6f}")
 
-    def _commit_new_descriptors(self, desc: Dict[str, torch.Tensor], phase: int) -> None:
+    def _commit_new_descriptors(self, desc: Dict[str, torch.Tensor], phase: int, *, freeze: bool = False) -> None:
         gb = self._bank_object()
-        ids = desc["class_ids"].detach().cpu().tolist()
-        for row, cls in enumerate(ids):
-            kwargs = dict(
-                class_id=int(cls),
-                mean=desc["means"][row].detach(),
-                basis=desc["bases"][row].detach(),
-                eigvals=desc["eigvals"][row].detach(),
-                res_var=desc["res_vars"][row].detach(),
-                sample_count=desc["sample_counts"][row].detach(),
-                active_rank=desc["active_ranks"][row].detach(),
-                reliability=desc.get("reliability", torch.ones_like(desc["sample_counts"]))[row].detach(),
-                spectral_prototype=desc.get("spectral_prototypes", None)[row].detach() if torch.is_tensor(desc.get("spectral_prototypes", None)) else None,
-                band_importance=desc.get("band_importance", None)[row].detach() if torch.is_tensor(desc.get("band_importance", None)) else None,
-                phase_created=int(phase),
+        ids = [int(c) for c in desc["class_ids"].detach().cpu().tolist()]
+        block_to_singular = {
+            "means": "mean", "bases": "basis", "eigvals": "eigvals", "res_vars": "res_var",
+            "active_ranks": "active_rank", "sample_counts": "sample_count",
+            "reliability": "reliability", "feature_reliability": "feature_reliability",
+            "band_importance": "band_importance", "band_reliability": "band_reliability",
+            "spectral_prototypes": "spectral_prototype", "spectral_reliability": "spectral_reliability",
+            "spectral_bases": "spectral_basis", "spectral_eigvals": "spectral_eigvals",
+            "spectral_res_vars": "spectral_res_var", "spectral_active_ranks": "spectral_active_rank",
+            "spectral_to_feature": "spectral_to_feature", "coupling_residual_vars": "coupling_residual_vars",
+            "coupling_reliability": "coupling_reliability", "spectral_sam_limits": "spectral_sam_limit",
+            "spectral_d1_limits": "spectral_d1_limit", "spectral_d2_limits": "spectral_d2_limit",
+            "energy_quantiles": "energy_quantiles", "margin_quantiles": "margin_quantiles",
+        }
+        rows: Dict[int, Dict[str, torch.Tensor]] = {}
+        for row_idx, cls in enumerate(ids):
+            row: Dict[str, torch.Tensor] = {}
+            for block_key, singular in block_to_singular.items():
+                value = desc.get(block_key, None)
+                if torch.is_tensor(value) and value.size(0) == len(ids):
+                    row[singular] = value[row_idx].detach()
+            rows[cls] = row
+        if hasattr(gb, "commit_candidate_geometry_rows"):
+            gb.commit_candidate_geometry_rows(
+                rows, allow_frozen_update=False, phase_created=int(phase), freeze=bool(freeze),
+                context=f"phase_{int(phase)}_new_row_commit",
             )
-            if hasattr(gb, "add_or_update_class_geometry"):
-                gb.add_or_update_class_geometry(**kwargs)
-            elif hasattr(gb, "update_class_geometry"):
-                gb.update_class_geometry(allow_frozen_update=False, **{k: v for k, v in kwargs.items() if k != "phase_created"})
-            elif hasattr(gb, "update_class"):
-                kwargs["cls_id"] = kwargs.pop("class_id")
-                gb.update_class(**{k: v for k, v in kwargs.items() if k != "phase_created"})
-            else:
-                raise AttributeError("GeometryBank must expose add_or_update_class_geometry/update_class_geometry/update_class.")
-        if hasattr(gb, "assert_bank_valid"):
-            try:
-                gb.assert_bank_valid(seen_classes=ids)
-            except TypeError:
-                gb.assert_bank_valid()
+        else:
+            for cls, row in rows.items():
+                gb.add_or_update_class_geometry(class_id=cls, phase_created=int(phase), freeze=bool(freeze), **row)
+        gb.assert_bank_valid(seen_classes=ids)
 
     def _risk_matrix_from_descriptors(
         self,
         old_snapshot: Dict[str, torch.Tensor],
         new_desc: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        old_mu = old_snapshot["means"].to(self.device).float()
-        old_U = old_snapshot["bases"].to(self.device).float()
-        old_e = old_snapshot["eigvals"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-        old_rv = old_snapshot["res_vars"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        """Differentiable old/new geometry risk using active ranks and normalized energy."""
+        old_mu = old_snapshot["means"].to(self.device).float().detach()
+        old_U = old_snapshot["bases"].to(self.device).float().detach()
+        old_e = old_snapshot["eigvals"].to(self.device).float().detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        old_rv = old_snapshot["res_vars"].to(self.device).float().detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        old_r = old_snapshot.get("active_ranks", torch.full((old_mu.size(0),), old_U.size(-1), device=self.device, dtype=torch.long)).to(self.device).long()
         new_mu = new_desc["means"].to(self.device).float()
         new_U = new_desc["bases"].to(self.device).float()
-        # Center proximity
+        new_e = new_desc["eigvals"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        new_rv = new_desc["res_vars"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        new_r = new_desc.get("active_ranks", torch.full((new_mu.size(0),), new_U.size(-1), device=self.device, dtype=torch.long)).to(self.device).long()
+
         dist = torch.cdist(old_mu, new_mu, p=2)
-        center_margin = max(self._inc_cfg_float("risk_center_margin", 1.0), 1e-6)
-        center = torch.exp(-dist / center_margin).clamp(0.0, 1.0)
-        # Old ellipsoid invasion energy of new means.
-        diff = new_mu.unsqueeze(0) - old_mu.unsqueeze(1)  # [O,N,D]
-        proj = torch.einsum("ond,odr->onr", diff, old_U)
-        low = (proj.pow(2) / old_e.unsqueeze(1).clamp_min(_EPS)).sum(dim=-1)
-        rec = torch.einsum("onr,odr->ond", proj, old_U)
-        residual = ((diff - rec).pow(2).sum(dim=-1) / old_rv.view(-1, 1).clamp_min(_EPS))
-        energy = (low + residual) / float(max(old_mu.size(1), 1))
-        mahal_margin = max(self._inc_cfg_float("old_new_geometry_margin", 0.30), 1e-6)
-        mahal = F.relu(mahal_margin - energy) / mahal_margin
-        # Subspace overlap.
+        old_scale = torch.stack([old_e[i, :max(int(old_r[i].item()), 1)].mean() for i in range(old_mu.size(0))]).view(-1, 1)
+        new_scale = torch.stack([new_e[j, :max(int(new_r[j].item()), 1)].mean() for j in range(new_mu.size(0))]).view(1, -1)
+        norm_dist = dist / (old_scale + new_scale).sqrt().clamp_min(_EPS)
+        center = torch.exp(-norm_dist / max(self._inc_cfg_float("risk_center_temperature", 3.0), 1e-6)).clamp(0.0, 1.0)
+
+        energy_rows: List[torch.Tensor] = []
         overlap_rows: List[torch.Tensor] = []
-        for i in range(old_U.size(0)):
-            vals = []
-            for j in range(new_U.size(0)):
-                m = old_U[i].t().matmul(new_U[j])
-                vals.append(m.pow(2).sum() / float(max(1, min(old_U.size(-1), new_U.size(-1)))))
-            overlap_rows.append(torch.stack(vals))
+        for i in range(old_mu.size(0)):
+            ri = max(0, min(int(old_r[i].item()), old_U.size(-1)))
+            diff = new_mu - old_mu[i].view(1, -1)
+            if ri > 0:
+                Ui = old_U[i, :, :ri]
+                coord = diff.matmul(Ui)
+                parallel = (coord.pow(2) / old_e[i, :ri].view(1, -1)).sum(dim=1) / float(ri)
+                residual = diff - coord.matmul(Ui.t())
+            else:
+                parallel = torch.zeros((new_mu.size(0),), device=self.device, dtype=new_mu.dtype)
+                residual = diff
+            residual_energy = residual.pow(2).sum(dim=1) / (float(max(old_mu.size(1) - ri, 1)) * old_rv[i])
+            energy_rows.append(parallel + residual_energy)
+            pair_ov: List[torch.Tensor] = []
+            for j in range(new_mu.size(0)):
+                rj = max(0, min(int(new_r[j].item()), new_U.size(-1)))
+                if ri <= 0 or rj <= 0:
+                    pair_ov.append(new_mu.new_tensor(0.0))
+                else:
+                    pair_ov.append(old_U[i, :, :ri].t().matmul(new_U[j, :, :rj]).pow(2).sum() / float(max(min(ri, rj), 1)))
+            overlap_rows.append(torch.stack(pair_ov))
+        energy = torch.stack(energy_rows, dim=0)
         subspace = torch.stack(overlap_rows, dim=0).clamp(0.0, 1.0)
+        mahal = torch.exp(-energy / max(self._inc_cfg_float("risk_energy_temperature", 1.0), 1e-6)).clamp(0.0, 1.0)
+
         band = torch.zeros_like(subspace)
-        if torch.is_tensor(old_snapshot.get("band_importance", None)) and torch.is_tensor(new_desc.get("band_importance", None)):
-            ob = F.normalize(old_snapshot["band_importance"].to(self.device).float(), p=2, dim=1)
-            nb = F.normalize(new_desc["band_importance"].to(self.device).float(), p=2, dim=1)
-            if ob.size(1) == nb.size(1):
-                band = ob.matmul(nb.t()).clamp(0.0, 1.0) * center
+        if torch.is_tensor(old_snapshot.get("band_importances", old_snapshot.get("band_importance", None))) and torch.is_tensor(new_desc.get("band_importance", None)):
+            ob = old_snapshot.get("band_importances", old_snapshot.get("band_importance")).to(self.device).float()
+            nb = new_desc["band_importance"].to(self.device).float()
+            if ob.dim() == 2 and nb.dim() == 2 and ob.size(1) == nb.size(1):
+                band = F.normalize(ob, p=2, dim=1).matmul(F.normalize(nb, p=2, dim=1).t()).clamp(0.0, 1.0)
         spectral = torch.zeros_like(subspace)
         if torch.is_tensor(old_snapshot.get("spectral_prototypes", None)) and torch.is_tensor(new_desc.get("spectral_prototypes", None)):
             os = old_snapshot["spectral_prototypes"].to(self.device).float()
             ns = new_desc["spectral_prototypes"].to(self.device).float()
             if os.dim() == 2 and ns.dim() == 2 and os.size(1) == ns.size(1):
-                spectral = F.normalize(os, p=2, dim=1).matmul(F.normalize(ns, p=2, dim=1).t()).clamp(0.0, 1.0) * center
+                os = os - os.mean(dim=1, keepdim=True)
+                ns = ns - ns.mean(dim=1, keepdim=True)
+                spectral = F.normalize(os, p=2, dim=1).matmul(F.normalize(ns, p=2, dim=1).t()).clamp(0.0, 1.0)
+        old_rel = old_snapshot.get("reliability", torch.ones((old_mu.size(0),), device=self.device)).to(self.device).float().view(-1, 1)
+        uncertainty = (1.0 - old_rel).clamp(0.0, 1.0)
         risk = (
-            self._inc_cfg_float("risk_center_weight", 0.50) * center
-            + self._inc_cfg_float("risk_mahal_weight", 1.00) * mahal
-            + self._inc_cfg_float("risk_subspace_weight", 1.00) * subspace
-            + self._inc_cfg_float("risk_band_weight", 0.15) * band
-            + self._inc_cfg_float("risk_spectral_shape_weight", 0.25) * spectral
-        )
-        return {"risk": risk, "center": center, "mahal": mahal, "subspace": subspace, "band": band, "spectral": spectral, "dist": dist, "energy": energy}
+            self._inc_cfg_float("risk_center_weight", 0.35) * center
+            + self._inc_cfg_float("risk_mahal_weight", 0.45) * mahal
+            + self._inc_cfg_float("risk_subspace_weight", 0.20) * subspace
+            + self._inc_cfg_float("risk_band_weight", 0.05) * band * (center + mahal).clamp(max=1.0)
+            + self._inc_cfg_float("risk_spectral_shape_weight", 0.05) * spectral * (center + mahal).clamp(max=1.0)
+        ) * (1.0 + 0.25 * uncertainty)
+        return {
+            "risk": risk, "center": center, "mahal": mahal, "subspace": subspace,
+            "band": band, "spectral": spectral, "dist": dist, "normalized_dist": norm_dist, "energy": energy,
+        }
 
     def admit_new_geometry(
         self,
@@ -766,55 +782,22 @@ class IncrementalPhaseTrainer:
         old_snapshot: Dict[str, torch.Tensor],
         new_classes: Sequence[int],
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
-        """Apply new-row-only spectral-guided safe insertion.
+        """Safe new-row admission for the clean SCTGR-RGA path.
 
-        This calls the repaired geometry_transport.safe_insert_new_geometry when available.
-        Fallback is a deterministic center push + basis projection.  In both cases old rows are never modified.
+        No geometry transport, no old-row transport, and no hidden ablation is
+        allowed here. The only permitted operation is a bounded correction of
+        the *new* descriptors relative to a detached snapshot of old rows.
         """
-        risk_before = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
-        corrected = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in new_desc.items()}
-        # Main SCBGR run must not secretly activate transport.
-        # Safe new-row transport is an explicit ablation: --use_geometry_transport true.
-        use_transport = self._inc_cfg_bool("use_geometry_transport", False) or self._inc_cfg_bool("use_new_row_transport", False)
-        if use_transport:
-            try:
-                from models.geometry_transport import safe_insert_new_geometry  # type: ignore
+        if self._inc_cfg_bool("use_geometry_transport", False) or self._inc_cfg_bool("use_sglat_transport", False) or self._inc_cfg_bool("allow_old_model_transport", False):
+            raise RuntimeError(
+                "Transport is disabled in the clean incremental path. "
+                "Keep old GeometryBank rows frozen and use deterministic new-row admission only."
+            )
 
-                out = safe_insert_new_geometry(
-                    new_class_ids=[int(c) for c in new_classes],
-                    old_class_ids=old_snapshot["class_ids"].detach().cpu().tolist(),
-                    new_means=new_desc["means"],
-                    new_bases=new_desc["bases"],
-                    new_eigvals=new_desc["eigvals"],
-                    new_res_vars=new_desc["res_vars"],
-                    old_means=old_snapshot["means"],
-                    old_bases=old_snapshot["bases"],
-                    old_eigvals=old_snapshot["eigvals"],
-                    old_res_vars=old_snapshot["res_vars"],
-                    new_active_ranks=new_desc.get("active_ranks", None),
-                    old_active_ranks=old_snapshot.get("active_ranks", None),
-                    new_spectral=new_desc.get("spectral_prototypes", None),
-                    old_spectral=old_snapshot.get("spectral_prototypes", None),
-                    new_band=new_desc.get("band_importance", None),
-                    old_band=old_snapshot.get("band_importance", None),
-                    center_margin=self._inc_cfg_float("risk_center_margin", 1.0),
-                    ellipsoid_margin=self._inc_cfg_float("old_new_geometry_margin", 0.30),
-                    max_mean_shift=self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35),
-                )
-                if isinstance(out, dict) and torch.is_tensor(out.get("means", None)):
-                    corrected["means"] = out["means"].to(self.device)
-                    corrected["bases"] = out["bases"].to(self.device)
-                    corrected["eigvals"] = out["eigvals"].to(self.device)
-                    corrected["res_vars"] = out["res_vars"].to(self.device)
-                    if torch.is_tensor(out.get("active_ranks", None)):
-                        corrected["active_ranks"] = out["active_ranks"].to(self.device)
-            except Exception as exc:
-                if bool(getattr(self, "debug", False)):
-                    print(f"[NewRowTransport WARN] using fallback safe insertion: {exc}")
-                corrected = self._fallback_safe_new_row_correction(corrected, old_snapshot, risk_before)
-        else:
-            corrected = self._fallback_safe_new_row_correction(corrected, old_snapshot, risk_before)
+        risk_before = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
+        corrected = self._fallback_safe_new_row_correction(new_desc, old_snapshot, risk_before)
         self._assert_descriptor_block_valid(corrected, context="admitted new geometry")
+
         risk_after = self._risk_matrix_from_descriptors(old_snapshot, corrected)
         stats = {
             "risk_before_max": float(risk_before["risk"].max().detach().cpu().item()) if risk_before["risk"].numel() else 0.0,
@@ -823,134 +806,192 @@ class IncrementalPhaseTrainer:
             "risk_after_mean": float(risk_after["risk"].mean().detach().cpu().item()) if risk_after["risk"].numel() else 0.0,
             "overlap_before_max": float(risk_before["subspace"].max().detach().cpu().item()) if risk_before["subspace"].numel() else 0.0,
             "overlap_after_max": float(risk_after["subspace"].max().detach().cpu().item()) if risk_after["subspace"].numel() else 0.0,
-            "transport_active": float(1.0 if use_transport else 0.0),
+            "transport_active": 0.0,
         }
-        if stats["risk_after_max"] > stats["risk_before_max"] + 1e-5:
-            print(f"[NewRowAdmission WARN] max risk increased {stats['risk_before_max']:.4f}->{stats['risk_after_max']:.4f}; keeping correction because identity clamp may still improve subspace/boundary.")
         return corrected, stats
+    def _fallback_safe_new_row_correction(
+        self,
+        desc: Dict[str, torch.Tensor],
+        old_snapshot: Dict[str, torch.Tensor],
+        risk_parts: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Bounded new-row admission without rotating the coupled feature basis.
 
-    def _fallback_safe_new_row_correction(self, desc: Dict[str, torch.Tensor], old_snapshot: Dict[str, torch.Tensor], risk_parts: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        Spectral-to-feature coupling is expressed in the new feature basis. Rotating
+        that basis after coupling fit would silently invalidate the replay model.
+        Admission may therefore adjust only the new centre and variance scale; the
+        feature/spectral bases and coupling matrix remain exactly as estimated.
+        """
         out = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in desc.items()}
         risk = risk_parts["risk"].to(self.device)
         if risk.numel() == 0:
             return out
-        old_mu = old_snapshot["means"].to(self.device).float()
-        old_U = old_snapshot["bases"].to(self.device).float()
+        old_mu = old_snapshot["means"].to(self.device).float().detach()
         means = out["means"].to(self.device).float()
-        bases = out["bases"].to(self.device).float()
         eig = out["eigvals"].to(self.device).float()
         res = out["res_vars"].to(self.device).float()
-        risk_thr = self._inc_cfg_float("descriptor_correction_risk_threshold", 0.35)
-        max_shift = self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35)
-        basis_strength = self._inc_cfg_float("descriptor_correction_basis_strength", 0.50)
-        var_shrink = self._inc_cfg_float("descriptor_correction_var_shrink", 0.10)
-        var_floor = self._inc_cfg_float("geom_var_floor", 1e-4)
+        risk_thr = self._inc_cfg_float("descriptor_correction_risk_threshold", 0.60)
+        max_shift = self._inc_cfg_float("descriptor_admission_max_mean_shift", 0.15)
+        max_log_shrink = self._inc_cfg_float("descriptor_admission_max_logvar_shrink", 0.10)
+        floor = self._inc_cfg_float("geom_var_floor", 1e-4)
         for j in range(means.size(0)):
             col = risk[:, j].clamp_min(0.0)
-            if float(col.max().detach().cpu().item()) < risk_thr:
+            peak = float(col.max().detach().cpu().item())
+            if peak <= risk_thr:
                 continue
-            w = col / col.sum().clamp_min(_EPS)
+            w = torch.softmax(col / max(self._inc_cfg_float("pair_risk_temperature", 0.75), 1e-6), dim=0)
             push = torch.zeros_like(means[j])
-            P = torch.zeros((bases.size(1), bases.size(1)), device=self.device, dtype=bases.dtype)
             for i in range(old_mu.size(0)):
                 direction = means[j] - old_mu[i]
-                direction = direction / direction.norm().clamp_min(_EPS)
-                push = push + w[i] * direction
-                P = P + w[i] * old_U[i].matmul(old_U[i].t())
-            gate = float(min(1.0, max(0.0, (float(col.max().detach().cpu().item()) - risk_thr) / max(1e-6, 1.5 - risk_thr))))
+                push = push + w[i] * direction / direction.norm().clamp_min(_EPS)
+            severity = min(1.0, max(0.0, (peak - risk_thr) / max(1.0 - risk_thr, 1e-6)))
             if push.norm() > _EPS:
-                delta = max_shift * gate * push / push.norm().clamp_min(_EPS)
-                means[j] = means[j] + delta
-            Ucorr = bases[j] - basis_strength * gate * P.matmul(bases[j])
-            q, _ = torch.linalg.qr(Ucorr, mode="reduced")
-            q = q[:, : bases.size(2)]
-            # sign-stabilize
-            sign = torch.where((q * bases[j]).sum(dim=0, keepdim=True) < 0, -torch.ones(1, bases.size(2), device=q.device), torch.ones(1, bases.size(2), device=q.device))
-            bases[j] = q * sign
-            eig[j] = (eig[j] * (1.0 - var_shrink * gate)).clamp_min(var_floor)
-            res[j] = (res[j] * (1.0 - 0.5 * var_shrink * gate)).clamp_min(var_floor)
-        out["means"], out["bases"], out["eigvals"], out["res_vars"] = means, bases, eig, res
+                means[j] = means[j] + max_shift * severity * push / push.norm().clamp_min(_EPS)
+            shrink = math.exp(-max_log_shrink * severity)
+            eig[j] = (eig[j] * shrink).clamp_min(floor)
+            res[j] = (res[j] * math.sqrt(shrink)).clamp_min(floor)
+        out["means"], out["eigvals"], out["res_vars"] = means, eig, res
         return out
 
     # ------------------------------------------------------------------
     # Replay from frozen old geometry
     # ------------------------------------------------------------------
-    def _sample_from_snapshot(self, snapshot: Dict[str, torch.Tensor], samples_per_class: int, boundary: bool = False, new_desc: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-        means = snapshot["means"].to(self.device).float()
-        bases = snapshot["bases"].to(self.device).float()
-        eig = snapshot["eigvals"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-        res = snapshot["res_vars"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-        ids = snapshot["class_ids"].to(self.device).long()
-        active = snapshot.get("active_ranks", torch.full((means.size(0),), bases.size(2), device=self.device, dtype=torch.long)).to(self.device).long()
-        per = max(1, int(samples_per_class))
-        xs: List[torch.Tensor] = []
-        ys: List[torch.Tensor] = []
-        boundary_count = 0
-        # Boundary replay is old-side only: sample near risky old means in directions toward new centers but keep old labels.
-        risk_pairs = None
-        if boundary and new_desc is not None:
-            risk = self._risk_matrix_from_descriptors(snapshot, new_desc)["risk"]
-            if risk.numel() > 0:
-                thr = self._inc_cfg_float("boundary_replay_risk_threshold", 0.35)
-                coords = (risk >= thr).nonzero(as_tuple=False)
-                if coords.numel() == 0:
-                    # fallback to top dangerous pairs, but log fallback.
-                    k = min(self._inc_cfg_int("boundary_replay_max_pairs", 24), int(risk.numel()))
-                    _, flat_idx = torch.topk(risk.flatten(), k=k, largest=True)
-                    coords = torch.stack([flat_idx // risk.size(1), flat_idx % risk.size(1)], dim=1)
-                risk_pairs = coords
-        for i in range(means.size(0)):
-            r = int(active[i].detach().cpu().item())
-            r = max(0, min(r, bases.size(2)))
-            eps = torch.randn(per, max(r, 1), device=self.device, dtype=means.dtype)
-            if r > 0:
-                low = eps[:, :r].matmul((bases[i, :, :r] * eig[i, :r].sqrt().view(1, -1)).t())
-            else:
-                low = torch.zeros(per, means.size(1), device=self.device, dtype=means.dtype)
-            residual = torch.randn(per, means.size(1), device=self.device, dtype=means.dtype) * res[i].sqrt() * self._inc_cfg_float("replay_residual_scale", 0.15)
-            z = means[i].view(1, -1) + self._inc_cfg_float("replay_parallel_scale", 0.35) * low + residual
-            xs.append(z)
-            ys.append(torch.full((per,), int(ids[i].detach().cpu().item()), device=self.device, dtype=torch.long))
-        if risk_pairs is not None and risk_pairs.numel() > 0 and new_desc is not None:
-            samples_per_pair = max(1, self._inc_cfg_int("boundary_replay_samples_per_pair", 4))
-            new_mu = new_desc["means"].to(self.device).float()
-            for oi, nj in risk_pairs.tolist():
-                direction = new_mu[int(nj)] - means[int(oi)]
-                if direction.norm() <= _EPS:
-                    continue
-                direction = direction / direction.norm().clamp_min(_EPS)
-                radius = eig[int(oi)].mean().sqrt().clamp_min(1e-3) * self._inc_cfg_float("boundary_replay_radius", 0.75)
-                noise = torch.randn(samples_per_pair, means.size(1), device=self.device, dtype=means.dtype) * res[int(oi)].sqrt() * 0.05
-                z = means[int(oi)].view(1, -1) + radius * direction.view(1, -1) + noise
-                xs.append(z)
-                ys.append(torch.full((samples_per_pair,), int(ids[int(oi)].detach().cpu().item()), device=self.device, dtype=torch.long))
-                boundary_count += samples_per_pair
-        x_old = torch.cat(xs, dim=0)
-        y_old = torch.cat(ys, dim=0)
-        _finite(x_old, "old replay features")
-        stats = {
-            "replay_count": float(y_old.numel()),
-            "boundary_replay_count": float(boundary_count),
-            "boundary_replay_fallback": float(1.0 if boundary and boundary_count == 0 else 0.0),
+    def sample_old_replay(
+        self,
+        old_snapshot: Dict[str, torch.Tensor],
+        seen_classes: Sequence[int],
+        new_desc: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor | Dict[str, Any]]:
+        """Generate geometry-valid core and directed spectral-tangent replay.
+
+        Core and directed quotas are selected independently. This prevents easy core
+        candidates from silently consuming the directed replay budget.
+        """
+        gb = self._bank_object()
+        old_classes = [int(c) for c in old_snapshot["class_ids"].detach().cpu().tolist()]
+        new_classes = [int(c) for c in new_desc["class_ids"].detach().cpu().tolist()] if isinstance(new_desc, dict) and torch.is_tensor(new_desc.get("class_ids", None)) else [c for c in seen_classes if c not in old_classes]
+        base = self._inc_cfg_int("gfa_samples_per_class", self._inc_cfg_int("synthetic_replay_per_class", 48))
+        min_count = self._inc_cfg_int("gfa_min_samples_per_class", max(8, base // 2))
+        max_count = self._inc_cfg_int("gfa_max_samples_per_class", max(base, int(round(base * self._inc_cfg_float("gfa_max_replay_multiplier", 2.0)))))
+        if hasattr(gb, "adaptive_replay_sample_counts"):
+            target_counts = gb.adaptive_replay_sample_counts(
+                old_classes, new_classes, base_samples_per_class=base,
+                min_samples_per_class=min_count, max_samples_per_class=max_count,
+                risk_weight=self._inc_cfg_float("replay_risk_weight", 0.75),
+                unreliability_weight=self._inc_cfg_float("replay_unreliability_weight", 0.50),
+            )
+        else:
+            target_counts = {c: base for c in old_classes}
+        if hasattr(gb, "adaptive_directed_replay_ratios"):
+            directed_ratios = gb.adaptive_directed_replay_ratios(
+                old_classes, new_classes,
+                min_ratio=self._inc_cfg_float("directed_replay_min_ratio", 0.10),
+                max_ratio=self._inc_cfg_float("directed_replay_max_ratio", 0.40),
+            )
+        else:
+            directed_ratios = {c: self._inc_cfg_float("directed_replay_ratio", 0.15) for c in old_classes}
+        target_directed = {
+            c: (int(round(target_counts[c] * directed_ratios[c])) if new_classes else 0)
+            for c in old_classes
         }
-        return x_old, y_old, stats
+        target_core = {c: target_counts[c] - target_directed[c] for c in old_classes}
+        pair_risk = gb.adaptive_geometry_risk_matrix() if hasattr(gb, "adaptive_geometry_risk_matrix") and new_classes else None
+        multiplier = max(1, self._inc_cfg_int("replay_energy_filter_multiplier", 3))
+        max_rounds = max(1, self._inc_cfg_int("replay_resample_rounds", 4))
+        accepted_x: Dict[Tuple[int, int], List[torch.Tensor]] = {(c, p): [] for c in old_classes for p in (0, 1)}
+        generated = accepted = 0
+        pool_generated = {0: 0, 1: 0}; pool_accepted = {0: 0, 1: 0}
+        coupling_values: List[float] = []
 
-    def sample_old_replay(self, old_snapshot: Dict[str, torch.Tensor], seen_classes: Sequence[int], new_desc: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor | Dict[str, float]]:
-        old_classes = old_snapshot["class_ids"].detach().cpu().tolist()
-        samples_per_class = self._inc_cfg_int("synthetic_replay_per_class", self._inc_cfg_int("component_replay_per_class", 32))
-        use_boundary = self._inc_cfg_bool("use_boundary_geometry_replay", True)
-        x_old, y_old, stats = self._sample_from_snapshot(old_snapshot, samples_per_class, boundary=use_boundary, new_desc=new_desc)
-        if x_old.dim() != 2:
-            raise RuntimeError(f"Replay features must be [B,D], got {tuple(x_old.shape)}")
-        self.assert_global_labels_in_set(y_old, old_classes, "old replay labels")
-        bad_new = sorted(set(y_old.detach().cpu().tolist()).difference(set(old_classes)))
-        if bad_new:
-            raise RuntimeError(f"Replay labels include non-old classes: {bad_new}")
-        local = self.global_to_seen_local(y_old, seen_classes)
-        self.assert_valid_seen_targets(local, len(seen_classes), context="old replay local labels")
-        return {"features": x_old.detach(), "global_labels": y_old.detach(), "local_labels": local.detach(), "stats": stats}
+        def have(c: int, pool: int) -> int:
+            return sum(t.size(0) for t in accepted_x[(c, pool)])
 
-    # Compatibility old API.
+        for _ in range(max_rounds):
+            deficits = {
+                c: (max(0, target_core[c] - have(c, 0)), max(0, target_directed[c] - have(c, 1)))
+                for c in old_classes
+            }
+            if all(a == 0 and b == 0 for a, b in deficits.values()):
+                break
+            request: Dict[int, int] = {}
+            round_ratio: Dict[int, float] = {}
+            for c in old_classes:
+                core_need, dir_need = deficits[c]
+                total_need = core_need + dir_need
+                if total_need <= 0:
+                    request[c] = 0; round_ratio[c] = directed_ratios[c]
+                    continue
+                ratio = directed_ratios[c] if new_classes else 0.0
+                if dir_need > 0 and core_need == 0:
+                    ratio = max(ratio, 0.70)
+                elif core_need > 0 and dir_need == 0:
+                    ratio = 0.0
+                round_ratio[c] = min(max(ratio, 0.0), 0.80)
+                request[c] = max(total_need * multiplier, total_need)
+            replay = gb.sample_replay(
+                old_classes, samples_per_class=request, seen_classes=seen_classes,
+                new_class_ids=new_classes, pair_risk=pair_risk, directed_ratio=round_ratio,
+                pair_risk_topk=self._inc_cfg_int("pair_risk_topk", 3),
+                residual_scale=self._inc_cfg_float("gfa_residual_scale", 0.25),
+                tangent_clip=self._inc_cfg_float("spectral_tangent_clip", 2.5),
+                use_spectral_coupled=self._inc_cfg_bool("use_spectral_coupled_replay", True),
+            )
+            x = replay["features"]; y = replay["global_labels"]
+            pools = replay.get("pool_types", torch.zeros_like(y))
+            generated += int(y.numel()); accepted_diag = replay.get("diagnostics", {})
+            for pool in (0, 1): pool_generated[pool] += int((pools == pool).sum().item())
+            filt = gb.filter_replay_by_geometry_energy(
+                x, y, seen_classes=seen_classes, pool_types=pools,
+                core_margin=self._inc_cfg_float("replay_core_accept_margin", 0.0),
+                directed_max_margin=(self._inc_cfg_float("replay_directed_max_margin", 1.0e9) if self._inc_cfg_float("replay_directed_max_margin", 1.0e9) < 1.0e8 else None),
+            )
+            mask = filt["accept_mask"]
+            accepted += int(mask.sum().item())
+            for pool in (0, 1): pool_accepted[pool] += int((mask & (pools == pool)).sum().item())
+            for c in old_classes:
+                for pool, target in ((0, target_core[c]), (1, target_directed[c])):
+                    room = target - have(c, pool)
+                    if room <= 0: continue
+                    idx = torch.nonzero(mask & (y == c) & (pools == pool), as_tuple=False).flatten()[:room]
+                    if idx.numel() > 0: accepted_x[(c, pool)].append(x.index_select(0, idx).detach())
+            for diag in accepted_diag.values():
+                if isinstance(diag, dict) and "coupling_reliability" in diag:
+                    coupling_values.append(float(diag["coupling_reliability"]))
+
+        missing = {
+            c: {"core": target_core[c] - have(c, 0), "directed": target_directed[c] - have(c, 1)}
+            for c in old_classes
+        }
+        if any(v["core"] > 0 or v["directed"] > 0 for v in missing.values()):
+            raise RuntimeError(
+                "SCTGR replay could not satisfy geometry-valid core/directed quotas. "
+                f"missing={missing}. Inspect spectral coupling or increase candidate/resample settings."
+            )
+        feat_parts: List[torch.Tensor] = []; pool_parts: List[torch.Tensor] = []; label_parts: List[torch.Tensor] = []
+        for c in old_classes:
+            for pool, target in ((0, target_core[c]), (1, target_directed[c])):
+                if target <= 0: continue
+                part = torch.cat(accepted_x[(c, pool)], dim=0)[:target]
+                feat_parts.append(part)
+                pool_parts.append(torch.full((target,), pool, device=self.device, dtype=torch.long))
+                label_parts.append(torch.full((target,), c, device=self.device, dtype=torch.long))
+        feats = torch.cat(feat_parts, dim=0); pools = torch.cat(pool_parts, dim=0); labels = torch.cat(label_parts, dim=0)
+        local = self.global_to_seen_local(labels, seen_classes)
+        stats: Dict[str, Any] = {
+            "target_counts": target_counts, "target_core_counts": target_core,
+            "target_directed_counts": target_directed, "directed_ratios": directed_ratios,
+            "replay_count": int(labels.numel()), "generated_count": generated,
+            "acceptance_rate": float(accepted) / float(max(generated, 1)),
+            "core_count": int((pools == 0).sum().item()), "directed_count": int((pools == 1).sum().item()),
+            "core_acceptance_rate": float(pool_accepted[0]) / float(max(pool_generated[0], 1)),
+            "directed_acceptance_rate": float(pool_accepted[1]) / float(max(pool_generated[1], 1)),
+            "coupling_reliability_mean": sum(coupling_values) / max(len(coupling_values), 1),
+        }
+        return {
+            "features": _finite(feats, "accepted SCTGR replay").detach(),
+            "global_labels": labels.detach(), "local_labels": local.detach(),
+            "pool_types": pools.detach(), "stats": stats,
+        }
     def _sample_old_anchor_batch(self, old_bank_snapshot: Dict[str, torch.Tensor], old_class_count: int, new_class_ids: Optional[Iterable[int]] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Convert old contiguous snapshot from old code to our canonical snapshot if needed.
         snap = old_bank_snapshot
@@ -987,147 +1028,58 @@ class IncrementalPhaseTrainer:
             outs.append(q)
         return torch.stack(outs, dim=0)
 
-    def _geometry_logits_from_bank(self, features: torch.Tensor, bank: Dict[str, torch.Tensor], seen_classes: Sequence[int]) -> torch.Tensor:
+    def _geometry_energy_from_bank(
+        self,
+        features: torch.Tensor,
+        bank: Dict[str, torch.Tensor],
+        seen_classes: Sequence[int],
+    ) -> torch.Tensor:
         ids = torch.as_tensor([int(c) for c in seen_classes], device=features.device, dtype=torch.long)
         mu = bank["means"].to(features.device).index_select(0, ids)
-        U = bank["bases"].to(features.device).index_select(0, ids)
-        eig = bank["eigvals"].to(features.device).index_select(0, ids).clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+        Uall = bank["bases"].to(features.device).index_select(0, ids)
+        eigall = bank["eigvals"].to(features.device).index_select(0, ids).clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
         rv = bank["res_vars"].to(features.device).flatten().index_select(0, ids).clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-        diff = features.unsqueeze(1) - mu.unsqueeze(0)
-        proj = torch.einsum("bsd,sdr->bsr", diff, U)
-        low = (proj.pow(2) / eig.unsqueeze(0).clamp_min(_EPS)).sum(dim=-1)
-        rec = torch.einsum("bsr,sdr->bsd", proj, U)
-        residual = ((diff - rec).pow(2).sum(dim=-1) / rv.view(1, -1).clamp_min(_EPS))
-        energy = (low + residual) / float(max(features.size(1), 1))
-        if self._inc_cfg_bool("use_logdet_energy", True):
-            logdet = torch.log(eig).sum(dim=-1) + torch.log(rv).view(-1) * float(max(features.size(1) - U.size(-1), 0))
-            energy = energy + self._inc_cfg_float("logdet_energy_weight", 0.02) * logdet.view(1, -1)
-        energy = energy - energy.min(dim=1, keepdim=True).values.detach()
-        return -self._inc_cfg_float("loss_scale", 8.0) * energy
+        ranks = bank.get("active_ranks", torch.full((bank["means"].size(0),), Uall.size(-1), device=features.device, dtype=torch.long)).to(features.device).index_select(0, ids).long()
+        cols: List[torch.Tensor] = []
+        for j in range(len(seen_classes)):
+            r = max(0, min(int(ranks[j].item()), Uall.size(-1)))
+            diff = features - mu[j].view(1, -1)
+            if r > 0:
+                U = Uall[j, :, :r]
+                coord = diff.matmul(U)
+                parallel = (coord.pow(2) / eigall[j, :r].view(1, -1)).sum(dim=1) / float(r)
+                residual = diff - coord.matmul(U.t())
+            else:
+                parallel = torch.zeros((features.size(0),), device=features.device, dtype=features.dtype)
+                residual = diff
+            residual_energy = residual.pow(2).sum(dim=1) / (float(max(features.size(1) - r, 1)) * rv[j])
+            energy = parallel + residual_energy
+            if self._inc_cfg_bool("use_logdet_energy", False):
+                logdet = torch.log(eigall[j, :r]).mean() if r > 0 else features.new_tensor(0.0)
+                logdet = logdet + torch.log(rv[j])
+                energy = energy + self._inc_cfg_float("logdet_energy_weight", 0.02) * logdet
+            cols.append(energy)
+        return torch.stack(cols, dim=1)
+
+    def _geometry_logits_from_bank(self, features: torch.Tensor, bank: Dict[str, torch.Tensor], seen_classes: Sequence[int]) -> torch.Tensor:
+        energy = self._geometry_energy_from_bank(features, bank, seen_classes)
+        scale = self._inc_cfg_float("loss_scale", 8.0)
+        logits = -scale * energy
+        return logits.clamp(-self._inc_cfg_float("geometry_logit_clip", 80.0), self._inc_cfg_float("geometry_logit_clip", 80.0))
 
     def _descriptor_margin_loss(self, old_snapshot: Dict[str, torch.Tensor], new_desc: Dict[str, torch.Tensor]) -> torch.Tensor:
         risk = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
-        margin = self._inc_cfg_float("descriptor_overlap_target", 0.35)
-        sub_loss = F.relu(risk["subspace"] - margin).pow(2).mean() if risk["subspace"].numel() else self._zero_like_ref(new_desc["means"])
-        invasion = risk["mahal"].pow(2).mean() if risk["mahal"].numel() else self._zero_like_ref(new_desc["means"])
-        return self._inc_cfg_float("lambda_subspace", 0.20) * sub_loss + self._inc_cfg_float("lambda_insertion", 0.35) * invasion
+        pair_weight = risk["risk"].detach().clamp_min(0.0)
+        if pair_weight.numel() == 0:
+            return self._zero_like_ref(new_desc["means"])
+        pair_weight = pair_weight / pair_weight.mean().clamp_min(_EPS)
+        overlap_target = self._inc_cfg_float("descriptor_subspace_overlap_max", 0.55)
+        center_target = self._inc_cfg_float("descriptor_center_risk_max", 0.50)
+        sub = (pair_weight * F.relu(risk["subspace"] - overlap_target).pow(2)).mean()
+        center = (pair_weight * F.relu(risk["center"] - center_target).pow(2)).mean()
+        return self._inc_cfg_float("lambda_subspace", 0.10) * sub + self._inc_cfg_float("lambda_center_collision", 0.05) * center
 
-    def _old_new_boundary_preservation_loss(
-        self,
-        old_snapshot: Dict[str, torch.Tensor],
-        new_desc: Dict[str, torch.Tensor],
-        *,
-        return_parts: bool = False,
-    ) -> torch.Tensor | Dict[str, torch.Tensor]:
-        """Differentiable old/new boundary preservation for new descriptors only.
 
-        This is the method the trainer contract was correctly looking for. It is
-        not a dummy/stub: it penalizes new rows that enter old ellipsoids, reuse
-        old tangent directions, become too broad, or share high band signatures
-        with risky old rows. Old tensors are detached by construction.
-        """
-        ref = new_desc.get("means", None)
-        if not torch.is_tensor(ref) or ref.numel() == 0:
-            z = self._zero_like_ref(ref)
-            return {"total": z, "risk": z, "overlap": z, "volume": z, "band": z} if return_parts else z
-
-        risk = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
-        risk_mat = risk["risk"]
-        sub = risk["subspace"]
-        band = risk.get("band", torch.zeros_like(sub))
-
-        risk_target = self._inc_cfg_float("max_old_new_risk", 0.60)
-        overlap_target = self._inc_cfg_float("max_old_new_overlap", self._inc_cfg_float("descriptor_subspace_overlap_max", 0.35))
-        risk_loss = F.relu(risk_mat - risk_target).pow(2).mean() if risk_mat.numel() else self._zero_like_ref(ref)
-        overlap_loss = F.relu(sub - overlap_target).pow(2).mean() if sub.numel() else self._zero_like_ref(ref)
-        band_loss = F.relu(band - self._inc_cfg_float("pgr_band_overlap_max", 0.75)).pow(2).mean() if band.numel() else self._zero_like_ref(ref)
-
-        eig = new_desc.get("eigvals", None)
-        res = new_desc.get("res_vars", None)
-        volume_loss = self._zero_like_ref(ref)
-        if torch.is_tensor(eig) and torch.is_tensor(res) and eig.numel() > 0 and res.numel() > 0:
-            new_volume = torch.log(eig.clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).mean(dim=1) + torch.log(res.clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).view(-1)
-            old_e = old_snapshot.get("eigvals", None)
-            old_r = old_snapshot.get("res_vars", None)
-            if torch.is_tensor(old_e) and torch.is_tensor(old_r) and old_e.numel() > 0 and old_r.numel() > 0:
-                old_volume = torch.log(old_e.detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).mean(dim=1) + torch.log(old_r.detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).view(-1)
-                cap = old_volume.mean().detach() + old_volume.std(unbiased=False).detach()
-                volume_loss = F.relu(new_volume - cap).pow(2).mean()
-
-        total = (
-            self._inc_cfg_float("boundary_preserve_center_weight", 0.50) * risk_loss
-            + self._inc_cfg_float("boundary_preserve_overlap_weight", 1.00) * overlap_loss
-            + self._inc_cfg_float("boundary_preserve_volume_weight", 0.25) * volume_loss
-            + self._inc_cfg_float("boundary_preserve_band_weight", 0.10) * band_loss
-        )
-        _finite(total, "old_new_boundary_preservation_loss")
-        if return_parts:
-            return {
-                "total": total,
-                "risk": risk_loss.detach(),
-                "overlap": overlap_loss.detach(),
-                "volume": volume_loss.detach(),
-                "band": band_loss.detach(),
-                "risk_max": risk_mat.detach().max() if risk_mat.numel() else self._zero_like_ref(ref).detach(),
-                "overlap_max": sub.detach().max() if sub.numel() else self._zero_like_ref(ref).detach(),
-            }
-        return total
-
-    @torch.no_grad()
-    def _project_new_descriptor_params_out_of_old_tangent_space(
-        self,
-        desc: Dict[str, torch.Tensor],
-        old_snapshot: Dict[str, torch.Tensor],
-        *,
-        risk_parts: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Hard projection step for new rows only.
-
-        It removes components of new bases that lie in risky old tangent spaces
-        and applies a small mean push/variance shrink. This never edits old rows.
-        """
-        parts = risk_parts if isinstance(risk_parts, dict) else self._risk_matrix_from_descriptors(old_snapshot, desc)
-        out = self._fallback_safe_new_row_correction(desc, old_snapshot, parts)
-        self._assert_descriptor_block_valid(out, context="boundary-projected new descriptors")
-        return out
-
-    def _adaptive_boundary_loss_from_current_bank(
-        self,
-        logits: Optional[torch.Tensor] = None,
-        labels_local: Optional[torch.Tensor] = None,
-        *,
-        old_class_count: int = 0,
-        seen_classes: Optional[Sequence[int]] = None,
-    ) -> torch.Tensor:
-        """Optional adaptive-boundary loss, gated by --use_adaptive_boundary.
-
-        The clean command uses --use_adaptive_boundary false, so this returns a
-        safe zero. When a repaired classifier exposes adaptive_boundary_loss, this
-        delegates to it without making adaptive boundary a hidden main-path module.
-        """
-        ref = logits if torch.is_tensor(logits) else None
-        if not self._inc_cfg_bool("use_adaptive_boundary", False):
-            return self._zero_like_ref(ref)
-        clf = getattr(self.model, "classifier", None)
-        if clf is None or not hasattr(clf, "adaptive_boundary_loss"):
-            return self._zero_like_ref(ref)
-        try:
-            loss = clf.adaptive_boundary_loss(
-                logits=logits,
-                labels=labels_local,
-                old_class_count=int(old_class_count),
-                seen_classes=list(seen_classes or []),
-            )
-        except TypeError:
-            try:
-                loss = clf.adaptive_boundary_loss(logits, labels_local, int(old_class_count))
-            except TypeError:
-                return self._zero_like_ref(ref)
-        if isinstance(loss, dict):
-            loss = loss.get("total", self._zero_like_ref(ref))
-        if not torch.is_tensor(loss):
-            return self._zero_like_ref(ref)
-        return _finite(loss, "adaptive_boundary_loss")
 
     def _refine_new_descriptors_impl(
         self,
@@ -1141,179 +1093,211 @@ class IncrementalPhaseTrainer:
         init_desc: Dict[str, torch.Tensor],
         steps: int,
     ) -> Dict[str, Any]:
+        """Refine only new means/eigenvalues/residual variances in canonical space.
+
+        The feature and spectral bases stay fixed so the fitted spectral-to-feature
+        coupling remains valid. Old rows are detached and immutable.
+        """
         if steps <= 0 or not self._inc_cfg_bool("refine_new_descriptors", True):
-            return {"desc": init_desc, "stats": {"loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "margin": 0.0, "steps": 0.0}}
+            return {"desc": init_desc, "stats": {"loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "steps": 0.0}}
         base_bank = self._bank_dict()
-        ids = torch.as_tensor([int(c) for c in new_classes], device=self.device, dtype=torch.long)
         mu0 = init_desc["means"].detach().clone()
         U0 = init_desc["bases"].detach().clone()
         eig0 = init_desc["eigvals"].detach().clone().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
         res0 = init_desc["res_vars"].detach().clone().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
         mu = nn.Parameter(mu0.clone())
-        raw_U = nn.Parameter(U0.clone())
         log_eig = nn.Parameter(eig0.log())
         log_res = nn.Parameter(res0.log())
-        opt = optim.Adam([mu, raw_U, log_eig, log_res], lr=self._inc_cfg_float("descriptor_refine_lr", 1e-3), weight_decay=0.0)
-        max_mean_shift = self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35)
-        max_logvar_shift = self._inc_cfg_float("descriptor_refine_max_logvar_shift", 0.75)
-        replay_weight = self._inc_cfg_float("lambda_replay", self._inc_cfg_float("synthetic_replay_weight", 1.0))
-        new_weight = self._inc_cfg_float("lambda_new", 1.0)
-        margin_weight = self._inc_cfg_float("lambda_margin", 1.0)
-        stats = {"loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "margin": 0.0, "replay_acc": 0.0, "steps": 0.0}
+        opt = optim.Adam([mu, log_eig, log_res], lr=self._inc_cfg_float("descriptor_refine_lr", 1e-3), weight_decay=0.0)
+        max_mean_shift = self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.30)
+        max_logvar_shift = self._inc_cfg_float("descriptor_refine_max_logvar_shift", 0.50)
+        margin_energy = self._inc_cfg_float("geometry_energy_margin", 0.30)
+        invasion_energy = self._inc_cfg_float("old_new_geometry_margin", 0.35)
+        scale = self._inc_cfg_float("loss_scale", 8.0)
+        new_local = self.global_to_seen_local(y_new, seen_classes)
+        old_local_ids = torch.as_tensor([seen_classes.index(c) for c in old_classes], device=self.device, dtype=torch.long)
+        new_local_ids = torch.as_tensor([seen_classes.index(c) for c in new_classes], device=self.device, dtype=torch.long)
+        counts = init_desc.get("sample_counts", torch.ones((len(new_classes),), device=self.device)).float().clamp_min(1.0)
+        rel = init_desc.get("reliability", torch.ones_like(counts)).float().clamp(0.05, 1.0)
+        trust_class = 1.0 + self._inc_cfg_float("descriptor_trust_small_class_weight", 1.0) / counts.sqrt() + self._inc_cfg_float("descriptor_trust_unreliable_weight", 1.0) * (1.0 - rel)
+
+        stats = {k: 0.0 for k in ("loss", "ce_new", "ce_replay", "margin", "invasion", "fit", "collision", "trust", "replay_acc", "old_to_new", "new_to_old", "steps")}
+        last_replay_stats: Dict[str, Any] = {}
         for _ in range(int(steps)):
             opt.zero_grad(set_to_none=True)
-            U = self._orthonormalize_bases(raw_U, U0)
             eig = log_eig.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
             res = log_res.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-            tmp_bank = self._compose_bank_for_descriptor_params(base_bank, new_classes, mu, U, eig, res)
-            logits_new = self._geometry_logits_from_bank(z_new, tmp_bank, seen_classes)
-            ce_new = self._stable_ce_seen(logits_new, y_new, seen_classes, "descriptor new CE")
             cur_desc = dict(init_desc)
-            cur_desc.update({"means": mu, "bases": U, "eigvals": eig, "res_vars": res})
+            cur_desc.update({"means": mu, "bases": U0, "eigvals": eig, "res_vars": res})
+            tmp_bank = self._compose_bank_for_descriptor_params(base_bank, new_classes, mu, U0, eig, res)
+
             replay = self.sample_old_replay(old_snapshot, seen_classes, new_desc=cur_desc)
             z_old = replay["features"].to(self.device)  # type: ignore[index]
             y_old = replay["global_labels"].to(self.device).long()  # type: ignore[index]
-            logits_old = self._geometry_logits_from_bank(z_old, tmp_bank, seen_classes)
-            ce_replay = self._stable_ce_seen(logits_old, y_old, seen_classes, "descriptor replay CE")
-            # Boundary preservation is the real old/new protection.
-            # It includes ellipsoid-invasion, tangent-space overlap, volume, and band-risk terms.
-            boundary_parts = self._old_new_boundary_preservation_loss(old_snapshot, cur_desc, return_parts=True)
-            margin = self._descriptor_margin_loss(old_snapshot, cur_desc) + self._inc_cfg_float("boundary_preserve_weight", 0.35) * boundary_parts["total"]
-            trust = (mu - mu0).pow(2).mean() + (U - U0).pow(2).mean() + (log_eig - eig0.log()).pow(2).mean() + (log_res - res0.log()).pow(2).mean()
-            loss = new_weight * ce_new + replay_weight * ce_replay + margin_weight * margin + self._inc_cfg_float("lambda_trust", 0.05) * trust
-            _finite(loss, "descriptor refinement loss")
+            y_old_local = self.global_to_seen_local(y_old, seen_classes)
+            last_replay_stats = dict(replay.get("stats", {}))  # type: ignore[arg-type]
+
+            energy_new = self._geometry_energy_from_bank(z_new, tmp_bank, seen_classes)
+            energy_old = self._geometry_energy_from_bank(z_old, tmp_bank, seen_classes)
+            logits_new = -scale * energy_new
+            logits_old = -scale * energy_old
+            ce_new = self._stable_ce_seen(logits_new, y_new, seen_classes, "SCTGR new CE")
+            ce_replay = self._stable_ce_seen(logits_old, y_old, seen_classes, "SCTGR replay CE")
+            joint_ce = self._stable_ce_seen(
+                torch.cat([logits_old, logits_new], dim=0),
+                torch.cat([y_old, y_new], dim=0),
+                seen_classes,
+                "SCTGR all-seen class-balanced CE",
+            )
+
+            def margin_loss(energy: torch.Tensor, targets: torch.Tensor, margin: float) -> Tuple[torch.Tensor, torch.Tensor]:
+                true = energy.gather(1, targets.view(-1, 1)).squeeze(1)
+                rival_m = energy.clone()
+                rival_m.scatter_(1, targets.view(-1, 1), float("inf"))
+                rival = rival_m.min(dim=1).values
+                gap = rival - true
+                return F.relu(float(margin) - gap).mean(), gap
+
+            m_new, gap_new = margin_loss(energy_new, new_local, margin_energy)
+            m_old, gap_old = margin_loss(energy_old, y_old_local, margin_energy)
+            margin = 0.5 * (m_new + m_old)
+
+            true_new = energy_new.gather(1, new_local.view(-1, 1)).squeeze(1)
+            best_old = energy_new.index_select(1, old_local_ids).min(dim=1).values
+            new_to_old = F.relu(invasion_energy - (best_old - true_new)).mean()
+            true_old = energy_old.gather(1, y_old_local.view(-1, 1)).squeeze(1)
+            best_new = energy_old.index_select(1, new_local_ids).min(dim=1).values
+            old_to_new = F.relu(invasion_energy - (best_new - true_old)).mean()
+            invasion = new_to_old + old_to_new
+
+            fit = torch.stack([true_new[y_new == int(c)].mean() for c in new_classes]).mean()
+            collision = self._descriptor_margin_loss(old_snapshot, cur_desc)
+            mean_shift = (mu - mu0).pow(2).mean(dim=1)
+            eig_shift = (log_eig - eig0.log()).pow(2).mean(dim=1)
+            res_shift = (log_res - res0.log()).pow(2)
+            trust = (trust_class * (mean_shift + eig_shift + res_shift)).mean()
+
+            loss = (
+                self._inc_cfg_float("joint_old_new_ce_weight", 1.0) * joint_ce
+                + self._inc_cfg_float("geometry_energy_margin_weight", 0.30) * margin
+                + self._inc_cfg_float("old_new_invasion_weight", 0.50) * invasion
+                + self._inc_cfg_float("new_descriptor_fit_weight", 0.10) * fit
+                + collision
+                + self._inc_cfg_float("descriptor_trust_weight", 0.80) * trust
+            )
+            _finite(loss, "SCTGR descriptor refinement loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_([mu, raw_U, log_eig, log_res], self._inc_cfg_float("descriptor_refine_grad_clip", 1.0))
+            torch.nn.utils.clip_grad_norm_([mu, log_eig, log_res], self._inc_cfg_float("descriptor_refine_grad_clip", 1.0))
             opt.step()
             with torch.no_grad():
-                # Hard identity preservation around admitted descriptor.
                 delta = mu - mu0
                 norm = delta.norm(dim=1, keepdim=True).clamp_min(_EPS)
-                scale = (max_mean_shift / norm).clamp(max=1.0)
-                mu.copy_(mu0 + delta * scale)
+                mu.copy_(mu0 + delta * (max_mean_shift / norm).clamp(max=1.0))
                 log_eig.copy_(torch.max(torch.min(log_eig, eig0.log() + max_logvar_shift), eig0.log() - max_logvar_shift))
                 log_res.copy_(torch.max(torch.min(log_res, res0.log() + max_logvar_shift), res0.log() - max_logvar_shift))
-            pred_old = logits_old.detach().argmax(dim=1)
-            y_old_local = self.global_to_seen_local(y_old, seen_classes)
             stats["loss"] += float(loss.detach().cpu().item())
             stats["ce_new"] += float(ce_new.detach().cpu().item())
             stats["ce_replay"] += float(ce_replay.detach().cpu().item())
             stats["margin"] += float(margin.detach().cpu().item())
-            stats["replay_acc"] += float((pred_old == y_old_local).float().mean().detach().cpu().item() * 100.0)
+            stats["invasion"] += float(invasion.detach().cpu().item())
+            stats["fit"] += float(fit.detach().cpu().item())
+            stats["collision"] += float(collision.detach().cpu().item())
+            stats["trust"] += float(trust.detach().cpu().item())
+            stats["replay_acc"] += float((energy_old.argmin(dim=1) == y_old_local).float().mean().cpu().item() * 100.0)
+            stats["old_to_new"] += float((energy_old.index_select(1, new_local_ids).min(dim=1).values <= true_old).float().mean().cpu().item() * 100.0)
+            stats["new_to_old"] += float((energy_new.index_select(1, old_local_ids).min(dim=1).values <= true_new).float().mean().cpu().item() * 100.0)
             stats["steps"] += 1.0
+
         with torch.no_grad():
-            U = self._orthonormalize_bases(raw_U, U0)
-            eig = log_eig.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
-            res = log_res.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
             final_desc = dict(init_desc)
-            final_desc.update({"means": mu.detach(), "bases": U.detach(), "eigvals": eig.detach(), "res_vars": res.detach()})
-            if self._inc_cfg_bool("use_boundary_projection", False):
-                final_desc = self._project_new_descriptor_params_out_of_old_tangent_space(final_desc, old_snapshot)
-            self._assert_descriptor_block_valid(final_desc, context="refined new descriptors")
+            final_desc.update({
+                "means": mu.detach(), "bases": U0.detach(),
+                "eigvals": log_eig.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4)).detach(),
+                "res_vars": log_res.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4)).detach(),
+            })
+            final_bank = self._compose_bank_for_descriptor_params(base_bank, new_classes, final_desc["means"], U0, final_desc["eigvals"], final_desc["res_vars"])
+            final_energy = self._geometry_energy_from_bank(z_new, final_bank, seen_classes)
+            q_e, q_m = [], []
+            for c in new_classes:
+                mask = y_new == int(c)
+                target = torch.full((int(mask.sum().item()),), seen_classes.index(c), device=self.device, dtype=torch.long)
+                e = final_energy[mask]
+                true = e.gather(1, target.view(-1, 1)).squeeze(1)
+                rival_m = e.clone(); rival_m.scatter_(1, target.view(-1, 1), float("inf"))
+                gap = rival_m.min(dim=1).values - true
+                q_e.append(torch.quantile(true, torch.tensor([0.50, 0.75, 0.90, 0.95], device=self.device)))
+                q_m.append(torch.quantile(gap, torch.tensor([0.05, 0.10], device=self.device)))
+            final_desc["energy_quantiles"] = torch.stack(q_e)
+            final_desc["margin_quantiles"] = torch.stack(q_m)
+            self._assert_descriptor_block_valid(final_desc, context="refined SCTGR new descriptors")
         denom = max(stats["steps"], 1.0)
-        for k in ("loss", "ce_new", "ce_replay", "margin", "replay_acc"):
-            stats[k] /= denom
+        for key in stats:
+            if key != "steps":
+                stats[key] /= denom
+        stats["replay"] = last_replay_stats
         return {"desc": final_desc, "stats": stats}
 
     # ------------------------------------------------------------------
-    # Trainability: descriptor-only default; adapter optional ablation
+    # Trainability: frozen base space + optional bounded residual adapter
     # ------------------------------------------------------------------
     def _incremental_update_mode(self) -> str:
-        mode = str(getattr(self.args, "incremental_update_mode", "scbgr")).lower().strip()
+        mode = str(getattr(self.args, "incremental_update_mode", "spectral_coupled_geometry_replay")).lower().strip()
         aliases = {
-            "": "scbgr",
-            "none": "scbgr",
-            "clean": "scbgr",
-            "descriptor": "scbgr",
-            "descriptor_only": "scbgr",
-            "rsgi": "scbgr",
-            "scbgr": "scbgr",
-            "scb-gr": "scbgr",
-            "spectral_risk_boundary": "scbgr",
-            "geometry_state_admission": "scbgr",
-            "g2rpa": "geometry_gated_adapter",
-            "g2-rpa": "geometry_gated_adapter",
-            "adapter": "geometry_gated_adapter",
-            "gated_adapter": "geometry_gated_adapter",
-            "geometry_adapter": "geometry_gated_adapter",
+            "": "spectral_coupled_geometry_replay",
+            "none": "spectral_coupled_geometry_replay",
+            "clean": "spectral_coupled_geometry_replay",
+            "descriptor": "spectral_coupled_geometry_replay",
+            "descriptor_only": "spectral_coupled_geometry_replay",
+            "scbgr": "spectral_coupled_geometry_replay",
+            "sctgr": "spectral_coupled_geometry_replay",
+            "spectral_coupled": "spectral_coupled_geometry_replay",
+            "spectral_coupled_geometry_replay": "spectral_coupled_geometry_replay",
         }
+        forbidden = {"geometry_gated_adapter", "adapter", "gated_adapter", "g2rpa", "g2-rpa"}
+        if mode in forbidden:
+            raise RuntimeError("Feature adapters are forbidden. Use incremental_update_mode=spectral_coupled_geometry_replay.")
         mode = aliases.get(mode, mode)
-        if mode not in {"scbgr", "geometry_gated_adapter"}:
-            raise RuntimeError(f"Unsupported incremental_update_mode={mode!r}. Use scbgr or geometry_gated_adapter.")
-        try:
-            setattr(self.args, "incremental_update_mode", mode)
-        except Exception:
-            pass
+        if mode != "spectral_coupled_geometry_replay":
+            raise RuntimeError(f"Unsupported incremental_update_mode={mode!r}.")
+        setattr(self.args, "incremental_update_mode", mode)
         return mode
 
     def _adapter_mode_enabled(self) -> bool:
-        return self._incremental_update_mode() == "geometry_gated_adapter"
+        return False
 
     def configure_incremental_trainability(self, old_classes: Sequence[int], new_classes: Sequence[int]) -> List[nn.Parameter]:
-        # Hard-disable old-row transport and legacy paths unless explicit unsafe ablation.
-        if self._inc_cfg_bool("use_sglat_transport", False) or self._inc_cfg_bool("allow_old_model_transport", False):
-            if not self._inc_cfg_bool("unsafe_allow_old_row_transport", False):
-                raise RuntimeError(
-                    "Old-row SGLAT/affine transport is disabled in the clean NECIL-HSI path. "
-                    "Use new-row safe insertion transport only."
-                )
+        """Freeze the canonical model. Only temporary descriptor tensors are optimized."""
+        if any(self._inc_cfg_bool(name, False) for name in (
+            "use_sglat_transport", "allow_old_model_transport", "use_geometry_transport",
+            "use_energy_calibrator", "use_adaptive_boundary",
+        )):
+            raise RuntimeError("Transport, calibration, and adaptive-boundary modules are forbidden in SCTGR-RGA.")
+        self._incremental_update_mode()
         for _, p in self.model.named_parameters():
             p.requires_grad = False
-        for attr, value in (
-            ("use_incremental_adapter", False),
-            ("use_bicyc_geometry_cycle", False),
-            ("use_geometry_calibrator", False),
-            ("use_geometry_transport", False),  # model-side old-row transport off; trainer calls new-row transport explicitly.
+        for attr in (
+            "use_incremental_adapter", "use_geometry_gated_adapter", "use_bicyc_geometry_cycle",
+            "use_geometry_calibrator", "use_geometry_transport", "use_energy_calibrator", "use_adaptive_boundary",
         ):
             if hasattr(self.model, attr):
-                setattr(self.model, attr, value)
-        for name in ("freeze_backbone_except_allowed", "freeze_semantic_encoder", "freeze_classifier", "freeze_projection_head", "freeze_backbone_only", "disable_incremental_adapter"):
+                setattr(self.model, attr, False)
+        for name in (
+            "freeze_backbone_except_allowed", "freeze_semantic_encoder", "freeze_classifier",
+            "freeze_projection_head", "freeze_backbone_only", "freeze_energy_calibrator",
+            "freeze_geometry_calibrator", "disable_incremental_adapter",
+        ):
             fn = getattr(self.model, name, None)
             if callable(fn):
                 try:
                     fn()
                 except TypeError:
-                    try:
-                        fn(allow_last_block=False)
-                    except TypeError:
-                        pass
-        params: List[nn.Parameter] = []
-        if self._adapter_mode_enabled():
-            adapter = getattr(self.model, "geometry_plastic_adapter", None)
-            if adapter is None:
-                raise RuntimeError("geometry_gated_adapter ablation requires model.geometry_plastic_adapter.")
-            if hasattr(self.model, "use_geometry_gated_adapter"):
-                self.model.use_geometry_gated_adapter = True
-            for p in adapter.parameters():
-                p.requires_grad = True
-                params.append(p)
-        if self._inc_cfg_bool("use_energy_calibrator", False):
-            if hasattr(self.model, "unfreeze_energy_calibrator"):
-                self.model.unfreeze_energy_calibrator()
-            for name, p in self.model.named_parameters():
-                if "energy_calibrator" in name or "old_bias" in name or "new_bias" in name or "old_log_scale" in name or "new_log_scale" in name:
-                    p.requires_grad = True
-                    params.append(p)
-        if self._inc_cfg_bool("use_adaptive_boundary", False):
-            clf = getattr(self.model, "classifier", None)
-            if clf is not None and hasattr(clf, "boundary_parameters"):
-                if hasattr(clf, "freeze_old_boundary_radii"):
-                    clf.freeze_old_boundary_radii(len(old_classes))
-                for p in clf.boundary_parameters():
-                    if p.requires_grad:
-                        params.append(p)
-        bad = []
-        allowed = ("geometry_plastic_adapter", "energy_calibrator", "old_bias", "new_bias", "old_log_scale", "new_log_scale", "boundary")
-        for name, p in self.model.named_parameters():
-            if p.requires_grad and not any(a in name for a in allowed):
-                bad.append(name)
+                    try: fn(allow_last_block=False)
+                    except TypeError: pass
+        bad = [name for name, p in self.model.named_parameters() if p.requires_grad]
         if bad:
-            raise RuntimeError(f"Forbidden trainable incremental parameters: {bad[:20]}")
-        names = [name for name, p in self.model.named_parameters() if p.requires_grad]
-        print(f"[Incremental Trainability] mode={self._incremental_update_mode()} | trainable={names if names else 'descriptor-only (no model weights)'}")
-        return list(dict.fromkeys(params))
-
-    # Uploaded-file compatibility names.
+            raise RuntimeError(f"No model parameters may be trainable in SCTGR-RGA: {bad[:20]}")
+        print("[Incremental Trainability] frozen backbone/projection/classifier; temporary new descriptor residuals only")
+        return []
     def _set_clean_incremental_trainable_params(self, old_class_count: int) -> List[nn.Parameter]:
         return self.configure_incremental_trainability(list(range(int(old_class_count))), [])
 
@@ -1321,238 +1305,79 @@ class IncrementalPhaseTrainer:
         return self._set_clean_incremental_trainable_params(old_class_count)
 
     # ------------------------------------------------------------------
-    # Optional adapter ablation training (bounded, not default)
-    # ------------------------------------------------------------------
-    def _adapt_replay_features_for_adapter_training(self, z_old: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Apply the geometry-gated adapter to synthetic old z-space samples.
 
-        Synthetic replay samples already live in GeometryBank z-space, so they
-        cannot pass through the backbone/projection. But when the adapter is
-        trainable, old replay must still pass through the adapter directly;
-        otherwise CE_replay has no gradient path into the adapter and cannot
-        teach gate≈0 in old basins.
-        """
-        z_old = _finite(z_old.float(), "adapter old replay base features")
-        fn = getattr(self.model, "adapt_projected_features", None)
-        if callable(fn):
-            try:
-                out = fn(z_old, force=True, return_delta=True)
-            except TypeError:
-                out = fn(z_old)
-            if isinstance(out, dict):
-                z = out.get("features", out.get("projected_features", None))
-                if not torch.is_tensor(z):
-                    raise RuntimeError("adapt_projected_features(return_delta=True) did not return features.")
-                delta = out.get("delta", z - z_old)
-                gate = out.get("gate", torch.zeros((z.size(0), 1), device=z.device, dtype=z.dtype))
-                return {"features": _finite(z.float(), "adapted old replay features"), "delta": delta, "gate": gate}
-            if torch.is_tensor(out):
-                return {"features": _finite(out.float(), "adapted old replay features"), "delta": out - z_old, "gate": torch.zeros((out.size(0), 1), device=out.device, dtype=out.dtype)}
-        return {"features": z_old, "delta": torch.zeros_like(z_old), "gate": torch.zeros((z_old.size(0), 1), device=z_old.device, dtype=z_old.dtype)}
 
-    def _adapter_regularization_loss(
-        self,
-        *,
-        new_out: Dict[str, torch.Tensor],
-        old_adapt: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Bounded plasticity regularizer for G²RPA.
-
-        Old synthetic replay must remain nearly unchanged. New real samples may
-        move, but only inside a small trust region. This prevents the adapter
-        from becoming an uncontrolled incremental classifier while still giving
-        enough plasticity to fix descriptor-only old/new bias.
-        """
-        ref = old_adapt["features"]
-        old_delta = old_adapt.get("delta", torch.zeros_like(ref))
-        old_gate = old_adapt.get("gate", torch.zeros((ref.size(0), 1), device=ref.device, dtype=ref.dtype))
-        new_delta = new_out.get("adapter_delta", torch.zeros_like(new_out["features"]))
-        new_gate = new_out.get("adapter_gate", torch.zeros((new_out["features"].size(0), 1), device=new_out["features"].device, dtype=new_out["features"].dtype))
-
-        old_delta_loss = old_delta.pow(2).mean()
-        old_gate_loss = old_gate.clamp_min(0.0).mean()
-        max_new_delta = self._inc_cfg_float("adapter_new_delta_max", self._inc_cfg_float("adapter_max_scale", 0.10))
-        new_norm = new_delta.norm(dim=1)
-        new_delta_loss = F.relu(new_norm - max_new_delta).pow(2).mean()
-        new_gate_target = self._inc_cfg_float("adapter_new_gate_target", 0.15)
-        new_gate_max = self._inc_cfg_float("adapter_new_gate_max_target", self._inc_cfg_float("adapter_new_gate_max", 0.35))
-        new_gate_mean = new_gate.clamp_min(0.0).mean()
-        new_gate_loss = F.relu(new_gate_mean - new_gate_max).pow(2) + 0.10 * (new_gate_mean - new_gate_target).pow(2)
-
-        loss = (
-            self._inc_cfg_float("adapter_old_delta_weight", 1.00) * old_delta_loss
-            + self._inc_cfg_float("adapter_old_gate_weight", 0.75) * old_gate_loss
-            + self._inc_cfg_float("adapter_new_delta_weight", 0.25) * new_delta_loss
-            + self._inc_cfg_float("adapter_new_gate_weight", 0.10) * new_gate_loss
-        )
-        stats = {
-            "gate_old": float(old_gate.detach().mean().cpu().item()) if old_gate.numel() else 0.0,
-            "gate_new": float(new_gate.detach().mean().cpu().item()) if new_gate.numel() else 0.0,
-            "delta_old": float(old_delta.detach().norm(dim=1).mean().cpu().item()) if old_delta.numel() else 0.0,
-            "delta_new": float(new_delta.detach().norm(dim=1).mean().cpu().item()) if new_delta.numel() else 0.0,
-            "adapter_reg": float(loss.detach().cpu().item()),
-        }
-        return _finite(loss, "adapter_regularization_loss"), stats
-
-    def train_one_adapter_epoch(
+    @torch.no_grad()
+    def validate_incremental_phase(
         self,
         loader,
-        optimizer: optim.Optimizer,
-        *,
-        old_snapshot: Dict[str, torch.Tensor],
-        seen_classes: Sequence[int],
         old_classes: Sequence[int],
         new_classes: Sequence[int],
-        new_desc: Dict[str, torch.Tensor],
-    ) -> Dict[str, float]:
-        if optimizer is None:
-            return {"adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "steps": 0.0}
-        self.model.train()
-        stats = {
-            "adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "adaptive_boundary": 0.0,
-            "adapter_reg": 0.0, "gate_old": 0.0, "gate_new": 0.0, "delta_old": 0.0, "delta_new": 0.0,
-            "steps": 0.0, "old_replay_acc": 0.0,
-        }
-        old_ref = self.snapshot_old_geometry(old_classes)
-        for batch in loader:
-            x, y, spectra, _ = self._unpack_batch(batch)
-            x = x.float().to(self.device, non_blocking=True)
-            y = y.long().to(self.device, non_blocking=True).view(-1)
-            self.assert_global_labels_in_set(y, new_classes, "adapter real new batch")
-            optimizer.zero_grad(set_to_none=True)
-
-            # Real new samples go through the model path, therefore through the
-            # adapter when geometry_gated_adapter is enabled.
-            out = self.extract_incremental_features(x, spectra)
-            z_new = out["features"]
-            logits_new = self.compute_seen_logits(z_new, seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
-            ce_new = self._stable_ce_seen(logits_new, y, seen_classes, "adapter CE_new")
-
-            # Synthetic old replay is already z-space. It must pass through the
-            # adapter directly; otherwise CE_replay cannot train the adapter and
-            # old-region gates never learn to close.
-            replay = self.sample_old_replay(old_snapshot, seen_classes, new_desc=new_desc)
-            z_old_base = replay["features"].to(self.device)  # type: ignore[index]
-            y_old = replay["global_labels"].to(self.device).long()  # type: ignore[index]
-            old_adapt = self._adapt_replay_features_for_adapter_training(z_old_base)
-            z_old = old_adapt["features"]
-            logits_old = self.compute_seen_logits(z_old, seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
-            ce_replay = self._stable_ce_seen(logits_old, y_old, seen_classes, "adapter CE_replay")
-
-            y_new_local = self.global_to_seen_local(y, seen_classes)
-            y_old_local = self.global_to_seen_local(y_old, seen_classes)
-            logits_all = torch.cat([logits_new, logits_old], dim=0)
-            labels_all = torch.cat([y_new_local, y_old_local], dim=0)
-            adaptive_boundary = self._adaptive_boundary_loss_from_current_bank(
-                logits_all,
-                labels_all,
-                old_class_count=len(old_classes),
-                seen_classes=seen_classes,
-            )
-            adapter_reg, reg_stats = self._adapter_regularization_loss(new_out=out, old_adapt=old_adapt)
-
-            loss = (
-                self._inc_cfg_float("adapter_new_ce_weight", 1.00) * ce_new
-                + self._inc_cfg_float("lambda_replay", self._inc_cfg_float("adapter_replay_weight", 1.00)) * ce_replay
-                + self._inc_cfg_float("adaptive_boundary_loss_weight", 1.00) * adaptive_boundary
-                + self._inc_cfg_float("adapter_regularization_weight", 1.00) * adapter_reg
-            )
-            _finite(loss, "adapter incremental loss")
-            loss.backward()
-            trainable = [p for p in self.model.parameters() if p.requires_grad]
-            if trainable:
-                torch.nn.utils.clip_grad_norm_(trainable, self._inc_cfg_float("grad_clip_inc", 0.5))
-            optimizer.step()
-            self.assert_old_geometry_unchanged(old_ref, "adapter_epoch", atol=1e-6)
-
-            stats["adapter_loss"] += float(loss.detach().cpu().item())
-            stats["ce_new"] += float(ce_new.detach().cpu().item())
-            stats["ce_replay"] += float(ce_replay.detach().cpu().item())
-            stats["adaptive_boundary"] += float(adaptive_boundary.detach().cpu().item()) if torch.is_tensor(adaptive_boundary) else 0.0
-            stats["adapter_reg"] += float(adapter_reg.detach().cpu().item())
-            stats["gate_old"] += reg_stats["gate_old"]
-            stats["gate_new"] += reg_stats["gate_new"]
-            stats["delta_old"] += reg_stats["delta_old"]
-            stats["delta_new"] += reg_stats["delta_new"]
-            stats["old_replay_acc"] += float((logits_old.detach().argmax(dim=1) == y_old_local).float().mean().cpu().item() * 100.0)
-            stats["steps"] += 1.0
-        denom = max(stats["steps"], 1.0)
-        for k in ("adapter_loss", "ce_new", "ce_replay", "adaptive_boundary", "adapter_reg", "gate_old", "gate_new", "delta_old", "delta_new", "old_replay_acc"):
-            stats[k] /= denom
-        return stats
-
-
-    # ------------------------------------------------------------------
-    # Validation/diagnostics/checkpoint selection
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def validate_incremental_phase(self, loader, old_classes: Sequence[int], new_classes: Sequence[int], seen_classes: Sequence[int]) -> Dict[str, Any]:
+        seen_classes: Sequence[int],
+    ) -> Dict[str, Any]:
         self.model.eval()
-        total_loss = 0.0
-        total = 0
-        correct = 0
+        total_loss = total = correct = invalid = 0
+        old_to_new = new_to_old = 0
+        old_total = new_total = 0
+        margin_viol = 0
         per_total = {int(c): 0 for c in seen_classes}
         per_correct = {int(c): 0 for c in seen_classes}
         pred_hist = {int(c): 0 for c in seen_classes}
-        old_logits: List[torch.Tensor] = []
-        new_logits: List[torch.Tensor] = []
-        invalid = 0
+        old_set, new_set = set(map(int, old_classes)), set(map(int, new_classes))
+        old_idx = torch.as_tensor([seen_classes.index(c) for c in old_classes], device=self.device, dtype=torch.long)
+        new_idx = torch.as_tensor([seen_classes.index(c) for c in new_classes], device=self.device, dtype=torch.long)
+        gaps: List[torch.Tensor] = []
         for batch in loader:
             x, y, spectra, _ = self._unpack_batch(batch)
             x = x.float().to(self.device, non_blocking=True)
             y = y.long().to(self.device, non_blocking=True).view(-1)
             self.assert_global_labels_in_set(y, seen_classes, "cumulative validation batch")
-            out = self.extract_incremental_features(x, spectra)
-            logits = self.compute_seen_logits(out["features"], seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
+            z = self.extract_incremental_features(x, spectra)["features"]
+            logits = self.compute_seen_logits(z, seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
             y_local = self.global_to_seen_local(y, seen_classes)
             loss = self._stable_ce(logits, y_local)
             pred_local = logits.argmax(dim=1)
             pred_global = self.seen_local_to_global(pred_local, seen_classes)
-            total_loss += float(loss.detach().cpu().item()) * int(y.numel())
-            total += int(y.numel())
-            correct += int((pred_global == y).sum().item())
+            true = logits.gather(1, y_local.view(-1, 1)).squeeze(1)
+            rival_m = logits.clone(); rival_m.scatter_(1, y_local.view(-1, 1), float("-inf"))
+            gap = true - rival_m.max(dim=1).values
+            gaps.append(gap.detach())
+            margin_viol += int((gap < self._inc_cfg_float("validation_logit_margin", 0.0)).sum().item())
+            total_loss += float(loss.cpu().item()) * int(y.numel())
+            total += int(y.numel()); correct += int((pred_global == y).sum().item())
             for cls in seen_classes:
-                mask = y == int(cls)
-                n = int(mask.sum().item())
-                if n > 0:
+                mask = y == int(cls); n = int(mask.sum().item())
+                if n:
                     per_total[int(cls)] += n
                     per_correct[int(cls)] += int((pred_global[mask] == int(cls)).sum().item())
-            for cls in pred_global.detach().cpu().tolist():
-                if int(cls) in pred_hist:
-                    pred_hist[int(cls)] += 1
-                else:
-                    invalid += 1
-            old_idx = [seen_classes.index(c) for c in old_classes if c in seen_classes]
-            new_idx = [seen_classes.index(c) for c in new_classes if c in seen_classes]
-            if old_idx:
-                old_logits.append(logits[:, old_idx].detach().mean(dim=1))
-            if new_idx:
-                new_logits.append(logits[:, new_idx].detach().mean(dim=1))
+            for pg, yt in zip(pred_global.detach().cpu().tolist(), y.detach().cpu().tolist()):
+                if int(pg) in pred_hist: pred_hist[int(pg)] += 1
+                else: invalid += 1
+                if int(yt) in old_set:
+                    old_total += 1
+                    if int(pg) in new_set: old_to_new += 1
+                elif int(yt) in new_set:
+                    new_total += 1
+                    if int(pg) in old_set: new_to_old += 1
         acc = 100.0 * correct / max(total, 1)
-        old_total = sum(per_total[c] for c in old_classes if c in per_total)
-        old_correct = sum(per_correct[c] for c in old_classes if c in per_correct)
-        new_total = sum(per_total[c] for c in new_classes if c in per_total)
-        new_correct = sum(per_correct[c] for c in new_classes if c in per_correct)
-        old_acc = 100.0 * old_correct / max(old_total, 1)
-        new_acc = 100.0 * new_correct / max(new_total, 1)
+        old_correct = sum(per_correct[c] for c in old_classes)
+        new_correct = sum(per_correct[c] for c in new_classes)
+        old_acc = 100.0 * old_correct / max(sum(per_total[c] for c in old_classes), 1)
+        new_acc = 100.0 * new_correct / max(sum(per_total[c] for c in new_classes), 1)
         hm = 0.0 if old_acc + new_acc <= 0 else 2.0 * old_acc * new_acc / (old_acc + new_acc)
         per_class_acc = {int(c): 100.0 * per_correct[int(c)] / max(per_total[int(c)], 1) for c in seen_classes}
-        avg_acc = sum(per_class_acc.values()) / max(len(per_class_acc), 1)
-        old_mean = float(torch.cat(old_logits).mean().cpu().item()) if old_logits else 0.0
-        new_mean = float(torch.cat(new_logits).mean().cpu().item()) if new_logits else 0.0
+        all_gaps = torch.cat(gaps) if gaps else torch.zeros((1,), device=self.device)
         return {
-            "loss": total_loss / max(total, 1),
-            "acc": acc,
-            "old_acc": old_acc,
-            "new_acc": new_acc,
-            "hm": hm,
-            "aa": avg_acc,
-            "per_class_accuracy": per_class_acc,
-            "prediction_histogram": pred_hist,
+            "loss": total_loss / max(total, 1), "acc": acc, "old_acc": old_acc, "new_acc": new_acc,
+            "hm": hm, "aa": sum(per_class_acc.values()) / max(len(per_class_acc), 1),
+            "per_class_accuracy": per_class_acc, "prediction_histogram": pred_hist,
             "invalid_prediction_rate": float(invalid) / float(max(total, 1)),
-            "old_logit_mean": old_mean,
-            "new_logit_mean": new_mean,
-            "old_new_logit_gap": old_mean - new_mean,
+            "old_to_new_error_rate": 100.0 * old_to_new / max(old_total, 1),
+            "new_to_old_error_rate": 100.0 * new_to_old / max(new_total, 1),
+            "margin_violation_rate": 100.0 * margin_viol / max(total, 1),
+            "mean_logit_margin": float(all_gaps.mean().cpu().item()),
+            "min_logit_margin": float(all_gaps.min().cpu().item()),
+            "old_new_logit_gap": 0.0,
         }
 
     def _compute_old_new_overlap_stats(self, old_snapshot: Dict[str, torch.Tensor], new_desc: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -1632,20 +1457,11 @@ class IncrementalPhaseTrainer:
 
 
     def load_base_handoff(self, phase: int) -> Dict[str, Any]:
-        """Load phase-0 PRL-style geometry handoff when available.
-
-        The handoff is not required for correctness, but when present it makes
-        the base preparation actionable: replay strength, insertion margin, and
-        new-row transport activation are initialized from the phase-0 geometry
-        certificate instead of guessed again inside the incremental trainer.
-        """
+        """Load optional base geometry recommendations without enabling forbidden modules."""
         if int(phase) <= 0:
             return {}
         save_dir = str(getattr(self, "save_dir", getattr(self.args, "save_dir", "./results")))
-        candidates = [
-            os.path.join(save_dir, "phase_0_base_handoff.pt"),
-            os.path.join(save_dir, "phase_0_base_handoff.json"),
-        ]
+        candidates = [os.path.join(save_dir, "phase_0_base_handoff.pt"), os.path.join(save_dir, "phase_0_base_handoff.json")]
         handoff: Dict[str, Any] = {}
         for path in candidates:
             if not os.path.exists(path):
@@ -1653,11 +1469,9 @@ class IncrementalPhaseTrainer:
             try:
                 if path.endswith(".pt"):
                     obj = torch.load(path, map_location=self.device)
-                    handoff = obj if isinstance(obj, dict) else {}
                 else:
-                    with open(path, "r", encoding="utf-8") as f:
-                        obj = json.load(f)
-                    handoff = obj if isinstance(obj, dict) else {}
+                    with open(path, "r", encoding="utf-8") as f: obj = json.load(f)
+                handoff = obj if isinstance(obj, dict) else {}
                 if handoff:
                     print(f"[BaseHandoff] loaded {path}")
                     break
@@ -1665,30 +1479,13 @@ class IncrementalPhaseTrainer:
                 print(f"[BaseHandoff WARN] could not load {path}: {exc}")
         if not handoff:
             return {}
-
-        # Make certificate recommendations operational. These are runtime fields,
-        # not permanent argparse mutations. _inc_cfg_* checks self first.
-        margin = handoff.get("recommended_insertion_margin", None)
+        margin = handoff.get("recommended_insertion_margin", handoff.get("recommended_margin", None))
         if isinstance(margin, (int, float)) and float(margin) > 0:
-            setattr(self, "old_new_geometry_margin", float(margin))
-
+            setattr(self, "old_new_geometry_margin", float(min(float(margin), self._inc_cfg_float("max_adaptive_geometry_margin", 0.60))))
         replay = handoff.get("recommended_replay_per_class", None)
-        if isinstance(replay, dict) and replay:
-            vals = []
-            for v in replay.values():
-                if isinstance(v, (int, float)):
-                    vals.append(int(v))
-            if vals:
-                setattr(self, "synthetic_replay_per_class", int(max(vals)))
-
-        # Do not silently enable transport from the handoff.  The certificate may
-        # recommend transport, but the CLI contract decides whether the run is
-        # descriptor-only or a transport ablation.  Secretly setting
-        # use_new_row_transport=True makes results non-auditable.
-        if bool(handoff.get("transport_required", False)):
-            setattr(self, "handoff_transport_recommended", True)
-            if self._inc_cfg_bool("use_geometry_transport", False) or self._inc_cfg_bool("use_new_row_transport", False):
-                setattr(self, "use_new_row_transport", True)
+        if isinstance(replay, dict):
+            vals = [int(v) for v in replay.values() if isinstance(v, (int, float))]
+            if vals: setattr(self, "synthetic_replay_per_class", max(vals))
         self._base_handoff = handoff
         return handoff
 
@@ -1711,206 +1508,2037 @@ class IncrementalPhaseTrainer:
         phase = int(phase)
         old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
         self._active_seen_classes = list(seen_classes)
-        print(f"==== Incremental Phase {phase} | SCBGR Descriptor-Only NECIL-HSI ====")
+        print(f"==== Incremental Phase {phase} | Spectral-Coupled Tangent Geometry Replay ====")
         print(f"[Classes] old={old_classes} | new={new_classes} | seen={seen_classes}")
         self.dataset.start_phase(phase)
         self.assert_incremental_contract(phase, old_classes, new_classes, seen_classes)
         base_handoff = self.load_base_handoff(phase)
-
         if hasattr(self.model, "ensure_class_capacity"):
             self.model.ensure_class_capacity(max(seen_classes) + 1)
-
         train_loader = self.dataset.get_phase_dataloader(phase, split="train", batch_size=batch_size, shuffle=True)
         val_loader = self.dataset.get_cumulative_dataloader(phase, split="val", batch_size=batch_size, shuffle=False)
 
-        old_snapshot0 = self.snapshot_old_geometry(old_classes)
+        old_snapshot = self.snapshot_old_geometry(old_classes)
         z_new, y_new, s_new, b_new = self.collect_current_phase_features(train_loader, new_classes)
-        raw_new_desc = self._estimate_geometry_from_features(z_new, y_new, new_classes, spectral_summary=s_new, band_summary=b_new)
-        admitted_desc, admission_stats = self.admit_new_geometry(raw_new_desc, old_snapshot0, new_classes)
-        self.assert_old_geometry_unchanged(old_snapshot0, "post_new_admission")
-        self._commit_new_descriptors(admitted_desc, phase=phase)
-        self.assert_geometry_exists(seen_classes, context="post new admission")
-        self.assert_old_geometry_unchanged(old_snapshot0, "post_new_commit")
+        raw_desc = self._estimate_geometry_from_features(z_new, y_new, new_classes, spectral_summary=s_new, band_summary=b_new)
+        admitted_desc, admission_stats = self.admit_new_geometry(raw_desc, old_snapshot, new_classes)
+        self.assert_old_geometry_unchanged(old_snapshot, "post_new_admission")
+        self._commit_new_descriptors(admitted_desc, phase=phase, freeze=False)
+        self.assert_geometry_exists(seen_classes, context="post provisional new-row insertion")
+        self.assert_old_geometry_unchanged(old_snapshot, "post_provisional_new_commit")
+        self.configure_incremental_trainability(old_classes, new_classes)
 
-        trainable_params = self.configure_incremental_trainability(old_classes, new_classes)
-        optimizer = None
-        if trainable_params:
-            opt_lr = self._inc_cfg_float("adapter_lr", float(lr)) if self._adapter_mode_enabled() else float(lr)
-            opt_wd = self._inc_cfg_float("adapter_weight_decay", 0.0) if self._adapter_mode_enabled() else self._inc_cfg_float("weight_decay", 0.0)
-            optimizer = optim.AdamW(trainable_params, lr=float(opt_lr), weight_decay=float(opt_wd))
-            print(f"[Incremental Optimizer] lr={float(opt_lr):.3g} | weight_decay={float(opt_wd):.3g} | params={sum(p.numel() for p in trainable_params):,}")
-
-        history: Dict[str, List[float]] = {
+        history: Dict[str, Any] = {
             "val_acc": [], "val_old_acc": [], "val_new_acc": [], "val_hm": [], "val_aa": [],
+            "old_to_new_error": [], "new_to_old_error": [], "margin_violation": [],
             "ce_new": [], "ce_replay": [], "desc_margin": [], "desc_loss": [], "old_replay_acc": [],
-            "old_new_logit_gap": [], "old_new_risk_max": [], "old_new_overlap_max": [],
-            "old_mean_drift": [], "old_basis_drift": [], "old_eigval_drift": [], "old_resvar_drift": [],
-            "boundary_replay_count": [], "boundary_replay_fallback": [],
-            "adapter_loss": [], "adapter_reg": [], "adaptive_boundary": [], "gate_old": [], "gate_new": [], "delta_old": [], "delta_new": [], "checkpoint_score": [],
+            "old_new_risk_max": [], "old_new_overlap_max": [], "desc_invasion": [], "desc_fit": [],
+            "desc_collision": [], "desc_trust": [], "replay_acceptance": [], "directed_replay_count": [],
+            "coupling_reliability": [], "checkpoint_score": [],
         }
-        phase_diagnostics: Dict[str, Any] = {
-            "phase": phase,
-            "old_classes": old_classes,
-            "new_classes": new_classes,
-            "seen_classes": seen_classes,
-            "base_handoff_loaded": bool(base_handoff),
-            "base_handoff": base_handoff,
-            "admission": admission_stats,
-            "trainable_parameter_names": [n for n, p in self.model.named_parameters() if p.requires_grad],
+        diagnostics: Dict[str, Any] = {
+            "phase": phase, "old_classes": old_classes, "new_classes": new_classes, "seen_classes": seen_classes,
+            "method": "spectral_coupled_tangent_geometry_replay", "base_handoff_loaded": bool(base_handoff),
+            "base_handoff": base_handoff, "admission": admission_stats, "old_rows_immutable": True,
         }
 
-        best_state = self._capture_state()
-        best_score = -1e18
-        best_desc = admitted_desc
-        epochs = int(max(0, epochs))
-        steps_per_epoch = self._inc_cfg_int("descriptor_refine_steps_per_epoch", self._inc_cfg_int("descriptor_refine_steps", 20))
-        old_snapshot_phase = self.snapshot_old_geometry(old_classes)
-
-        # Initial validation before descriptor refinement.
-        # This is a real checkpoint candidate. In the failed run, InitVal was
-        # consistently better than all refined states, but the old code ignored it
-        # and was forced to pick a degraded epoch.
         init_val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
-        init_drift = self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_init_validation_drift_check")
-        init_overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, admitted_desc)
-        init_score = self.select_best_incremental_checkpoint(init_val, init_drift, init_overlap)
-        best_score = init_score
+        init_drift = self.assert_old_geometry_unchanged(old_snapshot, f"phase{phase}_init")
+        init_overlap = self._compute_old_new_overlap_stats(old_snapshot, admitted_desc)
+        best_score = self.select_best_incremental_checkpoint(init_val, init_drift, init_overlap)
         best_state = self._capture_state()
         best_desc = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in admitted_desc.items()}
-        no_improve_epochs = 0
-        refine_patience = self._inc_cfg_int("descriptor_refine_patience", 3)
-        min_new_drop = self._inc_cfg_float("descriptor_refine_max_new_drop", 1.0)
-        print(
-            f"[InitVal] Phase {phase} | ValAcc={init_val['acc']:.2f}% | Old={init_val['old_acc']:.2f}% | "
-            f"New={init_val['new_acc']:.2f}% | HM={init_val['hm']:.2f}% | Gap={init_val['old_new_logit_gap']:.4f} | Score={init_score:.4f}"
-        )
+        print(f"[InitVal] Val={init_val['acc']:.2f}% | Old={init_val['old_acc']:.2f}% | New={init_val['new_acc']:.2f}% | HM={init_val['hm']:.2f}% | O→N={init_val['old_to_new_error_rate']:.2f}% | N→O={init_val['new_to_old_error_rate']:.2f}%")
 
+        epochs = int(max(0, epochs))
+        steps = self._inc_cfg_int("descriptor_refine_steps_per_epoch", self._inc_cfg_int("descriptor_refine_steps", 20))
         for epoch in range(epochs):
-            # Recollect features because optional adapter ablation may change scoring z.
-            z_new, y_new, s_new, b_new = self.collect_current_phase_features(train_loader, new_classes)
-            current_bank = self._bank_dict()
+            bank = self._bank_dict()
             ids = torch.as_tensor(new_classes, device=self.device, dtype=torch.long)
-            current_desc = {
-                "class_ids": ids,
-                "means": current_bank["means"].index_select(0, ids).detach(),
-                "bases": current_bank["bases"].index_select(0, ids).detach(),
-                "eigvals": current_bank["eigvals"].index_select(0, ids).detach(),
-                "res_vars": current_bank["res_vars"].index_select(0, ids).detach(),
-                "active_ranks": current_bank["active_ranks"].index_select(0, ids).detach(),
-                "sample_counts": current_bank["sample_counts"].flatten().index_select(0, ids).detach(),
-                "reliability": current_bank.get("reliability", torch.ones_like(current_bank["sample_counts"].float())).flatten().index_select(0, ids).detach() if torch.is_tensor(current_bank.get("reliability", None)) else torch.ones(len(new_classes), device=self.device),
-            }
-            if torch.is_tensor(current_bank.get("band_importance", None)) and current_bank["band_importance"].size(0) > int(ids.max().item()):
-                current_desc["band_importance"] = current_bank["band_importance"].index_select(0, ids).detach()
-            # Use the implementation name, not self.refine_new_descriptors.
-            # Trainer/config code may store the CLI boolean flag under
-            # self.refine_new_descriptors, which shadows any method with that
-            # name and causes: TypeError: 'bool' object is not callable.
-            refined = self._refine_new_descriptors_impl(
-                z_new=z_new,
-                y_new=y_new,
-                seen_classes=seen_classes,
-                old_classes=old_classes,
-                new_classes=new_classes,
-                old_snapshot=old_snapshot_phase,
-                init_desc=current_desc,
-                steps=steps_per_epoch,
+            keys = (
+                "means", "bases", "eigvals", "res_vars", "active_ranks", "sample_counts", "reliability",
+                "feature_reliability", "band_importance", "band_reliability", "spectral_prototypes",
+                "spectral_reliability", "spectral_bases", "spectral_eigvals", "spectral_res_vars",
+                "spectral_active_ranks", "spectral_to_feature", "coupling_residual_vars",
+                "coupling_reliability", "spectral_sam_limits", "spectral_d1_limits", "spectral_d2_limits",
+                "energy_quantiles", "margin_quantiles",
             )
-            desc = refined["desc"]
-            desc_stats = refined["stats"]
-            self._commit_new_descriptors(desc, phase=phase)
-            self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_post_descriptor_refine")
-
-            adapter_stats = {"adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "old_replay_acc": 0.0}
-            if optimizer is not None:
-                adapter_stats = self.train_one_adapter_epoch(train_loader, optimizer, old_snapshot=old_snapshot_phase, seen_classes=seen_classes, old_classes=old_classes, new_classes=new_classes, new_desc=desc)
-                self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_post_adapter")
-
+            current_desc: Dict[str, torch.Tensor] = {"class_ids": ids}
+            for key in keys:
+                value = bank.get(key, None)
+                if torch.is_tensor(value) and value.dim() > 0 and value.size(0) > int(ids.max().item()):
+                    current_desc[key] = value.index_select(0, ids).detach()
+            refined = self._refine_new_descriptors_impl(
+                z_new=z_new, y_new=y_new, seen_classes=seen_classes, old_classes=old_classes,
+                new_classes=new_classes, old_snapshot=old_snapshot, init_desc=current_desc, steps=steps,
+            )
+            desc, ds = refined["desc"], refined["stats"]
+            self._commit_new_descriptors(desc, phase=phase, freeze=False)
+            drift = self.assert_old_geometry_unchanged(old_snapshot, f"phase{phase}_epoch{epoch+1}")
             val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
-            drift = self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_validation_drift_check")
-            overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, desc)
+            overlap = self._compute_old_new_overlap_stats(old_snapshot, desc)
             score = self.select_best_incremental_checkpoint(val, drift, overlap)
             if score > best_score:
-                best_score = score
-                best_state = self._capture_state()
+                best_score = score; best_state = self._capture_state()
                 best_desc = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in desc.items()}
-                no_improve_epochs = 0
-            else:
-                no_improve_epochs += 1
-            replay_probe = self.sample_old_replay(old_snapshot_phase, seen_classes, new_desc=desc)
-            replay_stats = replay_probe["stats"]  # type: ignore[index]
-            history["val_acc"].append(float(val["acc"]))
-            history["val_old_acc"].append(float(val["old_acc"]))
-            history["val_new_acc"].append(float(val["new_acc"]))
-            history["val_hm"].append(float(val["hm"]))
-            history["val_aa"].append(float(val["aa"]))
-            history["ce_new"].append(float(desc_stats.get("ce_new", adapter_stats.get("ce_new", 0.0))))
-            history["ce_replay"].append(float(desc_stats.get("ce_replay", adapter_stats.get("ce_replay", 0.0))))
-            history["desc_margin"].append(float(desc_stats.get("margin", 0.0)))
-            history["desc_loss"].append(float(desc_stats.get("loss", 0.0)))
-            history["old_replay_acc"].append(float(desc_stats.get("replay_acc", adapter_stats.get("old_replay_acc", 0.0))))
-            history["old_new_logit_gap"].append(float(val["old_new_logit_gap"]))
-            history["old_new_risk_max"].append(float(overlap["old_new_risk_max"]))
-            history["old_new_overlap_max"].append(float(overlap["old_new_subspace_overlap_max"]))
-            history["old_mean_drift"].append(float(drift.get("old_means_max_abs_drift", 0.0)))
-            history["old_basis_drift"].append(float(drift.get("old_bases_max_abs_drift", 0.0)))
-            history["old_eigval_drift"].append(float(drift.get("old_eigvals_max_abs_drift", 0.0)))
-            history["old_resvar_drift"].append(float(drift.get("old_res_vars_max_abs_drift", 0.0)))
-            history["boundary_replay_count"].append(float(replay_stats.get("boundary_replay_count", 0.0)))
-            history["boundary_replay_fallback"].append(float(replay_stats.get("boundary_replay_fallback", 0.0)))
-            history["adapter_loss"].append(float(adapter_stats.get("adapter_loss", 0.0)))
-            history["adapter_reg"].append(float(adapter_stats.get("adapter_reg", 0.0)))
-            history["adaptive_boundary"].append(float(adapter_stats.get("adaptive_boundary", 0.0)))
-            history["gate_old"].append(float(adapter_stats.get("gate_old", 0.0)))
-            history["gate_new"].append(float(adapter_stats.get("gate_new", 0.0)))
-            history["delta_old"].append(float(adapter_stats.get("delta_old", 0.0)))
-            history["delta_new"].append(float(adapter_stats.get("delta_new", 0.0)))
-            history["checkpoint_score"].append(float(score))
+            rp = ds.get("replay", {}) if isinstance(ds.get("replay", {}), dict) else {}
+            history["val_acc"].append(float(val["acc"])); history["val_old_acc"].append(float(val["old_acc"])); history["val_new_acc"].append(float(val["new_acc"])); history["val_hm"].append(float(val["hm"])); history["val_aa"].append(float(val["aa"]))
+            history["old_to_new_error"].append(float(val["old_to_new_error_rate"])); history["new_to_old_error"].append(float(val["new_to_old_error_rate"])); history["margin_violation"].append(float(val["margin_violation_rate"]))
+            history["ce_new"].append(float(ds.get("ce_new", 0.0))); history["ce_replay"].append(float(ds.get("ce_replay", 0.0))); history["desc_margin"].append(float(ds.get("margin", 0.0))); history["desc_loss"].append(float(ds.get("loss", 0.0))); history["old_replay_acc"].append(float(ds.get("replay_acc", 0.0)))
+            history["old_new_risk_max"].append(float(overlap["old_new_risk_max"])); history["old_new_overlap_max"].append(float(overlap["old_new_subspace_overlap_max"])); history["desc_invasion"].append(float(ds.get("invasion", 0.0))); history["desc_fit"].append(float(ds.get("fit", 0.0))); history["desc_collision"].append(float(ds.get("collision", 0.0))); history["desc_trust"].append(float(ds.get("trust", 0.0)))
+            history["replay_acceptance"].append(float(rp.get("acceptance_rate", 0.0))); history["directed_replay_count"].append(float(rp.get("directed_count", 0.0))); history["coupling_reliability"].append(float(rp.get("coupling_reliability_mean", 0.0))); history["checkpoint_score"].append(float(score))
             print(
-                f"[IncEpoch] Phase {phase} Ep {epoch+1:03d}/{epochs} | "
-                f"DescLoss={desc_stats.get('loss', 0.0):.4f} | CEnew={history['ce_new'][-1]:.4f} | "
-                f"CEold={history['ce_replay'][-1]:.4f} | ReplayAcc={history['old_replay_acc'][-1]:.2f}% | "
+                f"[IncEpoch] P{phase} E{epoch+1:03d}/{epochs} | Loss={ds.get('loss',0.0):.4f} | "
+                f"CEnew={ds.get('ce_new',0.0):.4f} | CEold={ds.get('ce_replay',0.0):.4f} | Replay={ds.get('replay_acc',0.0):.2f}% | "
+                f"Accept={rp.get('acceptance_rate',0.0)*100.0:.1f}% | Directed={rp.get('directed_count',0)} | "
                 f"Val={val['acc']:.2f}% | Old={val['old_acc']:.2f}% | New={val['new_acc']:.2f}% | HM={val['hm']:.2f}% | "
-                f"Gap={val['old_new_logit_gap']:.4f} | RiskMax={overlap['old_new_risk_max']:.4f} | "
-                f"OverlapMax={overlap['old_new_subspace_overlap_max']:.4f} | "
-                f"GateOld={adapter_stats.get('gate_old', 0.0):.4f} | GateNew={adapter_stats.get('gate_new', 0.0):.4f} | "
-                f"ABnd={adapter_stats.get('adaptive_boundary', 0.0):.4f} | OldDrift={max(drift.values()) if drift else 0.0:.2e} | Score={score:.4f}"
+                f"O→N={val['old_to_new_error_rate']:.2f}% | N→O={val['new_to_old_error_rate']:.2f}% | Risk={overlap['old_new_risk_max']:.4f} | Score={score:.4f}"
             )
-            if no_improve_epochs >= refine_patience or float(val.get("new_acc", 0.0)) < float(init_val.get("new_acc", 0.0)) - min_new_drop:
-                print(
-                    f"[DescriptorRefine STOP] Phase {phase} stopped at epoch {epoch+1}: "
-                    f"best_score={best_score:.4f}, current_score={score:.4f}, "
-                    f"init_new={float(init_val.get('new_acc', 0.0)):.2f}, current_new={float(val.get('new_acc', 0.0)):.2f}. "
-                    "Restoring best descriptor checkpoint."
-                )
-                break
 
         self._restore_state(best_state)
-        self._commit_new_descriptors(best_desc, phase=phase)
-        self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_post_best_restore")
-        # Freeze all seen rows after the phase. New rows become old for next phase.
+        self._commit_new_descriptors(best_desc, phase=phase, freeze=True)
+        self.assert_old_geometry_unchanged(old_snapshot, f"phase{phase}_best_restore")
         self.freeze_old_geometry(seen_classes)
-        if hasattr(self.dataset, "finalize_phase"):
-            self.dataset.finalize_phase(phase)
-        if hasattr(self, "_set_model_phase_and_old_count"):
-            self._set_model_phase_and_old_count(phase, len(seen_classes))
+        if hasattr(self.dataset, "finalize_phase"): self.dataset.finalize_phase(phase)
+        if hasattr(self, "_set_model_phase_and_old_count"): self._set_model_phase_and_old_count(phase, len(seen_classes))
         final_val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
-        final_overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, best_desc)
-        phase_diagnostics.update({
-            "final_val": final_val,
-            "final_overlap": final_overlap,
-            "best_checkpoint_score": best_score,
-            "best_descriptor_classes": [int(c) for c in best_desc["class_ids"].detach().cpu().tolist()],
-        })
-        history["final_val"] = final_val  # type: ignore[assignment]
-        if hasattr(self, "save_checkpoint"):
-            self.save_checkpoint(phase, history)
-        self._save_phase_artifacts(phase, history, phase_diagnostics)
-        print(
-            f"[PhaseDone] Phase {phase} | Final Val={final_val['acc']:.2f}% | Old={final_val['old_acc']:.2f}% | "
-            f"New={final_val['new_acc']:.2f}% | HM={final_val['hm']:.2f}% | old_geometry_frozen=True"
-        )
+        final_overlap = self._compute_old_new_overlap_stats(old_snapshot, best_desc)
+        final_replay = self.sample_old_replay(old_snapshot, seen_classes, new_desc=best_desc)
+        diagnostics.update({"final_val": final_val, "final_overlap": final_overlap, "final_replay": final_replay.get("stats", {}), "best_checkpoint_score": best_score})
+        history["final_val"] = final_val
+        if hasattr(self, "save_checkpoint"): self.save_checkpoint(phase, history)
+        self._save_phase_artifacts(phase, history, diagnostics)
+        print(f"[PhaseDone] P{phase} | Val={final_val['acc']:.2f}% | Old={final_val['old_acc']:.2f}% | New={final_val['new_acc']:.2f}% | HM={final_val['hm']:.2f}% | old_rows_unchanged=True")
         return history
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# import copy
+# import json
+# import math
+# import os
+# from contextlib import nullcontext
+# from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import torch.optim as optim
+
+
+# _EPS = 1e-8
+
+
+# def _as_bool(value: Any) -> bool:
+#     if isinstance(value, str):
+#         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+#     return bool(value)
+
+
+# def _finite(x: torch.Tensor, name: str) -> torch.Tensor:
+#     if not torch.is_tensor(x):
+#         raise TypeError(f"{name} must be a tensor.")
+#     if not torch.isfinite(x).all():
+#         bad = int((~torch.isfinite(x)).sum().detach().cpu().item())
+#         raise RuntimeError(f"{name} contains {bad} NaN/Inf values.")
+#     return x
+
+
+# class IncrementalPhaseTrainer:
+#     """Clean descriptor-only incremental trainer for NECIL-HSI.
+
+#     Main-path contract
+#     ------------------
+#     * Dataset labels are global class ids.
+#     * GeometryBank rows are global class ids.
+#     * Classifier/logit columns are compact seen-class indices in ``seen_classes`` order.
+#     * CE labels are always seen-local indices.
+#     * Old GeometryBank rows are frozen and checked after every mutating operation.
+#     * New rows may be inserted/refined; old rows may not move.
+
+#     The default path is descriptor-only / SCBGR.  A bounded geometry-gated adapter
+#     is left as an explicit ablation, but old-row affine/SGLAT transport is disabled
+#     in the clean path because it mutates frozen memory.
+#     """
+
+#     # ------------------------------------------------------------------
+#     # Basic config helpers
+#     # ------------------------------------------------------------------
+#     def _zero_like_ref(self, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
+#         if torch.is_tensor(ref):
+#             return ref.sum() * 0.0
+#         return torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+#     def _inc_cfg_float(self, name: str, default: float) -> float:
+#         return float(getattr(self, name, getattr(self.args, name, default)))
+
+#     def _inc_cfg_int(self, name: str, default: int) -> int:
+#         return int(getattr(self, name, getattr(self.args, name, default)))
+
+#     def _inc_cfg_bool(self, name: str, default: bool) -> bool:
+#         return _as_bool(getattr(self, name, getattr(self.args, name, default)))
+
+#     def _classifier_mode(self) -> str:
+#         mode = str(getattr(self.args, "incremental_classifier_mode", "geometry")).lower().strip()
+#         aliases = {
+#             "geometry_only": "geometry",
+#             "calibrated_geometry": "calibrated_geometry",
+#             "topology_calibrated_geometry": "calibrated_geometry",
+#             "anchor": "geometry",
+#             "anchor_concept": "geometry",
+#             "srgp": "geometry",
+#         }
+#         return aliases.get(mode, mode)
+
+#     # ------------------------------------------------------------------
+#     # Phase/class resolution and label mapping
+#     # ------------------------------------------------------------------
+#     def _ordered_unique(self, values: Iterable[int]) -> List[int]:
+#         out: List[int] = []
+#         seen = set()
+#         for v in values:
+#             iv = int(v)
+#             if iv not in seen:
+#                 out.append(iv)
+#                 seen.add(iv)
+#         return out
+
+#     def resolve_phase_classes(self, phase: int) -> Tuple[List[int], List[int], List[int]]:
+#         phase = int(phase)
+#         if phase <= 0:
+#             raise ValueError("Incremental phase must be > 0.")
+#         if not hasattr(self.dataset, "phase_to_classes"):
+#             raise AttributeError("dataset.phase_to_classes is required.")
+#         new_classes = self._ordered_unique(int(c) for c in self.dataset.phase_to_classes[phase])
+#         old_classes: List[int] = []
+#         if hasattr(self.dataset, "get_classes_up_to_phase"):
+#             old_classes = self._ordered_unique(int(c) for c in self.dataset.get_classes_up_to_phase(phase - 1))
+#         else:
+#             for p in range(phase):
+#                 old_classes.extend(int(c) for c in self.dataset.phase_to_classes[p])
+#             old_classes = self._ordered_unique(old_classes)
+#         seen_classes = self._ordered_unique([*old_classes, *new_classes])
+#         if not old_classes:
+#             raise RuntimeError("Incremental phase has no old classes. Did phase 0 finalize correctly?")
+#         if not new_classes:
+#             raise RuntimeError(f"Phase {phase} has no new classes.")
+#         if len(seen_classes) != len(old_classes) + len(new_classes):
+#             overlap = sorted(set(old_classes).intersection(new_classes))
+#             raise RuntimeError(f"Old/new class overlap in phase {phase}: {overlap}")
+#         return old_classes, new_classes, seen_classes
+
+#     # Backward-compatible name used by older trainer code.
+#     def _seen_classes_for_phase(self, phase: int) -> List[int]:
+#         return self.resolve_phase_classes(int(phase))[2] if int(phase) > 0 else self._ordered_unique(self.dataset.phase_to_classes[0])
+
+#     def global_to_seen_local(self, labels_global: torch.Tensor, seen_classes: Sequence[int]) -> torch.Tensor:
+#         labels_global = labels_global.long().view(-1)
+#         mapping = {int(c): i for i, c in enumerate([int(x) for x in seen_classes])}
+#         local = torch.full_like(labels_global, -1)
+#         for global_id, local_id in mapping.items():
+#             local[labels_global == int(global_id)] = int(local_id)
+#         if (local < 0).any():
+#             bad = labels_global[local < 0].detach().cpu().unique().tolist()
+#             raise RuntimeError(f"Labels not in seen_classes. bad={bad}, seen={list(map(int, seen_classes))}")
+#         return local
+
+#     def seen_local_to_global(self, preds_local: torch.Tensor, seen_classes: Sequence[int]) -> torch.Tensor:
+#         preds_local = preds_local.long().view(-1)
+#         seen = torch.as_tensor([int(c) for c in seen_classes], device=preds_local.device, dtype=torch.long)
+#         if preds_local.numel() == 0:
+#             return preds_local
+#         if int(preds_local.min().item()) < 0 or int(preds_local.max().item()) >= int(seen.numel()):
+#             raise RuntimeError(
+#                 f"Local predictions [{int(preds_local.min())},{int(preds_local.max())}] incompatible with {int(seen.numel())} seen classes."
+#             )
+#         return seen.index_select(0, preds_local)
+
+#     def assert_valid_seen_targets(self, targets_local: torch.Tensor, num_seen: int, context: str = "CE") -> None:
+#         targets_local = targets_local.long().view(-1)
+#         if targets_local.numel() == 0:
+#             raise RuntimeError(f"{context}: empty CE target tensor.")
+#         if int(targets_local.min().item()) < 0 or int(targets_local.max().item()) >= int(num_seen):
+#             raise RuntimeError(
+#                 f"{context}: local targets [{int(targets_local.min())},{int(targets_local.max())}] outside [0,{int(num_seen)-1}]."
+#             )
+
+#     def assert_global_labels_in_set(self, labels_global: torch.Tensor, allowed_classes: Iterable[int], context: str) -> None:
+#         labels_global = labels_global.long().view(-1)
+#         allowed = torch.as_tensor([int(c) for c in allowed_classes], device=labels_global.device, dtype=torch.long)
+#         if labels_global.numel() == 0:
+#             raise RuntimeError(f"{context}: empty label tensor.")
+#         if allowed.numel() == 0:
+#             raise RuntimeError(f"{context}: empty allowed class set.")
+#         if hasattr(torch, "isin"):
+#             ok = torch.isin(labels_global, allowed).all()
+#         else:
+#             mask = torch.zeros_like(labels_global, dtype=torch.bool)
+#             for c in allowed:
+#                 mask |= labels_global == int(c)
+#             ok = mask.all()
+#         if not bool(ok.item()):
+#             bad = labels_global[~torch.isin(labels_global, allowed)].detach().cpu().unique().tolist() if hasattr(torch, "isin") else labels_global.detach().cpu().unique().tolist()
+#             raise RuntimeError(f"{context}: labels outside allowed set. bad={bad}, allowed={allowed.detach().cpu().tolist()}")
+
+#     # Older name in the uploaded file.
+#     def _assert_batch_labels_in_classes(self, y: torch.Tensor, class_ids: Iterable[int], context: str) -> None:
+#         self.assert_global_labels_in_set(y, class_ids, context)
+
+#     # ------------------------------------------------------------------
+#     # Canonical feature extraction and classifier scoring
+#     # ------------------------------------------------------------------
+#     def _prepare_real_spectral_summary(self, x: torch.Tensor, spectra: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], bool]:
+#         if not torch.is_tensor(spectra) or spectra.numel() == 0:
+#             return None, False
+#         s = spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
+#         if s.dim() == 4:
+#             s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
+#         elif s.dim() == 3:
+#             # [B,S,L] metadata: use the center token/spectrum.
+#             # Flattening would mix neighboring pixels into the spectral summary
+#             # and corrupt spectral-shape/risk calculations.
+#             if s.size(0) == x.size(0) and s.size(1) > 0 and s.size(2) > 1:
+#                 s = s[:, :, s.size(-1) // 2]
+#             else:
+#                 s = s.reshape(s.size(0), -1)
+#         elif s.dim() == 1:
+#             if s.numel() % max(int(x.size(0)), 1) == 0:
+#                 s = s.view(x.size(0), -1)
+#             else:
+#                 return None, False
+#         elif s.dim() > 4:
+#             s = s.flatten(1)
+#         if s.size(0) != x.size(0):
+#             return None, False
+#         # Raw metadata from the dataloader can stay physical even when model
+#         # input uses PCA. PCA channels themselves are never physical spectra.
+#         physical = self._inc_cfg_bool(
+#             "incremental_spectral_summary_is_physical",
+#             self._inc_cfg_bool("raw_spectral_summary_is_physical", False),
+#         )
+#         input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
+#         pca_active = int(getattr(self.args, "pca_components", 0) or 0) > 0 and not bool(getattr(self.args, "no_pca", False))
+#         if pca_active and input_channels > 0 and int(s.size(1)) == input_channels and not self._inc_cfg_bool("allow_nonphysical_spectral_summary", False):
+#             physical = False
+#         return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), bool(physical)
+
+#     def extract_incremental_features(self, x: torch.Tensor, spectra: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+#         x = x.float().to(self.device, non_blocking=True)
+#         spectral_summary, spectral_is_physical = self._prepare_real_spectral_summary(x, spectra)
+#         fn_names = ("forward_features", "extract_features", "extract_projected_features", "extract_geometry_features")
+#         for name in fn_names:
+#             fn = getattr(self.model, name, None)
+#             if callable(fn):
+#                 try:
+#                     out = fn(x, spectral_summary=spectral_summary, spectral_summary_is_physical=spectral_is_physical)
+#                 except TypeError:
+#                     try:
+#                         out = fn(x)
+#                     except TypeError:
+#                         continue
+#                 if isinstance(out, dict):
+#                     z = out.get("features", out.get("projected_features", out.get("z", None)))
+#                     if torch.is_tensor(z):
+#                         z = _finite(z.float(), "incremental features")
+#                         if z.dim() != 2:
+#                             raise RuntimeError(f"Canonical incremental features must be [B,D], got {tuple(z.shape)}")
+#                         out = dict(out)
+#                         out["features"] = z
+#                         out["projected_features"] = z
+#                         out["spectral_summary"] = spectral_summary if spectral_summary is not None else out.get("spectral_summary", None)
+#                         out["spectral_summary_is_physical"] = bool(spectral_is_physical)
+#                         self._assert_feature_dim_matches_bank(z)
+#                         return out
+#                 elif torch.is_tensor(out):
+#                     z = _finite(out.float(), "incremental features")
+#                     if z.dim() != 2:
+#                         raise RuntimeError(f"Canonical incremental features must be [B,D], got {tuple(z.shape)}")
+#                     self._assert_feature_dim_matches_bank(z)
+#                     return {"features": z, "projected_features": z, "spectral_summary": spectral_summary, "spectral_summary_is_physical": bool(spectral_is_physical)}
+#         # Fallback through model forward.
+#         try:
+#             out = self.model(x, seen_classes=getattr(self, "_active_seen_classes", None), mode="geometry")
+#         except TypeError:
+#             out = self.model(x)
+#         if not isinstance(out, dict) or not torch.is_tensor(out.get("features", None)):
+#             raise RuntimeError("Model must expose forward_features/extract_features/extract_projected_features returning canonical z.")
+#         z = _finite(out["features"].float(), "incremental features")
+#         if z.dim() != 2:
+#             raise RuntimeError(f"Canonical incremental features must be [B,D], got {tuple(z.shape)}")
+#         out = dict(out)
+#         out["features"] = z
+#         out["projected_features"] = z
+#         self._assert_feature_dim_matches_bank(z)
+#         return out
+
+#     def _assert_feature_dim_matches_bank(self, features: torch.Tensor) -> None:
+#         gb = getattr(self.model, "geometry_bank", None)
+#         dim = getattr(gb, "feature_dim", None)
+#         if dim is not None and int(dim) > 0 and int(features.size(1)) != int(dim):
+#             raise RuntimeError(f"Feature dim {int(features.size(1))} != GeometryBank feature_dim {int(dim)}")
+
+#     def compute_seen_logits(
+#         self,
+#         features: torch.Tensor,
+#         seen_classes: Sequence[int],
+#         *,
+#         mode: Optional[str] = None,
+#         return_diagnostics: bool = False,
+#         old_classes: Optional[Sequence[int]] = None,
+#         new_classes: Optional[Sequence[int]] = None,
+#         targets_local: Optional[torch.Tensor] = None,
+#     ) -> Dict[str, torch.Tensor | Dict[str, float]]:
+#         features = _finite(features.float(), "features for seen logits")
+#         if features.dim() != 2:
+#             raise RuntimeError(f"features must be [B,D], got {tuple(features.shape)}")
+#         seen = [int(c) for c in seen_classes]
+#         if not seen:
+#             raise RuntimeError("seen_classes is empty.")
+#         self.assert_geometry_exists(seen, context="compute_seen_logits")
+#         mode = str(mode or self._classifier_mode()).lower().strip()
+#         mode = "geometry" if mode == "geometry_only" else mode
+#         out: Any
+#         if hasattr(self.model, "compute_logits_from_features"):
+#             try:
+#                 out = self.model.compute_logits_from_features(
+#                     features,
+#                     seen_classes=seen,
+#                     geometry_bank=getattr(self.model, "geometry_bank", None),
+#                     mode=mode,
+#                     old_classes=list(old_classes or []),
+#                     new_classes=list(new_classes or []),
+#                     targets=targets_local,
+#                     return_diagnostics=return_diagnostics,
+#                 )
+#             except TypeError:
+#                 out = self.model.compute_logits_from_features(features, classifier_mode=mode)
+#         elif hasattr(self.model, "classifier"):
+#             out = self.model.classifier(
+#                 features,
+#                 seen_classes=seen,
+#                 geometry_bank=getattr(self.model, "geometry_bank", None),
+#                 mode=mode,
+#                 old_classes=list(old_classes or []),
+#                 new_classes=list(new_classes or []),
+#                 targets=targets_local,
+#                 return_diagnostics=return_diagnostics,
+#             )
+#         else:
+#             raise AttributeError("model must expose compute_logits_from_features() or classifier().")
+
+#         if isinstance(out, dict):
+#             logits = out.get("logits", None)
+#             result = dict(out)
+#         else:
+#             logits = out
+#             result = {"logits": logits}
+#         if not torch.is_tensor(logits):
+#             raise RuntimeError("Classifier output does not contain tensor logits.")
+#         logits = _finite(logits.float(), "seen logits")
+#         # Clean classifier returns [B, len(seen)].  Legacy classifier may return full global width; convert once here.
+#         if logits.dim() != 2:
+#             raise RuntimeError(f"logits must be [B,C], got {tuple(logits.shape)}")
+#         if logits.size(0) != features.size(0):
+#             raise RuntimeError(f"logit batch {logits.size(0)} != feature batch {features.size(0)}")
+#         if logits.size(1) == len(seen):
+#             seen_logits = logits
+#         elif logits.size(1) > max(seen):
+#             idx = torch.as_tensor(seen, device=logits.device, dtype=torch.long)
+#             seen_logits = logits.index_select(1, idx)
+#         else:
+#             raise RuntimeError(
+#                 f"Classifier logits width={logits.size(1)} cannot represent seen_classes={seen}. "
+#                 "Use repaired classifier with explicit seen_classes."
+#             )
+#         if seen_logits.size(1) != len(seen):
+#             raise RuntimeError("Internal error: seen logits width mismatch.")
+#         result["logits"] = _finite(seen_logits, "seen logits")
+#         if targets_local is not None:
+#             self.assert_valid_seen_targets(targets_local.to(seen_logits.device), len(seen), context="seen logits CE")
+#         return result
+
+#     def _stable_ce_seen(self, logits_seen: torch.Tensor, labels_global: torch.Tensor, seen_classes: Sequence[int], context: str) -> torch.Tensor:
+#         logits_seen = _finite(logits_seen.float(), f"{context} logits")
+#         if logits_seen.dim() != 2 or logits_seen.size(1) != len(seen_classes):
+#             raise RuntimeError(f"{context}: logits must be [B,{len(seen_classes)}], got {tuple(logits_seen.shape)}")
+#         labels_local = self.global_to_seen_local(labels_global.to(logits_seen.device), seen_classes)
+#         self.assert_valid_seen_targets(labels_local, len(seen_classes), context=context)
+#         if labels_local.numel() != logits_seen.size(0):
+#             raise RuntimeError(f"{context}: label/logit batch mismatch {labels_local.numel()} vs {logits_seen.size(0)}")
+#         clip = self._inc_cfg_float("ce_logit_clip", 50.0)
+#         return F.cross_entropy(
+#             logits_seen.clamp(-clip, clip),
+#             labels_local,
+#             label_smoothing=self._inc_cfg_float("label_smoothing", 0.0),
+#         )
+
+#     # Backward-compatible old helper: expects local labels for seen-width logits.
+#     def _stable_ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+#         labels = labels.to(device=logits.device).long().view(-1)
+#         self.assert_valid_seen_targets(labels, logits.size(1), context="legacy CE")
+#         clip = self._inc_cfg_float("ce_logit_clip", 50.0)
+#         return F.cross_entropy(logits.clamp(-clip, clip), labels, label_smoothing=self._inc_cfg_float("label_smoothing", 0.0))
+
+#     # ------------------------------------------------------------------
+#     # GeometryBank access and immutability checks
+#     # ------------------------------------------------------------------
+#     def _bank_object(self):
+#         gb = getattr(self.model, "geometry_bank", None)
+#         if gb is None:
+#             raise AttributeError("model.geometry_bank is required.")
+#         return gb
+
+#     def _bank_dict(self) -> Dict[str, torch.Tensor]:
+#         gb = self._bank_object()
+#         if hasattr(gb, "get_seen_class_bank"):
+#             # Use all currently allocated rows when possible.
+#             try:
+#                 counts = getattr(gb, "sample_counts", None)
+#                 if torch.is_tensor(counts):
+#                     ids = list(range(int(counts.numel())))
+#                     return gb.get_seen_class_bank(ids)
+#             except Exception:
+#                 pass
+#         if hasattr(gb, "get_subspace_bank"):
+#             bank = gb.get_subspace_bank()
+#         elif hasattr(self.model, "get_subspace_bank"):
+#             bank = self.model.get_subspace_bank()
+#         else:
+#             bank = {name: getattr(gb, name) for name in ("means", "bases", "eigvals", "res_vars", "sample_counts", "active_ranks") if torch.is_tensor(getattr(gb, name, None))}
+#         if not isinstance(bank, dict):
+#             raise RuntimeError("GeometryBank export must be a dict.")
+#         return self._canonical_bank_dict(bank)
+
+#     def _canonical_bank_dict(self, bank: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+#         out: Dict[str, torch.Tensor] = {}
+#         aliases = {
+#             "means": ("means", "mu"),
+#             "bases": ("bases", "basis", "U"),
+#             "eigvals": ("eigvals", "eigenvalues", "lambdas"),
+#             "res_vars": ("res_vars", "resvars", "residual_vars", "sigma_c2"),
+#             "sample_counts": ("sample_counts", "counts", "n"),
+#             "active_ranks": ("active_ranks", "ranks"),
+#             "reliability": ("reliability", "feature_reliability"),
+#             "spectral_prototypes": ("spectral_prototypes", "spectral_prototype", "spectral"),
+#             "band_importance": ("band_importance", "band_importances", "band"),
+#         }
+#         for key, names in aliases.items():
+#             for name in names:
+#                 value = bank.get(name, None)
+#                 if torch.is_tensor(value):
+#                     out[key] = value.to(self.device)
+#                     break
+#         if "eigvals" not in out and torch.is_tensor(bank.get("variances", None)):
+#             out["eigvals"] = bank["variances"].to(self.device)[:, :-1]
+#             out["res_vars"] = bank["variances"].to(self.device)[:, -1]
+#         if "res_vars" not in out and torch.is_tensor(bank.get("variances", None)):
+#             out["res_vars"] = bank["variances"].to(self.device)[:, -1]
+#         required = ("means", "bases", "eigvals", "res_vars", "sample_counts")
+#         missing = [k for k in required if k not in out]
+#         if missing:
+#             raise RuntimeError(f"GeometryBank missing required tensors: {missing}")
+#         if "active_ranks" not in out:
+#             out["active_ranks"] = torch.full((out["means"].size(0),), out["bases"].size(-1), device=self.device, dtype=torch.long)
+#         return out
+
+#     def assert_geometry_exists(self, class_ids: Iterable[int], context: str) -> None:
+#         ids = [int(c) for c in class_ids]
+#         if not ids:
+#             raise RuntimeError(f"{context}: empty class id list.")
+#         gb = self._bank_object()
+#         if hasattr(gb, "assert_bank_valid"):
+#             try:
+#                 gb.assert_bank_valid(seen_classes=ids)
+#                 return
+#             except TypeError:
+#                 gb.assert_bank_valid()
+#         bank = self._bank_dict()
+#         counts = bank["sample_counts"].flatten()
+#         max_id = max(ids)
+#         if max_id >= counts.numel():
+#             raise RuntimeError(f"{context}: bank has {counts.numel()} rows but needs class {max_id}")
+#         bad = [c for c in ids if float(counts[c].detach().cpu().item()) <= 0]
+#         if bad:
+#             raise RuntimeError(f"{context}: missing GeometryBank rows for classes {bad}")
+
+#     def freeze_old_geometry(self, old_classes: Sequence[int]) -> None:
+#         gb = self._bank_object()
+#         old = [int(c) for c in old_classes]
+#         if hasattr(gb, "freeze_classes"):
+#             gb.freeze_classes(old)
+#         elif hasattr(gb, "freeze_classes_up_to") and old:
+#             # Safe only for sequential old classes; otherwise fall back to mask if present.
+#             if old == list(range(max(old) + 1)):
+#                 gb.freeze_classes_up_to(max(old) + 1)
+#             elif hasattr(gb, "frozen_mask"):
+#                 gb.frozen_mask[torch.as_tensor(old, device=gb.frozen_mask.device)] = True
+#         elif hasattr(gb, "frozen_class_mask"):
+#             gb.frozen_class_mask[torch.as_tensor(old, device=gb.frozen_class_mask.device)] = True
+#         if hasattr(gb, "assert_bank_valid"):
+#             try:
+#                 gb.assert_bank_valid(seen_classes=old)
+#             except TypeError:
+#                 gb.assert_bank_valid()
+
+#     def snapshot_old_geometry(self, old_classes: Sequence[int]) -> Dict[str, torch.Tensor]:
+#         old = [int(c) for c in old_classes]
+#         self.assert_geometry_exists(old, context="snapshot_old_geometry")
+#         bank = self._bank_dict()
+#         ids = torch.as_tensor(old, device=self.device, dtype=torch.long)
+#         snap = {
+#             "class_ids": ids.detach().clone(),
+#             "means": bank["means"].index_select(0, ids).detach().clone(),
+#             "bases": bank["bases"].index_select(0, ids).detach().clone(),
+#             "eigvals": bank["eigvals"].index_select(0, ids).detach().clone(),
+#             "res_vars": bank["res_vars"].index_select(0, ids).detach().clone(),
+#             "active_ranks": bank["active_ranks"].index_select(0, ids).detach().clone(),
+#             "sample_counts": bank["sample_counts"].flatten().index_select(0, ids).detach().clone(),
+#         }
+#         for k in ("reliability", "spectral_prototypes", "band_importance"):
+#             v = bank.get(k, None)
+#             if torch.is_tensor(v) and v.size(0) > int(ids.max().item()):
+#                 snap[k] = v.index_select(0, ids).detach().clone()
+#         if bool((snap["sample_counts"] <= 0).any().item()):
+#             bad = ids[snap["sample_counts"] <= 0].detach().cpu().tolist()
+#             raise RuntimeError(f"Old GeometryBank has invalid old rows: {bad}")
+#         return snap
+
+#     # Compatibility name used by uploaded code.
+#     def _snapshot_old_bank_clean(self, old_class_count: int) -> Dict[str, torch.Tensor]:
+#         return self.snapshot_old_geometry(list(range(int(old_class_count))))
+
+#     def assert_old_geometry_unchanged(self, snapshot: Dict[str, torch.Tensor], context: str, atol: float = 1e-6) -> Dict[str, float]:
+#         ids = snapshot["class_ids"].to(self.device).long()
+#         bank = self._bank_dict()
+#         drift: Dict[str, float] = {}
+#         for key, bank_key in (("means", "means"), ("bases", "bases"), ("eigvals", "eigvals"), ("res_vars", "res_vars")):
+#             cur = bank[bank_key].index_select(0, ids).detach()
+#             ref = snapshot[key].to(cur.device, cur.dtype)
+#             if cur.shape != ref.shape:
+#                 raise RuntimeError(f"{context}: old {key} shape changed {tuple(ref.shape)} -> {tuple(cur.shape)}")
+#             delta = (cur - ref).abs().max()
+#             drift[f"old_{key}_max_abs_drift"] = float(delta.detach().cpu().item())
+#             if float(delta.detach().cpu().item()) > float(atol):
+#                 raise RuntimeError(f"{context}: frozen old geometry changed for {key}. max_abs={float(delta):.6g}")
+#         return drift
+
+#     # ------------------------------------------------------------------
+#     # New geometry construction and safe admission
+#     # ------------------------------------------------------------------
+#     def _unpack_batch(self, batch):
+#         if hasattr(self, "_unpack_hsi_batch"):
+#             return self._unpack_hsi_batch(batch)
+#         if isinstance(batch, (list, tuple)):
+#             if len(batch) == 2:
+#                 x, y = batch
+#                 return x, y, None, None
+#             if len(batch) == 3:
+#                 x, y, spectra = batch
+#                 return x, y, spectra, None
+#             return batch[0], batch[1], batch[2] if len(batch) > 2 else None, batch[3] if len(batch) > 3 else None
+#         raise RuntimeError("Cannot unpack HSI batch.")
+
+#     @torch.no_grad()
+#     def collect_current_phase_features(self, loader, new_classes: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+#         self.model.eval()
+#         feats: List[torch.Tensor] = []
+#         labs: List[torch.Tensor] = []
+#         spectra_rows: List[torch.Tensor] = []
+#         bands: List[torch.Tensor] = []
+#         for batch in loader:
+#             x, y, spectra, _ = self._unpack_batch(batch)
+#             x = x.float().to(self.device, non_blocking=True)
+#             y = y.long().to(self.device, non_blocking=True).view(-1)
+#             self.assert_global_labels_in_set(y, new_classes, "current incremental train loader")
+#             out = self.extract_incremental_features(x, spectra)
+#             z = out["features"].detach()
+#             feats.append(z)
+#             labs.append(y.detach())
+#             s = out.get("spectral_summary", None)
+#             if torch.is_tensor(s) and s.size(0) == z.size(0):
+#                 spectra_rows.append(s.detach().float())
+#             b = out.get("band_summary", out.get("band_importance", None))
+#             if torch.is_tensor(b) and b.size(0) == z.size(0):
+#                 bands.append(b.detach().float())
+#         if not feats:
+#             raise RuntimeError("Current phase train loader produced no features.")
+#         z_all = torch.cat(feats, dim=0)
+#         y_all = torch.cat(labs, dim=0)
+#         s_all = torch.cat(spectra_rows, dim=0) if spectra_rows else None
+#         b_all = torch.cat(bands, dim=0) if bands else None
+#         return z_all, y_all, s_all, b_all
+
+#     def _estimate_geometry_from_features(
+#         self,
+#         features: torch.Tensor,
+#         labels_global: torch.Tensor,
+#         class_ids: Sequence[int],
+#         spectral_summary: Optional[torch.Tensor] = None,
+#         band_summary: Optional[torch.Tensor] = None,
+#     ) -> Dict[str, torch.Tensor]:
+#         features = _finite(features.float(), "new descriptor features")
+#         labels_global = labels_global.long().view(-1).to(features.device)
+#         D = int(features.size(1))
+#         rank = int(getattr(getattr(self.model, "geometry_bank", None), "rank", getattr(self.args, "subspace_rank", 5)))
+#         rank = max(1, min(rank, D))
+#         means: List[torch.Tensor] = []
+#         bases: List[torch.Tensor] = []
+#         eigvals: List[torch.Tensor] = []
+#         res_vars: List[torch.Tensor] = []
+#         active: List[int] = []
+#         counts: List[int] = []
+#         reliability: List[torch.Tensor] = []
+#         spectral_proto: List[torch.Tensor] = []
+#         band_proto: List[torch.Tensor] = []
+#         var_floor = self._inc_cfg_float("geom_var_floor", 1e-4)
+#         for cls in [int(c) for c in class_ids]:
+#             mask = labels_global == int(cls)
+#             if not bool(mask.any().item()):
+#                 raise RuntimeError(f"Cannot estimate new geometry for class {cls}: no samples.")
+#             zc = features[mask]
+#             n = int(zc.size(0))
+#             mu = zc.mean(dim=0)
+#             xc = zc - mu
+#             denom = float(max(n - 1, 1))
+#             if n >= 2:
+#                 try:
+#                     U, S, _ = torch.linalg.svd(xc / math.sqrt(denom), full_matrices=False)
+#                     # For data matrix [N,D], right singular vectors are Vh.T. Recompute from covariance for clarity.
+#                     cov = xc.t().matmul(xc) / denom
+#                     evals, evecs = torch.linalg.eigh(cov)
+#                     order = torch.argsort(evals, descending=True)
+#                     evals = evals.index_select(0, order).clamp_min(var_floor)
+#                     evecs = evecs.index_select(1, order)
+#                     r_eff = min(rank, int((evals > var_floor * 1.01).sum().detach().cpu().item()), D)
+#                     r_eff = max(1, r_eff)
+#                     Uc = evecs[:, :rank]
+#                     if Uc.size(1) < rank:
+#                         pad = torch.eye(D, device=features.device, dtype=features.dtype)[:, : rank - Uc.size(1)]
+#                         Uc = torch.cat([Uc, pad], dim=1)
+#                     q, _ = torch.linalg.qr(Uc, mode="reduced")
+#                     Uc = q[:, :rank]
+#                     lam = evals[:rank]
+#                     if lam.numel() < rank:
+#                         lam = torch.cat([lam, lam.new_full((rank - lam.numel(),), var_floor)])
+#                     total_var = torch.diag(cov).sum().clamp_min(var_floor)
+#                     res = ((total_var - lam[:r_eff].sum()).clamp_min(var_floor) / float(max(D - r_eff, 1))).clamp_min(var_floor)
+#                 except RuntimeError:
+#                     Uc = torch.eye(D, device=features.device, dtype=features.dtype)[:, :rank]
+#                     lam = torch.full((rank,), var_floor, device=features.device, dtype=features.dtype)
+#                     res = torch.tensor(var_floor, device=features.device, dtype=features.dtype)
+#                     r_eff = 1
+#             else:
+#                 Uc = torch.eye(D, device=features.device, dtype=features.dtype)[:, :rank]
+#                 lam = torch.full((rank,), var_floor, device=features.device, dtype=features.dtype)
+#                 res = torch.tensor(var_floor, device=features.device, dtype=features.dtype)
+#                 r_eff = 1
+#             means.append(mu)
+#             bases.append(Uc)
+#             eigvals.append(lam.clamp_min(var_floor))
+#             res_vars.append(res.clamp_min(var_floor).view(()))
+#             active.append(int(r_eff))
+#             counts.append(n)
+#             rel = torch.tensor(min(1.0, math.log1p(n) / math.log1p(64.0)), device=features.device, dtype=features.dtype)
+#             reliability.append(rel)
+#             if torch.is_tensor(spectral_summary) and spectral_summary.size(0) == labels_global.numel():
+#                 spectral_proto.append(spectral_summary.to(features.device).float()[mask].mean(dim=0))
+#             if torch.is_tensor(band_summary) and band_summary.size(0) == labels_global.numel():
+#                 b = band_summary.to(features.device).float()[mask].mean(dim=0)
+#                 b = b.clamp_min(0.0)
+#                 b = b / b.sum().clamp_min(_EPS)
+#                 band_proto.append(b)
+#         result: Dict[str, torch.Tensor] = {
+#             "class_ids": torch.as_tensor([int(c) for c in class_ids], device=features.device, dtype=torch.long),
+#             "means": torch.stack(means, dim=0),
+#             "bases": torch.stack(bases, dim=0),
+#             "eigvals": torch.stack(eigvals, dim=0),
+#             "res_vars": torch.stack(res_vars, dim=0),
+#             "active_ranks": torch.as_tensor(active, device=features.device, dtype=torch.long),
+#             "sample_counts": torch.as_tensor(counts, device=features.device, dtype=torch.float32),
+#             "reliability": torch.stack(reliability, dim=0),
+#         }
+#         if spectral_proto:
+#             result["spectral_prototypes"] = torch.stack(spectral_proto, dim=0)
+#         if band_proto:
+#             result["band_importance"] = torch.stack(band_proto, dim=0)
+#         self._assert_descriptor_block_valid(result, context="estimated new geometry")
+#         return result
+
+#     def _assert_descriptor_block_valid(self, desc: Dict[str, torch.Tensor], context: str) -> None:
+#         means = desc["means"]
+#         bases = desc["bases"]
+#         eig = desc["eigvals"]
+#         res = desc["res_vars"]
+#         if means.dim() != 2:
+#             raise RuntimeError(f"{context}: means must be [K,D], got {tuple(means.shape)}")
+#         if bases.dim() != 3 or bases.size(0) != means.size(0) or bases.size(1) != means.size(1):
+#             raise RuntimeError(f"{context}: bases must be [K,D,R], got {tuple(bases.shape)} with means {tuple(means.shape)}")
+#         if eig.shape != (means.size(0), bases.size(2)):
+#             raise RuntimeError(f"{context}: eigvals shape {tuple(eig.shape)} incompatible with bases {tuple(bases.shape)}")
+#         if res.numel() != means.size(0):
+#             raise RuntimeError(f"{context}: res_vars length mismatch")
+#         for name, t in (("means", means), ("bases", bases), ("eigvals", eig), ("res_vars", res)):
+#             _finite(t, f"{context}.{name}")
+#         if bool((eig < 0).any().item()) or bool((res < 0).any().item()):
+#             raise RuntimeError(f"{context}: negative variances/eigenvalues.")
+#         gram = torch.matmul(bases.transpose(1, 2), bases)
+#         eye = torch.eye(bases.size(2), device=bases.device, dtype=bases.dtype).unsqueeze(0)
+#         err = (gram - eye).abs().max()
+#         if float(err.detach().cpu().item()) > 5e-3:
+#             raise RuntimeError(f"{context}: bases are not orthonormal; max gram error={float(err):.6f}")
+
+#     def _commit_new_descriptors(self, desc: Dict[str, torch.Tensor], phase: int) -> None:
+#         gb = self._bank_object()
+#         ids = desc["class_ids"].detach().cpu().tolist()
+#         for row, cls in enumerate(ids):
+#             kwargs = dict(
+#                 class_id=int(cls),
+#                 mean=desc["means"][row].detach(),
+#                 basis=desc["bases"][row].detach(),
+#                 eigvals=desc["eigvals"][row].detach(),
+#                 res_var=desc["res_vars"][row].detach(),
+#                 sample_count=desc["sample_counts"][row].detach(),
+#                 active_rank=desc["active_ranks"][row].detach(),
+#                 reliability=desc.get("reliability", torch.ones_like(desc["sample_counts"]))[row].detach(),
+#                 spectral_prototype=desc.get("spectral_prototypes", None)[row].detach() if torch.is_tensor(desc.get("spectral_prototypes", None)) else None,
+#                 band_importance=desc.get("band_importance", None)[row].detach() if torch.is_tensor(desc.get("band_importance", None)) else None,
+#                 phase_created=int(phase),
+#             )
+#             if hasattr(gb, "add_or_update_class_geometry"):
+#                 gb.add_or_update_class_geometry(**kwargs)
+#             elif hasattr(gb, "update_class_geometry"):
+#                 gb.update_class_geometry(allow_frozen_update=False, **{k: v for k, v in kwargs.items() if k != "phase_created"})
+#             elif hasattr(gb, "update_class"):
+#                 kwargs["cls_id"] = kwargs.pop("class_id")
+#                 gb.update_class(**{k: v for k, v in kwargs.items() if k != "phase_created"})
+#             else:
+#                 raise AttributeError("GeometryBank must expose add_or_update_class_geometry/update_class_geometry/update_class.")
+#         if hasattr(gb, "assert_bank_valid"):
+#             try:
+#                 gb.assert_bank_valid(seen_classes=ids)
+#             except TypeError:
+#                 gb.assert_bank_valid()
+
+#     def _risk_matrix_from_descriptors(
+#         self,
+#         old_snapshot: Dict[str, torch.Tensor],
+#         new_desc: Dict[str, torch.Tensor],
+#     ) -> Dict[str, torch.Tensor]:
+#         old_mu = old_snapshot["means"].to(self.device).float()
+#         old_U = old_snapshot["bases"].to(self.device).float()
+#         old_e = old_snapshot["eigvals"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         old_rv = old_snapshot["res_vars"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         new_mu = new_desc["means"].to(self.device).float()
+#         new_U = new_desc["bases"].to(self.device).float()
+#         # Center proximity
+#         dist = torch.cdist(old_mu, new_mu, p=2)
+#         center_margin = max(self._inc_cfg_float("risk_center_margin", 1.0), 1e-6)
+#         center = torch.exp(-dist / center_margin).clamp(0.0, 1.0)
+#         # Old ellipsoid invasion energy of new means.
+#         diff = new_mu.unsqueeze(0) - old_mu.unsqueeze(1)  # [O,N,D]
+#         proj = torch.einsum("ond,odr->onr", diff, old_U)
+#         low = (proj.pow(2) / old_e.unsqueeze(1).clamp_min(_EPS)).sum(dim=-1)
+#         rec = torch.einsum("onr,odr->ond", proj, old_U)
+#         residual = ((diff - rec).pow(2).sum(dim=-1) / old_rv.view(-1, 1).clamp_min(_EPS))
+#         energy = (low + residual) / float(max(old_mu.size(1), 1))
+#         mahal_margin = max(self._inc_cfg_float("old_new_geometry_margin", 0.30), 1e-6)
+#         mahal = F.relu(mahal_margin - energy) / mahal_margin
+#         # Subspace overlap.
+#         overlap_rows: List[torch.Tensor] = []
+#         for i in range(old_U.size(0)):
+#             vals = []
+#             for j in range(new_U.size(0)):
+#                 m = old_U[i].t().matmul(new_U[j])
+#                 vals.append(m.pow(2).sum() / float(max(1, min(old_U.size(-1), new_U.size(-1)))))
+#             overlap_rows.append(torch.stack(vals))
+#         subspace = torch.stack(overlap_rows, dim=0).clamp(0.0, 1.0)
+#         band = torch.zeros_like(subspace)
+#         if torch.is_tensor(old_snapshot.get("band_importance", None)) and torch.is_tensor(new_desc.get("band_importance", None)):
+#             ob = F.normalize(old_snapshot["band_importance"].to(self.device).float(), p=2, dim=1)
+#             nb = F.normalize(new_desc["band_importance"].to(self.device).float(), p=2, dim=1)
+#             if ob.size(1) == nb.size(1):
+#                 band = ob.matmul(nb.t()).clamp(0.0, 1.0) * center
+#         spectral = torch.zeros_like(subspace)
+#         if torch.is_tensor(old_snapshot.get("spectral_prototypes", None)) and torch.is_tensor(new_desc.get("spectral_prototypes", None)):
+#             os = old_snapshot["spectral_prototypes"].to(self.device).float()
+#             ns = new_desc["spectral_prototypes"].to(self.device).float()
+#             if os.dim() == 2 and ns.dim() == 2 and os.size(1) == ns.size(1):
+#                 spectral = F.normalize(os, p=2, dim=1).matmul(F.normalize(ns, p=2, dim=1).t()).clamp(0.0, 1.0) * center
+#         risk = (
+#             self._inc_cfg_float("risk_center_weight", 0.50) * center
+#             + self._inc_cfg_float("risk_mahal_weight", 1.00) * mahal
+#             + self._inc_cfg_float("risk_subspace_weight", 1.00) * subspace
+#             + self._inc_cfg_float("risk_band_weight", 0.15) * band
+#             + self._inc_cfg_float("risk_spectral_shape_weight", 0.25) * spectral
+#         )
+#         return {"risk": risk, "center": center, "mahal": mahal, "subspace": subspace, "band": band, "spectral": spectral, "dist": dist, "energy": energy}
+
+#     def admit_new_geometry(
+#         self,
+#         new_desc: Dict[str, torch.Tensor],
+#         old_snapshot: Dict[str, torch.Tensor],
+#         new_classes: Sequence[int],
+#     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
+#         """Apply new-row-only spectral-guided safe insertion.
+
+#         This calls the repaired geometry_transport.safe_insert_new_geometry when available.
+#         Fallback is a deterministic center push + basis projection.  In both cases old rows are never modified.
+#         """
+#         risk_before = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
+#         corrected = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in new_desc.items()}
+#         # Main SCBGR run must not secretly activate transport.
+#         # Safe new-row transport is an explicit ablation: --use_geometry_transport true.
+#         use_transport = self._inc_cfg_bool("use_geometry_transport", False) or self._inc_cfg_bool("use_new_row_transport", False)
+#         if use_transport:
+#             try:
+#                 from models.geometry_transport import safe_insert_new_geometry  # type: ignore
+
+#                 out = safe_insert_new_geometry(
+#                     new_class_ids=[int(c) for c in new_classes],
+#                     old_class_ids=old_snapshot["class_ids"].detach().cpu().tolist(),
+#                     new_means=new_desc["means"],
+#                     new_bases=new_desc["bases"],
+#                     new_eigvals=new_desc["eigvals"],
+#                     new_res_vars=new_desc["res_vars"],
+#                     old_means=old_snapshot["means"],
+#                     old_bases=old_snapshot["bases"],
+#                     old_eigvals=old_snapshot["eigvals"],
+#                     old_res_vars=old_snapshot["res_vars"],
+#                     new_active_ranks=new_desc.get("active_ranks", None),
+#                     old_active_ranks=old_snapshot.get("active_ranks", None),
+#                     new_spectral=new_desc.get("spectral_prototypes", None),
+#                     old_spectral=old_snapshot.get("spectral_prototypes", None),
+#                     new_band=new_desc.get("band_importance", None),
+#                     old_band=old_snapshot.get("band_importance", None),
+#                     center_margin=self._inc_cfg_float("risk_center_margin", 1.0),
+#                     ellipsoid_margin=self._inc_cfg_float("old_new_geometry_margin", 0.30),
+#                     max_mean_shift=self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35),
+#                 )
+#                 if isinstance(out, dict) and torch.is_tensor(out.get("means", None)):
+#                     corrected["means"] = out["means"].to(self.device)
+#                     corrected["bases"] = out["bases"].to(self.device)
+#                     corrected["eigvals"] = out["eigvals"].to(self.device)
+#                     corrected["res_vars"] = out["res_vars"].to(self.device)
+#                     if torch.is_tensor(out.get("active_ranks", None)):
+#                         corrected["active_ranks"] = out["active_ranks"].to(self.device)
+#             except Exception as exc:
+#                 if bool(getattr(self, "debug", False)):
+#                     print(f"[NewRowTransport WARN] using fallback safe insertion: {exc}")
+#                 corrected = self._fallback_safe_new_row_correction(corrected, old_snapshot, risk_before)
+#         else:
+#             corrected = self._fallback_safe_new_row_correction(corrected, old_snapshot, risk_before)
+#         self._assert_descriptor_block_valid(corrected, context="admitted new geometry")
+#         risk_after = self._risk_matrix_from_descriptors(old_snapshot, corrected)
+#         stats = {
+#             "risk_before_max": float(risk_before["risk"].max().detach().cpu().item()) if risk_before["risk"].numel() else 0.0,
+#             "risk_before_mean": float(risk_before["risk"].mean().detach().cpu().item()) if risk_before["risk"].numel() else 0.0,
+#             "risk_after_max": float(risk_after["risk"].max().detach().cpu().item()) if risk_after["risk"].numel() else 0.0,
+#             "risk_after_mean": float(risk_after["risk"].mean().detach().cpu().item()) if risk_after["risk"].numel() else 0.0,
+#             "overlap_before_max": float(risk_before["subspace"].max().detach().cpu().item()) if risk_before["subspace"].numel() else 0.0,
+#             "overlap_after_max": float(risk_after["subspace"].max().detach().cpu().item()) if risk_after["subspace"].numel() else 0.0,
+#             "transport_active": float(1.0 if use_transport else 0.0),
+#         }
+#         if stats["risk_after_max"] > stats["risk_before_max"] + 1e-5:
+#             print(f"[NewRowAdmission WARN] max risk increased {stats['risk_before_max']:.4f}->{stats['risk_after_max']:.4f}; keeping correction because identity clamp may still improve subspace/boundary.")
+#         return corrected, stats
+
+#     def _fallback_safe_new_row_correction(self, desc: Dict[str, torch.Tensor], old_snapshot: Dict[str, torch.Tensor], risk_parts: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+#         out = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in desc.items()}
+#         risk = risk_parts["risk"].to(self.device)
+#         if risk.numel() == 0:
+#             return out
+#         old_mu = old_snapshot["means"].to(self.device).float()
+#         old_U = old_snapshot["bases"].to(self.device).float()
+#         means = out["means"].to(self.device).float()
+#         bases = out["bases"].to(self.device).float()
+#         eig = out["eigvals"].to(self.device).float()
+#         res = out["res_vars"].to(self.device).float()
+#         risk_thr = self._inc_cfg_float("descriptor_correction_risk_threshold", 0.35)
+#         max_shift = self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35)
+#         basis_strength = self._inc_cfg_float("descriptor_correction_basis_strength", 0.50)
+#         var_shrink = self._inc_cfg_float("descriptor_correction_var_shrink", 0.10)
+#         var_floor = self._inc_cfg_float("geom_var_floor", 1e-4)
+#         for j in range(means.size(0)):
+#             col = risk[:, j].clamp_min(0.0)
+#             if float(col.max().detach().cpu().item()) < risk_thr:
+#                 continue
+#             w = col / col.sum().clamp_min(_EPS)
+#             push = torch.zeros_like(means[j])
+#             P = torch.zeros((bases.size(1), bases.size(1)), device=self.device, dtype=bases.dtype)
+#             for i in range(old_mu.size(0)):
+#                 direction = means[j] - old_mu[i]
+#                 direction = direction / direction.norm().clamp_min(_EPS)
+#                 push = push + w[i] * direction
+#                 P = P + w[i] * old_U[i].matmul(old_U[i].t())
+#             gate = float(min(1.0, max(0.0, (float(col.max().detach().cpu().item()) - risk_thr) / max(1e-6, 1.5 - risk_thr))))
+#             if push.norm() > _EPS:
+#                 delta = max_shift * gate * push / push.norm().clamp_min(_EPS)
+#                 means[j] = means[j] + delta
+#             Ucorr = bases[j] - basis_strength * gate * P.matmul(bases[j])
+#             q, _ = torch.linalg.qr(Ucorr, mode="reduced")
+#             q = q[:, : bases.size(2)]
+#             # sign-stabilize
+#             sign = torch.where((q * bases[j]).sum(dim=0, keepdim=True) < 0, -torch.ones(1, bases.size(2), device=q.device), torch.ones(1, bases.size(2), device=q.device))
+#             bases[j] = q * sign
+#             eig[j] = (eig[j] * (1.0 - var_shrink * gate)).clamp_min(var_floor)
+#             res[j] = (res[j] * (1.0 - 0.5 * var_shrink * gate)).clamp_min(var_floor)
+#         out["means"], out["bases"], out["eigvals"], out["res_vars"] = means, bases, eig, res
+#         return out
+
+#     # ------------------------------------------------------------------
+#     # Replay from frozen old geometry
+#     # ------------------------------------------------------------------
+#     def _sample_from_snapshot(self, snapshot: Dict[str, torch.Tensor], samples_per_class: int, boundary: bool = False, new_desc: Optional[Dict[str, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+#         means = snapshot["means"].to(self.device).float()
+#         bases = snapshot["bases"].to(self.device).float()
+#         eig = snapshot["eigvals"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         res = snapshot["res_vars"].to(self.device).float().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         ids = snapshot["class_ids"].to(self.device).long()
+#         active = snapshot.get("active_ranks", torch.full((means.size(0),), bases.size(2), device=self.device, dtype=torch.long)).to(self.device).long()
+#         per = max(1, int(samples_per_class))
+#         xs: List[torch.Tensor] = []
+#         ys: List[torch.Tensor] = []
+#         boundary_count = 0
+#         # Boundary replay is old-side only: sample near risky old means in directions toward new centers but keep old labels.
+#         risk_pairs = None
+#         if boundary and new_desc is not None:
+#             risk = self._risk_matrix_from_descriptors(snapshot, new_desc)["risk"]
+#             if risk.numel() > 0:
+#                 thr = self._inc_cfg_float("boundary_replay_risk_threshold", 0.35)
+#                 coords = (risk >= thr).nonzero(as_tuple=False)
+#                 if coords.numel() == 0:
+#                     # fallback to top dangerous pairs, but log fallback.
+#                     k = min(self._inc_cfg_int("boundary_replay_max_pairs", 24), int(risk.numel()))
+#                     _, flat_idx = torch.topk(risk.flatten(), k=k, largest=True)
+#                     coords = torch.stack([flat_idx // risk.size(1), flat_idx % risk.size(1)], dim=1)
+#                 risk_pairs = coords
+#         for i in range(means.size(0)):
+#             r = int(active[i].detach().cpu().item())
+#             r = max(0, min(r, bases.size(2)))
+#             eps = torch.randn(per, max(r, 1), device=self.device, dtype=means.dtype)
+#             if r > 0:
+#                 low = eps[:, :r].matmul((bases[i, :, :r] * eig[i, :r].sqrt().view(1, -1)).t())
+#             else:
+#                 low = torch.zeros(per, means.size(1), device=self.device, dtype=means.dtype)
+#             residual = torch.randn(per, means.size(1), device=self.device, dtype=means.dtype) * res[i].sqrt() * self._inc_cfg_float("replay_residual_scale", 0.15)
+#             z = means[i].view(1, -1) + self._inc_cfg_float("replay_parallel_scale", 0.35) * low + residual
+#             xs.append(z)
+#             ys.append(torch.full((per,), int(ids[i].detach().cpu().item()), device=self.device, dtype=torch.long))
+#         if risk_pairs is not None and risk_pairs.numel() > 0 and new_desc is not None:
+#             samples_per_pair = max(1, self._inc_cfg_int("boundary_replay_samples_per_pair", 4))
+#             new_mu = new_desc["means"].to(self.device).float()
+#             for oi, nj in risk_pairs.tolist():
+#                 direction = new_mu[int(nj)] - means[int(oi)]
+#                 if direction.norm() <= _EPS:
+#                     continue
+#                 direction = direction / direction.norm().clamp_min(_EPS)
+#                 radius = eig[int(oi)].mean().sqrt().clamp_min(1e-3) * self._inc_cfg_float("boundary_replay_radius", 0.75)
+#                 noise = torch.randn(samples_per_pair, means.size(1), device=self.device, dtype=means.dtype) * res[int(oi)].sqrt() * 0.05
+#                 z = means[int(oi)].view(1, -1) + radius * direction.view(1, -1) + noise
+#                 xs.append(z)
+#                 ys.append(torch.full((samples_per_pair,), int(ids[int(oi)].detach().cpu().item()), device=self.device, dtype=torch.long))
+#                 boundary_count += samples_per_pair
+#         x_old = torch.cat(xs, dim=0)
+#         y_old = torch.cat(ys, dim=0)
+#         _finite(x_old, "old replay features")
+#         stats = {
+#             "replay_count": float(y_old.numel()),
+#             "boundary_replay_count": float(boundary_count),
+#             "boundary_replay_fallback": float(1.0 if boundary and boundary_count == 0 else 0.0),
+#         }
+#         return x_old, y_old, stats
+
+#     def sample_old_replay(self, old_snapshot: Dict[str, torch.Tensor], seen_classes: Sequence[int], new_desc: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor | Dict[str, float]]:
+#         old_classes = old_snapshot["class_ids"].detach().cpu().tolist()
+#         samples_per_class = self._inc_cfg_int("synthetic_replay_per_class", self._inc_cfg_int("component_replay_per_class", 32))
+#         use_boundary = self._inc_cfg_bool("use_boundary_geometry_replay", True)
+#         x_old, y_old, stats = self._sample_from_snapshot(old_snapshot, samples_per_class, boundary=use_boundary, new_desc=new_desc)
+#         if x_old.dim() != 2:
+#             raise RuntimeError(f"Replay features must be [B,D], got {tuple(x_old.shape)}")
+#         self.assert_global_labels_in_set(y_old, old_classes, "old replay labels")
+#         bad_new = sorted(set(y_old.detach().cpu().tolist()).difference(set(old_classes)))
+#         if bad_new:
+#             raise RuntimeError(f"Replay labels include non-old classes: {bad_new}")
+#         local = self.global_to_seen_local(y_old, seen_classes)
+#         self.assert_valid_seen_targets(local, len(seen_classes), context="old replay local labels")
+#         return {"features": x_old.detach(), "global_labels": y_old.detach(), "local_labels": local.detach(), "stats": stats}
+
+#     # Compatibility old API.
+#     def _sample_old_anchor_batch(self, old_bank_snapshot: Dict[str, torch.Tensor], old_class_count: int, new_class_ids: Optional[Iterable[int]] = None) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+#         # Convert old contiguous snapshot from old code to our canonical snapshot if needed.
+#         snap = old_bank_snapshot
+#         if "class_ids" not in snap:
+#             snap = dict(snap)
+#             snap["class_ids"] = torch.arange(int(old_class_count), device=self.device, dtype=torch.long)
+#         if "eigvals" not in snap and torch.is_tensor(snap.get("variances", None)):
+#             snap["eigvals"] = snap["variances"][:, :-1]
+#             snap["res_vars"] = snap["variances"][:, -1]
+#         replay = self.sample_old_replay(snap, list(range(int(old_class_count))) + [int(c) for c in (new_class_ids or [])])
+#         return replay["features"], replay["global_labels"]  # type: ignore[return-value]
+
+#     # ------------------------------------------------------------------
+#     # Descriptor refinement: optimize only current new rows, old snapshot detached
+#     # ------------------------------------------------------------------
+#     def _compose_bank_for_descriptor_params(self, base_bank: Dict[str, torch.Tensor], new_classes: Sequence[int], mu: torch.Tensor, bases: torch.Tensor, eig: torch.Tensor, res: torch.Tensor) -> Dict[str, torch.Tensor]:
+#         bank = {k: (v.detach().clone().to(self.device) if torch.is_tensor(v) else v) for k, v in base_bank.items()}
+#         ids = torch.as_tensor([int(c) for c in new_classes], device=self.device, dtype=torch.long)
+#         bank["means"][ids] = mu
+#         bank["bases"][ids] = bases
+#         bank["eigvals"][ids] = eig
+#         bank["res_vars"][ids] = res
+#         return bank  # type: ignore[return-value]
+
+#     def _orthonormalize_bases(self, raw: torch.Tensor, reference: Optional[torch.Tensor] = None) -> torch.Tensor:
+#         outs = []
+#         R = raw.size(-1)
+#         for i in range(raw.size(0)):
+#             q, _ = torch.linalg.qr(raw[i], mode="reduced")
+#             q = q[:, :R]
+#             if torch.is_tensor(reference) and reference.shape == raw.shape:
+#                 sign = torch.where((q * reference[i].to(q.device, q.dtype)).sum(dim=0, keepdim=True) < 0, -torch.ones(1, R, device=q.device, dtype=q.dtype), torch.ones(1, R, device=q.device, dtype=q.dtype))
+#                 q = q * sign
+#             outs.append(q)
+#         return torch.stack(outs, dim=0)
+
+#     def _geometry_logits_from_bank(self, features: torch.Tensor, bank: Dict[str, torch.Tensor], seen_classes: Sequence[int]) -> torch.Tensor:
+#         ids = torch.as_tensor([int(c) for c in seen_classes], device=features.device, dtype=torch.long)
+#         mu = bank["means"].to(features.device).index_select(0, ids)
+#         U = bank["bases"].to(features.device).index_select(0, ids)
+#         eig = bank["eigvals"].to(features.device).index_select(0, ids).clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         rv = bank["res_vars"].to(features.device).flatten().index_select(0, ids).clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         diff = features.unsqueeze(1) - mu.unsqueeze(0)
+#         proj = torch.einsum("bsd,sdr->bsr", diff, U)
+#         low = (proj.pow(2) / eig.unsqueeze(0).clamp_min(_EPS)).sum(dim=-1)
+#         rec = torch.einsum("bsr,sdr->bsd", proj, U)
+#         residual = ((diff - rec).pow(2).sum(dim=-1) / rv.view(1, -1).clamp_min(_EPS))
+#         energy = (low + residual) / float(max(features.size(1), 1))
+#         if self._inc_cfg_bool("use_logdet_energy", True):
+#             logdet = torch.log(eig).sum(dim=-1) + torch.log(rv).view(-1) * float(max(features.size(1) - U.size(-1), 0))
+#             energy = energy + self._inc_cfg_float("logdet_energy_weight", 0.02) * logdet.view(1, -1)
+#         energy = energy - energy.min(dim=1, keepdim=True).values.detach()
+#         return -self._inc_cfg_float("loss_scale", 8.0) * energy
+
+#     def _descriptor_margin_loss(self, old_snapshot: Dict[str, torch.Tensor], new_desc: Dict[str, torch.Tensor]) -> torch.Tensor:
+#         risk = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
+#         margin = self._inc_cfg_float("descriptor_overlap_target", 0.35)
+#         sub_loss = F.relu(risk["subspace"] - margin).pow(2).mean() if risk["subspace"].numel() else self._zero_like_ref(new_desc["means"])
+#         invasion = risk["mahal"].pow(2).mean() if risk["mahal"].numel() else self._zero_like_ref(new_desc["means"])
+#         return self._inc_cfg_float("lambda_subspace", 0.20) * sub_loss + self._inc_cfg_float("lambda_insertion", 0.35) * invasion
+
+#     def _old_new_boundary_preservation_loss(
+#         self,
+#         old_snapshot: Dict[str, torch.Tensor],
+#         new_desc: Dict[str, torch.Tensor],
+#         *,
+#         return_parts: bool = False,
+#     ) -> torch.Tensor | Dict[str, torch.Tensor]:
+#         """Differentiable old/new boundary preservation for new descriptors only.
+
+#         This is the method the trainer contract was correctly looking for. It is
+#         not a dummy/stub: it penalizes new rows that enter old ellipsoids, reuse
+#         old tangent directions, become too broad, or share high band signatures
+#         with risky old rows. Old tensors are detached by construction.
+#         """
+#         ref = new_desc.get("means", None)
+#         if not torch.is_tensor(ref) or ref.numel() == 0:
+#             z = self._zero_like_ref(ref)
+#             return {"total": z, "risk": z, "overlap": z, "volume": z, "band": z} if return_parts else z
+
+#         risk = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
+#         risk_mat = risk["risk"]
+#         sub = risk["subspace"]
+#         band = risk.get("band", torch.zeros_like(sub))
+
+#         risk_target = self._inc_cfg_float("max_old_new_risk", 0.60)
+#         overlap_target = self._inc_cfg_float("max_old_new_overlap", self._inc_cfg_float("descriptor_subspace_overlap_max", 0.35))
+#         risk_loss = F.relu(risk_mat - risk_target).pow(2).mean() if risk_mat.numel() else self._zero_like_ref(ref)
+#         overlap_loss = F.relu(sub - overlap_target).pow(2).mean() if sub.numel() else self._zero_like_ref(ref)
+#         band_loss = F.relu(band - self._inc_cfg_float("pgr_band_overlap_max", 0.75)).pow(2).mean() if band.numel() else self._zero_like_ref(ref)
+
+#         eig = new_desc.get("eigvals", None)
+#         res = new_desc.get("res_vars", None)
+#         volume_loss = self._zero_like_ref(ref)
+#         if torch.is_tensor(eig) and torch.is_tensor(res) and eig.numel() > 0 and res.numel() > 0:
+#             new_volume = torch.log(eig.clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).mean(dim=1) + torch.log(res.clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).view(-1)
+#             old_e = old_snapshot.get("eigvals", None)
+#             old_r = old_snapshot.get("res_vars", None)
+#             if torch.is_tensor(old_e) and torch.is_tensor(old_r) and old_e.numel() > 0 and old_r.numel() > 0:
+#                 old_volume = torch.log(old_e.detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).mean(dim=1) + torch.log(old_r.detach().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))).view(-1)
+#                 cap = old_volume.mean().detach() + old_volume.std(unbiased=False).detach()
+#                 volume_loss = F.relu(new_volume - cap).pow(2).mean()
+
+#         total = (
+#             self._inc_cfg_float("boundary_preserve_center_weight", 0.50) * risk_loss
+#             + self._inc_cfg_float("boundary_preserve_overlap_weight", 1.00) * overlap_loss
+#             + self._inc_cfg_float("boundary_preserve_volume_weight", 0.25) * volume_loss
+#             + self._inc_cfg_float("boundary_preserve_band_weight", 0.10) * band_loss
+#         )
+#         _finite(total, "old_new_boundary_preservation_loss")
+#         if return_parts:
+#             return {
+#                 "total": total,
+#                 "risk": risk_loss.detach(),
+#                 "overlap": overlap_loss.detach(),
+#                 "volume": volume_loss.detach(),
+#                 "band": band_loss.detach(),
+#                 "risk_max": risk_mat.detach().max() if risk_mat.numel() else self._zero_like_ref(ref).detach(),
+#                 "overlap_max": sub.detach().max() if sub.numel() else self._zero_like_ref(ref).detach(),
+#             }
+#         return total
+
+#     @torch.no_grad()
+#     def _project_new_descriptor_params_out_of_old_tangent_space(
+#         self,
+#         desc: Dict[str, torch.Tensor],
+#         old_snapshot: Dict[str, torch.Tensor],
+#         *,
+#         risk_parts: Optional[Dict[str, torch.Tensor]] = None,
+#     ) -> Dict[str, torch.Tensor]:
+#         """Hard projection step for new rows only.
+
+#         It removes components of new bases that lie in risky old tangent spaces
+#         and applies a small mean push/variance shrink. This never edits old rows.
+#         """
+#         parts = risk_parts if isinstance(risk_parts, dict) else self._risk_matrix_from_descriptors(old_snapshot, desc)
+#         out = self._fallback_safe_new_row_correction(desc, old_snapshot, parts)
+#         self._assert_descriptor_block_valid(out, context="boundary-projected new descriptors")
+#         return out
+
+#     def _adaptive_boundary_loss_from_current_bank(
+#         self,
+#         logits: Optional[torch.Tensor] = None,
+#         labels_local: Optional[torch.Tensor] = None,
+#         *,
+#         old_class_count: int = 0,
+#         seen_classes: Optional[Sequence[int]] = None,
+#     ) -> torch.Tensor:
+#         """Optional adaptive-boundary loss, gated by --use_adaptive_boundary.
+
+#         The clean command uses --use_adaptive_boundary false, so this returns a
+#         safe zero. When a repaired classifier exposes adaptive_boundary_loss, this
+#         delegates to it without making adaptive boundary a hidden main-path module.
+#         """
+#         ref = logits if torch.is_tensor(logits) else None
+#         if not self._inc_cfg_bool("use_adaptive_boundary", False):
+#             return self._zero_like_ref(ref)
+#         clf = getattr(self.model, "classifier", None)
+#         if clf is None or not hasattr(clf, "adaptive_boundary_loss"):
+#             return self._zero_like_ref(ref)
+#         try:
+#             loss = clf.adaptive_boundary_loss(
+#                 logits=logits,
+#                 labels=labels_local,
+#                 old_class_count=int(old_class_count),
+#                 seen_classes=list(seen_classes or []),
+#             )
+#         except TypeError:
+#             try:
+#                 loss = clf.adaptive_boundary_loss(logits, labels_local, int(old_class_count))
+#             except TypeError:
+#                 return self._zero_like_ref(ref)
+#         if isinstance(loss, dict):
+#             loss = loss.get("total", self._zero_like_ref(ref))
+#         if not torch.is_tensor(loss):
+#             return self._zero_like_ref(ref)
+#         return _finite(loss, "adaptive_boundary_loss")
+
+#     def _refine_new_descriptors_impl(
+#         self,
+#         *,
+#         z_new: torch.Tensor,
+#         y_new: torch.Tensor,
+#         seen_classes: Sequence[int],
+#         old_classes: Sequence[int],
+#         new_classes: Sequence[int],
+#         old_snapshot: Dict[str, torch.Tensor],
+#         init_desc: Dict[str, torch.Tensor],
+#         steps: int,
+#     ) -> Dict[str, Any]:
+#         if steps <= 0 or not self._inc_cfg_bool("refine_new_descriptors", True):
+#             return {"desc": init_desc, "stats": {"loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "margin": 0.0, "steps": 0.0}}
+#         base_bank = self._bank_dict()
+#         ids = torch.as_tensor([int(c) for c in new_classes], device=self.device, dtype=torch.long)
+#         mu0 = init_desc["means"].detach().clone()
+#         U0 = init_desc["bases"].detach().clone()
+#         eig0 = init_desc["eigvals"].detach().clone().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         res0 = init_desc["res_vars"].detach().clone().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#         mu = nn.Parameter(mu0.clone())
+#         raw_U = nn.Parameter(U0.clone())
+#         log_eig = nn.Parameter(eig0.log())
+#         log_res = nn.Parameter(res0.log())
+#         opt = optim.Adam([mu, raw_U, log_eig, log_res], lr=self._inc_cfg_float("descriptor_refine_lr", 1e-3), weight_decay=0.0)
+#         max_mean_shift = self._inc_cfg_float("descriptor_refine_max_mean_shift", 0.35)
+#         max_logvar_shift = self._inc_cfg_float("descriptor_refine_max_logvar_shift", 0.75)
+#         replay_weight = self._inc_cfg_float("lambda_replay", self._inc_cfg_float("synthetic_replay_weight", 1.0))
+#         new_weight = self._inc_cfg_float("lambda_new", 1.0)
+#         margin_weight = self._inc_cfg_float("lambda_margin", 1.0)
+#         stats = {"loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "margin": 0.0, "replay_acc": 0.0, "steps": 0.0}
+#         for _ in range(int(steps)):
+#             opt.zero_grad(set_to_none=True)
+#             U = self._orthonormalize_bases(raw_U, U0)
+#             eig = log_eig.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#             res = log_res.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#             tmp_bank = self._compose_bank_for_descriptor_params(base_bank, new_classes, mu, U, eig, res)
+#             logits_new = self._geometry_logits_from_bank(z_new, tmp_bank, seen_classes)
+#             ce_new = self._stable_ce_seen(logits_new, y_new, seen_classes, "descriptor new CE")
+#             cur_desc = dict(init_desc)
+#             cur_desc.update({"means": mu, "bases": U, "eigvals": eig, "res_vars": res})
+#             replay = self.sample_old_replay(old_snapshot, seen_classes, new_desc=cur_desc)
+#             z_old = replay["features"].to(self.device)  # type: ignore[index]
+#             y_old = replay["global_labels"].to(self.device).long()  # type: ignore[index]
+#             logits_old = self._geometry_logits_from_bank(z_old, tmp_bank, seen_classes)
+#             ce_replay = self._stable_ce_seen(logits_old, y_old, seen_classes, "descriptor replay CE")
+#             # Boundary preservation is the real old/new protection.
+#             # It includes ellipsoid-invasion, tangent-space overlap, volume, and band-risk terms.
+#             boundary_parts = self._old_new_boundary_preservation_loss(old_snapshot, cur_desc, return_parts=True)
+#             margin = self._descriptor_margin_loss(old_snapshot, cur_desc) + self._inc_cfg_float("boundary_preserve_weight", 0.35) * boundary_parts["total"]
+#             trust = (mu - mu0).pow(2).mean() + (U - U0).pow(2).mean() + (log_eig - eig0.log()).pow(2).mean() + (log_res - res0.log()).pow(2).mean()
+#             loss = new_weight * ce_new + replay_weight * ce_replay + margin_weight * margin + self._inc_cfg_float("lambda_trust", 0.05) * trust
+#             _finite(loss, "descriptor refinement loss")
+#             loss.backward()
+#             torch.nn.utils.clip_grad_norm_([mu, raw_U, log_eig, log_res], self._inc_cfg_float("descriptor_refine_grad_clip", 1.0))
+#             opt.step()
+#             with torch.no_grad():
+#                 # Hard identity preservation around admitted descriptor.
+#                 delta = mu - mu0
+#                 norm = delta.norm(dim=1, keepdim=True).clamp_min(_EPS)
+#                 scale = (max_mean_shift / norm).clamp(max=1.0)
+#                 mu.copy_(mu0 + delta * scale)
+#                 log_eig.copy_(torch.max(torch.min(log_eig, eig0.log() + max_logvar_shift), eig0.log() - max_logvar_shift))
+#                 log_res.copy_(torch.max(torch.min(log_res, res0.log() + max_logvar_shift), res0.log() - max_logvar_shift))
+#             pred_old = logits_old.detach().argmax(dim=1)
+#             y_old_local = self.global_to_seen_local(y_old, seen_classes)
+#             stats["loss"] += float(loss.detach().cpu().item())
+#             stats["ce_new"] += float(ce_new.detach().cpu().item())
+#             stats["ce_replay"] += float(ce_replay.detach().cpu().item())
+#             stats["margin"] += float(margin.detach().cpu().item())
+#             stats["replay_acc"] += float((pred_old == y_old_local).float().mean().detach().cpu().item() * 100.0)
+#             stats["steps"] += 1.0
+#         with torch.no_grad():
+#             U = self._orthonormalize_bases(raw_U, U0)
+#             eig = log_eig.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#             res = log_res.exp().clamp_min(self._inc_cfg_float("geom_var_floor", 1e-4))
+#             final_desc = dict(init_desc)
+#             final_desc.update({"means": mu.detach(), "bases": U.detach(), "eigvals": eig.detach(), "res_vars": res.detach()})
+#             if self._inc_cfg_bool("use_boundary_projection", False):
+#                 final_desc = self._project_new_descriptor_params_out_of_old_tangent_space(final_desc, old_snapshot)
+#             self._assert_descriptor_block_valid(final_desc, context="refined new descriptors")
+#         denom = max(stats["steps"], 1.0)
+#         for k in ("loss", "ce_new", "ce_replay", "margin", "replay_acc"):
+#             stats[k] /= denom
+#         return {"desc": final_desc, "stats": stats}
+
+#     # ------------------------------------------------------------------
+#     # Trainability: descriptor-only default; adapter optional ablation
+#     # ------------------------------------------------------------------
+#     def _incremental_update_mode(self) -> str:
+#         mode = str(getattr(self.args, "incremental_update_mode", "scbgr")).lower().strip()
+#         aliases = {
+#             "": "scbgr",
+#             "none": "scbgr",
+#             "clean": "scbgr",
+#             "descriptor": "scbgr",
+#             "descriptor_only": "scbgr",
+#             "rsgi": "scbgr",
+#             "scbgr": "scbgr",
+#             "scb-gr": "scbgr",
+#             "spectral_risk_boundary": "scbgr",
+#             "geometry_state_admission": "scbgr",
+#             "g2rpa": "geometry_gated_adapter",
+#             "g2-rpa": "geometry_gated_adapter",
+#             "adapter": "geometry_gated_adapter",
+#             "gated_adapter": "geometry_gated_adapter",
+#             "geometry_adapter": "geometry_gated_adapter",
+#         }
+#         mode = aliases.get(mode, mode)
+#         if mode not in {"scbgr", "geometry_gated_adapter"}:
+#             raise RuntimeError(f"Unsupported incremental_update_mode={mode!r}. Use scbgr or geometry_gated_adapter.")
+#         try:
+#             setattr(self.args, "incremental_update_mode", mode)
+#         except Exception:
+#             pass
+#         return mode
+
+#     def _adapter_mode_enabled(self) -> bool:
+#         return self._incremental_update_mode() == "geometry_gated_adapter"
+
+#     def configure_incremental_trainability(self, old_classes: Sequence[int], new_classes: Sequence[int]) -> List[nn.Parameter]:
+#         # Hard-disable old-row transport and legacy paths unless explicit unsafe ablation.
+#         if self._inc_cfg_bool("use_sglat_transport", False) or self._inc_cfg_bool("allow_old_model_transport", False):
+#             if not self._inc_cfg_bool("unsafe_allow_old_row_transport", False):
+#                 raise RuntimeError(
+#                     "Old-row SGLAT/affine transport is disabled in the clean NECIL-HSI path. "
+#                     "Use new-row safe insertion transport only."
+#                 )
+#         for _, p in self.model.named_parameters():
+#             p.requires_grad = False
+#         for attr, value in (
+#             ("use_incremental_adapter", False),
+#             ("use_bicyc_geometry_cycle", False),
+#             ("use_geometry_calibrator", False),
+#             ("use_geometry_transport", False),  # model-side old-row transport off; trainer calls new-row transport explicitly.
+#         ):
+#             if hasattr(self.model, attr):
+#                 setattr(self.model, attr, value)
+#         for name in ("freeze_backbone_except_allowed", "freeze_semantic_encoder", "freeze_classifier", "freeze_projection_head", "freeze_backbone_only", "disable_incremental_adapter"):
+#             fn = getattr(self.model, name, None)
+#             if callable(fn):
+#                 try:
+#                     fn()
+#                 except TypeError:
+#                     try:
+#                         fn(allow_last_block=False)
+#                     except TypeError:
+#                         pass
+#         params: List[nn.Parameter] = []
+#         if self._adapter_mode_enabled():
+#             adapter = getattr(self.model, "geometry_plastic_adapter", None)
+#             if adapter is None:
+#                 raise RuntimeError("geometry_gated_adapter ablation requires model.geometry_plastic_adapter.")
+#             if hasattr(self.model, "use_geometry_gated_adapter"):
+#                 self.model.use_geometry_gated_adapter = True
+#             for p in adapter.parameters():
+#                 p.requires_grad = True
+#                 params.append(p)
+#         if self._inc_cfg_bool("use_energy_calibrator", False):
+#             if hasattr(self.model, "unfreeze_energy_calibrator"):
+#                 self.model.unfreeze_energy_calibrator()
+#             for name, p in self.model.named_parameters():
+#                 if "energy_calibrator" in name or "old_bias" in name or "new_bias" in name or "old_log_scale" in name or "new_log_scale" in name:
+#                     p.requires_grad = True
+#                     params.append(p)
+#         if self._inc_cfg_bool("use_adaptive_boundary", False):
+#             clf = getattr(self.model, "classifier", None)
+#             if clf is not None and hasattr(clf, "boundary_parameters"):
+#                 if hasattr(clf, "freeze_old_boundary_radii"):
+#                     clf.freeze_old_boundary_radii(len(old_classes))
+#                 for p in clf.boundary_parameters():
+#                     if p.requires_grad:
+#                         params.append(p)
+#         bad = []
+#         allowed = ("geometry_plastic_adapter", "energy_calibrator", "old_bias", "new_bias", "old_log_scale", "new_log_scale", "boundary")
+#         for name, p in self.model.named_parameters():
+#             if p.requires_grad and not any(a in name for a in allowed):
+#                 bad.append(name)
+#         if bad:
+#             raise RuntimeError(f"Forbidden trainable incremental parameters: {bad[:20]}")
+#         names = [name for name, p in self.model.named_parameters() if p.requires_grad]
+#         print(f"[Incremental Trainability] mode={self._incremental_update_mode()} | trainable={names if names else 'descriptor-only (no model weights)'}")
+#         return list(dict.fromkeys(params))
+
+#     # Uploaded-file compatibility names.
+#     def _set_clean_incremental_trainable_params(self, old_class_count: int) -> List[nn.Parameter]:
+#         return self.configure_incremental_trainability(list(range(int(old_class_count))), [])
+
+#     def _set_incremental_trainable_params(self, old_class_count: int) -> List[nn.Parameter]:
+#         return self._set_clean_incremental_trainable_params(old_class_count)
+
+#     # ------------------------------------------------------------------
+#     # Optional adapter ablation training (bounded, not default)
+#     # ------------------------------------------------------------------
+#     def _adapt_replay_features_for_adapter_training(self, z_old: torch.Tensor) -> Dict[str, torch.Tensor]:
+#         """Apply the geometry-gated adapter to synthetic old z-space samples.
+
+#         Synthetic replay samples already live in GeometryBank z-space, so they
+#         cannot pass through the backbone/projection. But when the adapter is
+#         trainable, old replay must still pass through the adapter directly;
+#         otherwise CE_replay has no gradient path into the adapter and cannot
+#         teach gate≈0 in old basins.
+#         """
+#         z_old = _finite(z_old.float(), "adapter old replay base features")
+#         fn = getattr(self.model, "adapt_projected_features", None)
+#         if callable(fn):
+#             try:
+#                 out = fn(z_old, force=True, return_delta=True)
+#             except TypeError:
+#                 out = fn(z_old)
+#             if isinstance(out, dict):
+#                 z = out.get("features", out.get("projected_features", None))
+#                 if not torch.is_tensor(z):
+#                     raise RuntimeError("adapt_projected_features(return_delta=True) did not return features.")
+#                 delta = out.get("delta", z - z_old)
+#                 gate = out.get("gate", torch.zeros((z.size(0), 1), device=z.device, dtype=z.dtype))
+#                 return {"features": _finite(z.float(), "adapted old replay features"), "delta": delta, "gate": gate}
+#             if torch.is_tensor(out):
+#                 return {"features": _finite(out.float(), "adapted old replay features"), "delta": out - z_old, "gate": torch.zeros((out.size(0), 1), device=out.device, dtype=out.dtype)}
+#         return {"features": z_old, "delta": torch.zeros_like(z_old), "gate": torch.zeros((z_old.size(0), 1), device=z_old.device, dtype=z_old.dtype)}
+
+#     def _adapter_regularization_loss(
+#         self,
+#         *,
+#         new_out: Dict[str, torch.Tensor],
+#         old_adapt: Dict[str, torch.Tensor],
+#     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+#         """Bounded plasticity regularizer for G²RPA.
+
+#         Old synthetic replay must remain nearly unchanged. New real samples may
+#         move, but only inside a small trust region. This prevents the adapter
+#         from becoming an uncontrolled incremental classifier while still giving
+#         enough plasticity to fix descriptor-only old/new bias.
+#         """
+#         ref = old_adapt["features"]
+#         old_delta = old_adapt.get("delta", torch.zeros_like(ref))
+#         old_gate = old_adapt.get("gate", torch.zeros((ref.size(0), 1), device=ref.device, dtype=ref.dtype))
+#         new_delta = new_out.get("adapter_delta", torch.zeros_like(new_out["features"]))
+#         new_gate = new_out.get("adapter_gate", torch.zeros((new_out["features"].size(0), 1), device=new_out["features"].device, dtype=new_out["features"].dtype))
+
+#         old_delta_loss = old_delta.pow(2).mean()
+#         old_gate_loss = old_gate.clamp_min(0.0).mean()
+#         max_new_delta = self._inc_cfg_float("adapter_new_delta_max", self._inc_cfg_float("adapter_max_scale", 0.10))
+#         new_norm = new_delta.norm(dim=1)
+#         new_delta_loss = F.relu(new_norm - max_new_delta).pow(2).mean()
+#         new_gate_target = self._inc_cfg_float("adapter_new_gate_target", 0.15)
+#         new_gate_max = self._inc_cfg_float("adapter_new_gate_max_target", self._inc_cfg_float("adapter_new_gate_max", 0.35))
+#         new_gate_mean = new_gate.clamp_min(0.0).mean()
+#         new_gate_loss = F.relu(new_gate_mean - new_gate_max).pow(2) + 0.10 * (new_gate_mean - new_gate_target).pow(2)
+
+#         loss = (
+#             self._inc_cfg_float("adapter_old_delta_weight", 1.00) * old_delta_loss
+#             + self._inc_cfg_float("adapter_old_gate_weight", 0.75) * old_gate_loss
+#             + self._inc_cfg_float("adapter_new_delta_weight", 0.25) * new_delta_loss
+#             + self._inc_cfg_float("adapter_new_gate_weight", 0.10) * new_gate_loss
+#         )
+#         stats = {
+#             "gate_old": float(old_gate.detach().mean().cpu().item()) if old_gate.numel() else 0.0,
+#             "gate_new": float(new_gate.detach().mean().cpu().item()) if new_gate.numel() else 0.0,
+#             "delta_old": float(old_delta.detach().norm(dim=1).mean().cpu().item()) if old_delta.numel() else 0.0,
+#             "delta_new": float(new_delta.detach().norm(dim=1).mean().cpu().item()) if new_delta.numel() else 0.0,
+#             "adapter_reg": float(loss.detach().cpu().item()),
+#         }
+#         return _finite(loss, "adapter_regularization_loss"), stats
+
+#     def train_one_adapter_epoch(
+#         self,
+#         loader,
+#         optimizer: optim.Optimizer,
+#         *,
+#         old_snapshot: Dict[str, torch.Tensor],
+#         seen_classes: Sequence[int],
+#         old_classes: Sequence[int],
+#         new_classes: Sequence[int],
+#         new_desc: Dict[str, torch.Tensor],
+#     ) -> Dict[str, float]:
+#         if optimizer is None:
+#             return {"adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "steps": 0.0}
+#         self.model.train()
+#         stats = {
+#             "adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "adaptive_boundary": 0.0,
+#             "adapter_reg": 0.0, "gate_old": 0.0, "gate_new": 0.0, "delta_old": 0.0, "delta_new": 0.0,
+#             "steps": 0.0, "old_replay_acc": 0.0,
+#         }
+#         old_ref = self.snapshot_old_geometry(old_classes)
+#         for batch in loader:
+#             x, y, spectra, _ = self._unpack_batch(batch)
+#             x = x.float().to(self.device, non_blocking=True)
+#             y = y.long().to(self.device, non_blocking=True).view(-1)
+#             self.assert_global_labels_in_set(y, new_classes, "adapter real new batch")
+#             optimizer.zero_grad(set_to_none=True)
+
+#             # Real new samples go through the model path, therefore through the
+#             # adapter when geometry_gated_adapter is enabled.
+#             out = self.extract_incremental_features(x, spectra)
+#             z_new = out["features"]
+#             logits_new = self.compute_seen_logits(z_new, seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
+#             ce_new = self._stable_ce_seen(logits_new, y, seen_classes, "adapter CE_new")
+
+#             # Synthetic old replay is already z-space. It must pass through the
+#             # adapter directly; otherwise CE_replay cannot train the adapter and
+#             # old-region gates never learn to close.
+#             replay = self.sample_old_replay(old_snapshot, seen_classes, new_desc=new_desc)
+#             z_old_base = replay["features"].to(self.device)  # type: ignore[index]
+#             y_old = replay["global_labels"].to(self.device).long()  # type: ignore[index]
+#             old_adapt = self._adapt_replay_features_for_adapter_training(z_old_base)
+#             z_old = old_adapt["features"]
+#             logits_old = self.compute_seen_logits(z_old, seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
+#             ce_replay = self._stable_ce_seen(logits_old, y_old, seen_classes, "adapter CE_replay")
+
+#             y_new_local = self.global_to_seen_local(y, seen_classes)
+#             y_old_local = self.global_to_seen_local(y_old, seen_classes)
+#             logits_all = torch.cat([logits_new, logits_old], dim=0)
+#             labels_all = torch.cat([y_new_local, y_old_local], dim=0)
+#             adaptive_boundary = self._adaptive_boundary_loss_from_current_bank(
+#                 logits_all,
+#                 labels_all,
+#                 old_class_count=len(old_classes),
+#                 seen_classes=seen_classes,
+#             )
+#             adapter_reg, reg_stats = self._adapter_regularization_loss(new_out=out, old_adapt=old_adapt)
+
+#             loss = (
+#                 self._inc_cfg_float("adapter_new_ce_weight", 1.00) * ce_new
+#                 + self._inc_cfg_float("lambda_replay", self._inc_cfg_float("adapter_replay_weight", 1.00)) * ce_replay
+#                 + self._inc_cfg_float("adaptive_boundary_loss_weight", 1.00) * adaptive_boundary
+#                 + self._inc_cfg_float("adapter_regularization_weight", 1.00) * adapter_reg
+#             )
+#             _finite(loss, "adapter incremental loss")
+#             loss.backward()
+#             trainable = [p for p in self.model.parameters() if p.requires_grad]
+#             if trainable:
+#                 torch.nn.utils.clip_grad_norm_(trainable, self._inc_cfg_float("grad_clip_inc", 0.5))
+#             optimizer.step()
+#             self.assert_old_geometry_unchanged(old_ref, "adapter_epoch", atol=1e-6)
+
+#             stats["adapter_loss"] += float(loss.detach().cpu().item())
+#             stats["ce_new"] += float(ce_new.detach().cpu().item())
+#             stats["ce_replay"] += float(ce_replay.detach().cpu().item())
+#             stats["adaptive_boundary"] += float(adaptive_boundary.detach().cpu().item()) if torch.is_tensor(adaptive_boundary) else 0.0
+#             stats["adapter_reg"] += float(adapter_reg.detach().cpu().item())
+#             stats["gate_old"] += reg_stats["gate_old"]
+#             stats["gate_new"] += reg_stats["gate_new"]
+#             stats["delta_old"] += reg_stats["delta_old"]
+#             stats["delta_new"] += reg_stats["delta_new"]
+#             stats["old_replay_acc"] += float((logits_old.detach().argmax(dim=1) == y_old_local).float().mean().cpu().item() * 100.0)
+#             stats["steps"] += 1.0
+#         denom = max(stats["steps"], 1.0)
+#         for k in ("adapter_loss", "ce_new", "ce_replay", "adaptive_boundary", "adapter_reg", "gate_old", "gate_new", "delta_old", "delta_new", "old_replay_acc"):
+#             stats[k] /= denom
+#         return stats
+
+
+#     # ------------------------------------------------------------------
+#     # Validation/diagnostics/checkpoint selection
+#     # ------------------------------------------------------------------
+#     @torch.no_grad()
+#     def validate_incremental_phase(self, loader, old_classes: Sequence[int], new_classes: Sequence[int], seen_classes: Sequence[int]) -> Dict[str, Any]:
+#         self.model.eval()
+#         total_loss = 0.0
+#         total = 0
+#         correct = 0
+#         per_total = {int(c): 0 for c in seen_classes}
+#         per_correct = {int(c): 0 for c in seen_classes}
+#         pred_hist = {int(c): 0 for c in seen_classes}
+#         old_logits: List[torch.Tensor] = []
+#         new_logits: List[torch.Tensor] = []
+#         invalid = 0
+#         for batch in loader:
+#             x, y, spectra, _ = self._unpack_batch(batch)
+#             x = x.float().to(self.device, non_blocking=True)
+#             y = y.long().to(self.device, non_blocking=True).view(-1)
+#             self.assert_global_labels_in_set(y, seen_classes, "cumulative validation batch")
+#             out = self.extract_incremental_features(x, spectra)
+#             logits = self.compute_seen_logits(out["features"], seen_classes, mode="geometry", old_classes=old_classes, new_classes=new_classes)["logits"]  # type: ignore[index]
+#             y_local = self.global_to_seen_local(y, seen_classes)
+#             loss = self._stable_ce(logits, y_local)
+#             pred_local = logits.argmax(dim=1)
+#             pred_global = self.seen_local_to_global(pred_local, seen_classes)
+#             total_loss += float(loss.detach().cpu().item()) * int(y.numel())
+#             total += int(y.numel())
+#             correct += int((pred_global == y).sum().item())
+#             for cls in seen_classes:
+#                 mask = y == int(cls)
+#                 n = int(mask.sum().item())
+#                 if n > 0:
+#                     per_total[int(cls)] += n
+#                     per_correct[int(cls)] += int((pred_global[mask] == int(cls)).sum().item())
+#             for cls in pred_global.detach().cpu().tolist():
+#                 if int(cls) in pred_hist:
+#                     pred_hist[int(cls)] += 1
+#                 else:
+#                     invalid += 1
+#             old_idx = [seen_classes.index(c) for c in old_classes if c in seen_classes]
+#             new_idx = [seen_classes.index(c) for c in new_classes if c in seen_classes]
+#             if old_idx:
+#                 old_logits.append(logits[:, old_idx].detach().mean(dim=1))
+#             if new_idx:
+#                 new_logits.append(logits[:, new_idx].detach().mean(dim=1))
+#         acc = 100.0 * correct / max(total, 1)
+#         old_total = sum(per_total[c] for c in old_classes if c in per_total)
+#         old_correct = sum(per_correct[c] for c in old_classes if c in per_correct)
+#         new_total = sum(per_total[c] for c in new_classes if c in per_total)
+#         new_correct = sum(per_correct[c] for c in new_classes if c in per_correct)
+#         old_acc = 100.0 * old_correct / max(old_total, 1)
+#         new_acc = 100.0 * new_correct / max(new_total, 1)
+#         hm = 0.0 if old_acc + new_acc <= 0 else 2.0 * old_acc * new_acc / (old_acc + new_acc)
+#         per_class_acc = {int(c): 100.0 * per_correct[int(c)] / max(per_total[int(c)], 1) for c in seen_classes}
+#         avg_acc = sum(per_class_acc.values()) / max(len(per_class_acc), 1)
+#         old_mean = float(torch.cat(old_logits).mean().cpu().item()) if old_logits else 0.0
+#         new_mean = float(torch.cat(new_logits).mean().cpu().item()) if new_logits else 0.0
+#         return {
+#             "loss": total_loss / max(total, 1),
+#             "acc": acc,
+#             "old_acc": old_acc,
+#             "new_acc": new_acc,
+#             "hm": hm,
+#             "aa": avg_acc,
+#             "per_class_accuracy": per_class_acc,
+#             "prediction_histogram": pred_hist,
+#             "invalid_prediction_rate": float(invalid) / float(max(total, 1)),
+#             "old_logit_mean": old_mean,
+#             "new_logit_mean": new_mean,
+#             "old_new_logit_gap": old_mean - new_mean,
+#         }
+
+#     def _compute_old_new_overlap_stats(self, old_snapshot: Dict[str, torch.Tensor], new_desc: Dict[str, torch.Tensor]) -> Dict[str, float]:
+#         risk = self._risk_matrix_from_descriptors(old_snapshot, new_desc)
+#         return {
+#             "old_new_risk_max": float(risk["risk"].max().detach().cpu().item()) if risk["risk"].numel() else 0.0,
+#             "old_new_risk_mean": float(risk["risk"].mean().detach().cpu().item()) if risk["risk"].numel() else 0.0,
+#             "old_new_subspace_overlap_max": float(risk["subspace"].max().detach().cpu().item()) if risk["subspace"].numel() else 0.0,
+#             "old_new_center_distance_min": float(risk["dist"].min().detach().cpu().item()) if risk["dist"].numel() else 0.0,
+#             "old_new_ellipsoid_energy_min": float(risk["energy"].min().detach().cpu().item()) if risk["energy"].numel() else 0.0,
+#         }
+
+#     def select_best_incremental_checkpoint(self, val_stats: Dict[str, Any], drift_stats: Dict[str, float], overlap_stats: Dict[str, float]) -> float:
+#         """Validation-first checkpoint score for descriptor-only NECIL.
+
+#         The previous score subtracted the raw old/new logit gap.  Geometry-energy
+#         logits in this code can be thousands of units apart, so that term drowned
+#         the actual validation harmonic mean and selected worse descriptors.
+
+#         Correct policy:
+#         - primary: old/new harmonic mean on real validation data
+#         - secondary: keep both old and new non-collapsed
+#         - small penalties: frozen-row drift and old/new geometry risk
+#         - optional normalized logit-gap penalty only after tanh scaling
+#         """
+#         hm = float(val_stats.get("hm", 0.0))
+#         acc = float(val_stats.get("acc", val_stats.get("overall_accuracy", 0.0)))
+#         old_acc = float(val_stats.get("old_acc", 0.0))
+#         new_acc = float(val_stats.get("new_acc", 0.0))
+#         balance = min(old_acc, new_acc)
+#         drift = max(float(v) for v in drift_stats.values()) if drift_stats else 0.0
+#         overlap = float(overlap_stats.get("old_new_risk_max", 0.0))
+
+#         raw_gap = abs(float(val_stats.get("old_new_logit_gap", 0.0)))
+#         gap_scale = max(self._inc_cfg_float("ckpt_logit_gap_scale", 1000.0), 1e-6)
+#         gap_penalty = math.tanh(raw_gap / gap_scale)
+
+#         return (
+#             hm
+#             + self._inc_cfg_float("ckpt_balance_weight", 0.20) * balance
+#             + self._inc_cfg_float("ckpt_acc_weight", 0.05) * acc
+#             - self._inc_cfg_float("ckpt_logit_gap_weight", 0.0) * gap_penalty
+#             - self._inc_cfg_float("ckpt_geometry_drift_weight", 50.0) * drift
+#             - self._inc_cfg_float("ckpt_overlap_weight", 2.0) * overlap
+#         )
+
+#     # Compatibility with outer Trainer.
+#     def _select_score(self, val_stats: Dict[str, Any], phase: int) -> float:
+#         return float(val_stats.get("hm", val_stats.get("acc", 0.0)))
+
+#     def _capture_state(self):
+#         return copy.deepcopy(self.model.state_dict())
+
+#     def _restore_state(self, state):
+#         if state is not None:
+#             self.model.load_state_dict(state)
+
+#     def _save_phase_artifacts(self, phase: int, history: Dict[str, Any], diagnostics: Dict[str, Any]) -> None:
+#         save_dir = str(getattr(self, "save_dir", getattr(self.args, "save_dir", "./results")))
+#         os.makedirs(save_dir, exist_ok=True)
+#         json_path = os.path.join(save_dir, f"phase_{int(phase)}_incremental_diagnostics.json")
+#         pt_path = os.path.join(save_dir, f"phase_{int(phase)}_incremental_handoff.pt")
+#         def _jsonable(v: Any):
+#             if torch.is_tensor(v):
+#                 return v.detach().cpu().tolist()
+#             if isinstance(v, dict):
+#                 return {str(k): _jsonable(val) for k, val in v.items()}
+#             if isinstance(v, (list, tuple)):
+#                 return [_jsonable(x) for x in v]
+#             if isinstance(v, (int, float, str, bool)) or v is None:
+#                 return v
+#             return str(v)
+#         with open(json_path, "w", encoding="utf-8") as f:
+#             json.dump(_jsonable({"history": history, "diagnostics": diagnostics}), f, indent=2)
+#         torch.save({"history": history, "diagnostics": diagnostics}, pt_path)
+#         print(f"[Incremental Diagnostics] saved json={json_path} | pt={pt_path}")
+
+
+#     def load_base_handoff(self, phase: int) -> Dict[str, Any]:
+#         """Load phase-0 PRL-style geometry handoff when available.
+
+#         The handoff is not required for correctness, but when present it makes
+#         the base preparation actionable: replay strength, insertion margin, and
+#         new-row transport activation are initialized from the phase-0 geometry
+#         certificate instead of guessed again inside the incremental trainer.
+#         """
+#         if int(phase) <= 0:
+#             return {}
+#         save_dir = str(getattr(self, "save_dir", getattr(self.args, "save_dir", "./results")))
+#         candidates = [
+#             os.path.join(save_dir, "phase_0_base_handoff.pt"),
+#             os.path.join(save_dir, "phase_0_base_handoff.json"),
+#         ]
+#         handoff: Dict[str, Any] = {}
+#         for path in candidates:
+#             if not os.path.exists(path):
+#                 continue
+#             try:
+#                 if path.endswith(".pt"):
+#                     obj = torch.load(path, map_location=self.device)
+#                     handoff = obj if isinstance(obj, dict) else {}
+#                 else:
+#                     with open(path, "r", encoding="utf-8") as f:
+#                         obj = json.load(f)
+#                     handoff = obj if isinstance(obj, dict) else {}
+#                 if handoff:
+#                     print(f"[BaseHandoff] loaded {path}")
+#                     break
+#             except Exception as exc:
+#                 print(f"[BaseHandoff WARN] could not load {path}: {exc}")
+#         if not handoff:
+#             return {}
+
+#         # Make certificate recommendations operational. These are runtime fields,
+#         # not permanent argparse mutations. _inc_cfg_* checks self first.
+#         margin = handoff.get("recommended_insertion_margin", None)
+#         if isinstance(margin, (int, float)) and float(margin) > 0:
+#             setattr(self, "old_new_geometry_margin", float(margin))
+
+#         replay = handoff.get("recommended_replay_per_class", None)
+#         if isinstance(replay, dict) and replay:
+#             vals = []
+#             for v in replay.values():
+#                 if isinstance(v, (int, float)):
+#                     vals.append(int(v))
+#             if vals:
+#                 setattr(self, "synthetic_replay_per_class", int(max(vals)))
+
+#         # Do not silently enable transport from the handoff.  The certificate may
+#         # recommend transport, but the CLI contract decides whether the run is
+#         # descriptor-only or a transport ablation.  Secretly setting
+#         # use_new_row_transport=True makes results non-auditable.
+#         if bool(handoff.get("transport_required", False)):
+#             setattr(self, "handoff_transport_recommended", True)
+#             if self._inc_cfg_bool("use_geometry_transport", False) or self._inc_cfg_bool("use_new_row_transport", False):
+#                 setattr(self, "use_new_row_transport", True)
+#         self._base_handoff = handoff
+#         return handoff
+
+#     # ------------------------------------------------------------------
+#     # Main epoch/phase flow
+#     # ------------------------------------------------------------------
+#     def assert_incremental_contract(self, phase: int, old_classes: Sequence[int], new_classes: Sequence[int], seen_classes: Sequence[int]) -> None:
+#         if int(phase) <= 0:
+#             raise RuntimeError("phase must be > 0 for incremental training.")
+#         if seen_classes != list(old_classes) + list(new_classes):
+#             raise RuntimeError(f"seen_classes must equal old+new order. old={old_classes}, new={new_classes}, seen={seen_classes}")
+#         self.assert_geometry_exists(old_classes, context="incremental old GeometryBank")
+#         self.freeze_old_geometry(old_classes)
+#         if hasattr(self.model, "set_incremental_mode"):
+#             self.model.set_incremental_mode(phase=int(phase), old_class_count=len(old_classes))
+#         if hasattr(self, "_set_model_phase_and_old_count"):
+#             self._set_model_phase_and_old_count(int(phase), len(old_classes))
+
+#     def train_incremental_phase(self, phase, epochs, batch_size: int = 64, lr: float = 1e-4) -> Dict[str, Any]:
+#         phase = int(phase)
+#         old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
+#         self._active_seen_classes = list(seen_classes)
+#         print(f"==== Incremental Phase {phase} | SCBGR Descriptor-Only NECIL-HSI ====")
+#         print(f"[Classes] old={old_classes} | new={new_classes} | seen={seen_classes}")
+#         self.dataset.start_phase(phase)
+#         self.assert_incremental_contract(phase, old_classes, new_classes, seen_classes)
+#         base_handoff = self.load_base_handoff(phase)
+
+#         if hasattr(self.model, "ensure_class_capacity"):
+#             self.model.ensure_class_capacity(max(seen_classes) + 1)
+
+#         train_loader = self.dataset.get_phase_dataloader(phase, split="train", batch_size=batch_size, shuffle=True)
+#         val_loader = self.dataset.get_cumulative_dataloader(phase, split="val", batch_size=batch_size, shuffle=False)
+
+#         old_snapshot0 = self.snapshot_old_geometry(old_classes)
+#         z_new, y_new, s_new, b_new = self.collect_current_phase_features(train_loader, new_classes)
+#         raw_new_desc = self._estimate_geometry_from_features(z_new, y_new, new_classes, spectral_summary=s_new, band_summary=b_new)
+#         admitted_desc, admission_stats = self.admit_new_geometry(raw_new_desc, old_snapshot0, new_classes)
+#         self.assert_old_geometry_unchanged(old_snapshot0, "post_new_admission")
+#         self._commit_new_descriptors(admitted_desc, phase=phase)
+#         self.assert_geometry_exists(seen_classes, context="post new admission")
+#         self.assert_old_geometry_unchanged(old_snapshot0, "post_new_commit")
+
+#         trainable_params = self.configure_incremental_trainability(old_classes, new_classes)
+#         optimizer = None
+#         if trainable_params:
+#             opt_lr = self._inc_cfg_float("adapter_lr", float(lr)) if self._adapter_mode_enabled() else float(lr)
+#             opt_wd = self._inc_cfg_float("adapter_weight_decay", 0.0) if self._adapter_mode_enabled() else self._inc_cfg_float("weight_decay", 0.0)
+#             optimizer = optim.AdamW(trainable_params, lr=float(opt_lr), weight_decay=float(opt_wd))
+#             print(f"[Incremental Optimizer] lr={float(opt_lr):.3g} | weight_decay={float(opt_wd):.3g} | params={sum(p.numel() for p in trainable_params):,}")
+
+#         history: Dict[str, List[float]] = {
+#             "val_acc": [], "val_old_acc": [], "val_new_acc": [], "val_hm": [], "val_aa": [],
+#             "ce_new": [], "ce_replay": [], "desc_margin": [], "desc_loss": [], "old_replay_acc": [],
+#             "old_new_logit_gap": [], "old_new_risk_max": [], "old_new_overlap_max": [],
+#             "old_mean_drift": [], "old_basis_drift": [], "old_eigval_drift": [], "old_resvar_drift": [],
+#             "boundary_replay_count": [], "boundary_replay_fallback": [],
+#             "adapter_loss": [], "adapter_reg": [], "adaptive_boundary": [], "gate_old": [], "gate_new": [], "delta_old": [], "delta_new": [], "checkpoint_score": [],
+#         }
+#         phase_diagnostics: Dict[str, Any] = {
+#             "phase": phase,
+#             "old_classes": old_classes,
+#             "new_classes": new_classes,
+#             "seen_classes": seen_classes,
+#             "base_handoff_loaded": bool(base_handoff),
+#             "base_handoff": base_handoff,
+#             "admission": admission_stats,
+#             "trainable_parameter_names": [n for n, p in self.model.named_parameters() if p.requires_grad],
+#         }
+
+#         best_state = self._capture_state()
+#         best_score = -1e18
+#         best_desc = admitted_desc
+#         epochs = int(max(0, epochs))
+#         steps_per_epoch = self._inc_cfg_int("descriptor_refine_steps_per_epoch", self._inc_cfg_int("descriptor_refine_steps", 20))
+#         old_snapshot_phase = self.snapshot_old_geometry(old_classes)
+
+#         # Initial validation before descriptor refinement.
+#         # This is a real checkpoint candidate. In the failed run, InitVal was
+#         # consistently better than all refined states, but the old code ignored it
+#         # and was forced to pick a degraded epoch.
+#         init_val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
+#         init_drift = self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_init_validation_drift_check")
+#         init_overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, admitted_desc)
+#         init_score = self.select_best_incremental_checkpoint(init_val, init_drift, init_overlap)
+#         best_score = init_score
+#         best_state = self._capture_state()
+#         best_desc = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in admitted_desc.items()}
+#         no_improve_epochs = 0
+#         refine_patience = self._inc_cfg_int("descriptor_refine_patience", 3)
+#         min_new_drop = self._inc_cfg_float("descriptor_refine_max_new_drop", 1.0)
+#         print(
+#             f"[InitVal] Phase {phase} | ValAcc={init_val['acc']:.2f}% | Old={init_val['old_acc']:.2f}% | "
+#             f"New={init_val['new_acc']:.2f}% | HM={init_val['hm']:.2f}% | Gap={init_val['old_new_logit_gap']:.4f} | Score={init_score:.4f}"
+#         )
+
+#         for epoch in range(epochs):
+#             # Recollect features because optional adapter ablation may change scoring z.
+#             z_new, y_new, s_new, b_new = self.collect_current_phase_features(train_loader, new_classes)
+#             current_bank = self._bank_dict()
+#             ids = torch.as_tensor(new_classes, device=self.device, dtype=torch.long)
+#             current_desc = {
+#                 "class_ids": ids,
+#                 "means": current_bank["means"].index_select(0, ids).detach(),
+#                 "bases": current_bank["bases"].index_select(0, ids).detach(),
+#                 "eigvals": current_bank["eigvals"].index_select(0, ids).detach(),
+#                 "res_vars": current_bank["res_vars"].index_select(0, ids).detach(),
+#                 "active_ranks": current_bank["active_ranks"].index_select(0, ids).detach(),
+#                 "sample_counts": current_bank["sample_counts"].flatten().index_select(0, ids).detach(),
+#                 "reliability": current_bank.get("reliability", torch.ones_like(current_bank["sample_counts"].float())).flatten().index_select(0, ids).detach() if torch.is_tensor(current_bank.get("reliability", None)) else torch.ones(len(new_classes), device=self.device),
+#             }
+#             if torch.is_tensor(current_bank.get("band_importance", None)) and current_bank["band_importance"].size(0) > int(ids.max().item()):
+#                 current_desc["band_importance"] = current_bank["band_importance"].index_select(0, ids).detach()
+#             # Use the implementation name, not self.refine_new_descriptors.
+#             # Trainer/config code may store the CLI boolean flag under
+#             # self.refine_new_descriptors, which shadows any method with that
+#             # name and causes: TypeError: 'bool' object is not callable.
+#             refined = self._refine_new_descriptors_impl(
+#                 z_new=z_new,
+#                 y_new=y_new,
+#                 seen_classes=seen_classes,
+#                 old_classes=old_classes,
+#                 new_classes=new_classes,
+#                 old_snapshot=old_snapshot_phase,
+#                 init_desc=current_desc,
+#                 steps=steps_per_epoch,
+#             )
+#             desc = refined["desc"]
+#             desc_stats = refined["stats"]
+#             self._commit_new_descriptors(desc, phase=phase)
+#             self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_post_descriptor_refine")
+
+#             adapter_stats = {"adapter_loss": 0.0, "ce_new": 0.0, "ce_replay": 0.0, "old_replay_acc": 0.0}
+#             if optimizer is not None:
+#                 adapter_stats = self.train_one_adapter_epoch(train_loader, optimizer, old_snapshot=old_snapshot_phase, seen_classes=seen_classes, old_classes=old_classes, new_classes=new_classes, new_desc=desc)
+#                 self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_post_adapter")
+
+#             val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
+#             drift = self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_epoch{epoch+1}_validation_drift_check")
+#             overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, desc)
+#             score = self.select_best_incremental_checkpoint(val, drift, overlap)
+#             if score > best_score:
+#                 best_score = score
+#                 best_state = self._capture_state()
+#                 best_desc = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in desc.items()}
+#                 no_improve_epochs = 0
+#             else:
+#                 no_improve_epochs += 1
+#             replay_probe = self.sample_old_replay(old_snapshot_phase, seen_classes, new_desc=desc)
+#             replay_stats = replay_probe["stats"]  # type: ignore[index]
+#             history["val_acc"].append(float(val["acc"]))
+#             history["val_old_acc"].append(float(val["old_acc"]))
+#             history["val_new_acc"].append(float(val["new_acc"]))
+#             history["val_hm"].append(float(val["hm"]))
+#             history["val_aa"].append(float(val["aa"]))
+#             history["ce_new"].append(float(desc_stats.get("ce_new", adapter_stats.get("ce_new", 0.0))))
+#             history["ce_replay"].append(float(desc_stats.get("ce_replay", adapter_stats.get("ce_replay", 0.0))))
+#             history["desc_margin"].append(float(desc_stats.get("margin", 0.0)))
+#             history["desc_loss"].append(float(desc_stats.get("loss", 0.0)))
+#             history["old_replay_acc"].append(float(desc_stats.get("replay_acc", adapter_stats.get("old_replay_acc", 0.0))))
+#             history["old_new_logit_gap"].append(float(val["old_new_logit_gap"]))
+#             history["old_new_risk_max"].append(float(overlap["old_new_risk_max"]))
+#             history["old_new_overlap_max"].append(float(overlap["old_new_subspace_overlap_max"]))
+#             history["old_mean_drift"].append(float(drift.get("old_means_max_abs_drift", 0.0)))
+#             history["old_basis_drift"].append(float(drift.get("old_bases_max_abs_drift", 0.0)))
+#             history["old_eigval_drift"].append(float(drift.get("old_eigvals_max_abs_drift", 0.0)))
+#             history["old_resvar_drift"].append(float(drift.get("old_res_vars_max_abs_drift", 0.0)))
+#             history["boundary_replay_count"].append(float(replay_stats.get("boundary_replay_count", 0.0)))
+#             history["boundary_replay_fallback"].append(float(replay_stats.get("boundary_replay_fallback", 0.0)))
+#             history["adapter_loss"].append(float(adapter_stats.get("adapter_loss", 0.0)))
+#             history["adapter_reg"].append(float(adapter_stats.get("adapter_reg", 0.0)))
+#             history["adaptive_boundary"].append(float(adapter_stats.get("adaptive_boundary", 0.0)))
+#             history["gate_old"].append(float(adapter_stats.get("gate_old", 0.0)))
+#             history["gate_new"].append(float(adapter_stats.get("gate_new", 0.0)))
+#             history["delta_old"].append(float(adapter_stats.get("delta_old", 0.0)))
+#             history["delta_new"].append(float(adapter_stats.get("delta_new", 0.0)))
+#             history["checkpoint_score"].append(float(score))
+#             print(
+#                 f"[IncEpoch] Phase {phase} Ep {epoch+1:03d}/{epochs} | "
+#                 f"DescLoss={desc_stats.get('loss', 0.0):.4f} | CEnew={history['ce_new'][-1]:.4f} | "
+#                 f"CEold={history['ce_replay'][-1]:.4f} | ReplayAcc={history['old_replay_acc'][-1]:.2f}% | "
+#                 f"Val={val['acc']:.2f}% | Old={val['old_acc']:.2f}% | New={val['new_acc']:.2f}% | HM={val['hm']:.2f}% | "
+#                 f"Gap={val['old_new_logit_gap']:.4f} | RiskMax={overlap['old_new_risk_max']:.4f} | "
+#                 f"OverlapMax={overlap['old_new_subspace_overlap_max']:.4f} | "
+#                 f"GateOld={adapter_stats.get('gate_old', 0.0):.4f} | GateNew={adapter_stats.get('gate_new', 0.0):.4f} | "
+#                 f"ABnd={adapter_stats.get('adaptive_boundary', 0.0):.4f} | OldDrift={max(drift.values()) if drift else 0.0:.2e} | Score={score:.4f}"
+#             )
+#             if no_improve_epochs >= refine_patience or float(val.get("new_acc", 0.0)) < float(init_val.get("new_acc", 0.0)) - min_new_drop:
+#                 print(
+#                     f"[DescriptorRefine STOP] Phase {phase} stopped at epoch {epoch+1}: "
+#                     f"best_score={best_score:.4f}, current_score={score:.4f}, "
+#                     f"init_new={float(init_val.get('new_acc', 0.0)):.2f}, current_new={float(val.get('new_acc', 0.0)):.2f}. "
+#                     "Restoring best descriptor checkpoint."
+#                 )
+#                 break
+
+#         self._restore_state(best_state)
+#         self._commit_new_descriptors(best_desc, phase=phase)
+#         self.assert_old_geometry_unchanged(old_snapshot_phase, f"phase{phase}_post_best_restore")
+#         # Freeze all seen rows after the phase. New rows become old for next phase.
+#         self.freeze_old_geometry(seen_classes)
+#         if hasattr(self.dataset, "finalize_phase"):
+#             self.dataset.finalize_phase(phase)
+#         if hasattr(self, "_set_model_phase_and_old_count"):
+#             self._set_model_phase_and_old_count(phase, len(seen_classes))
+#         final_val = self.validate_incremental_phase(val_loader, old_classes, new_classes, seen_classes)
+#         final_overlap = self._compute_old_new_overlap_stats(old_snapshot_phase, best_desc)
+#         phase_diagnostics.update({
+#             "final_val": final_val,
+#             "final_overlap": final_overlap,
+#             "best_checkpoint_score": best_score,
+#             "best_descriptor_classes": [int(c) for c in best_desc["class_ids"].detach().cpu().tolist()],
+#         })
+#         history["final_val"] = final_val  # type: ignore[assignment]
+#         if hasattr(self, "save_checkpoint"):
+#             self.save_checkpoint(phase, history)
+#         self._save_phase_artifacts(phase, history, phase_diagnostics)
+#         print(
+#             f"[PhaseDone] Phase {phase} | Final Val={final_val['acc']:.2f}% | Old={final_val['old_acc']:.2f}% | "
+#             f"New={final_val['new_acc']:.2f}% | HM={final_val['hm']:.2f}% | old_geometry_frozen=True"
+#         )
+#         return history
 
 
 
