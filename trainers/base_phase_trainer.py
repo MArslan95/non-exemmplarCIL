@@ -1,5951 +1,3440 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Optional, Tuple, List
+"""Base-phase training for transport-verified HSI factor geometry.
 
+This trainer is aligned with the revised architecture:
+
+    raw ordered center spectrum -> spectral branch -> z_s
+    center-relative reduced patch -> spatial branch -> z_p
+    z = [z_s ; z_p]
+
+Persistent class memory after base handoff:
+
+    p(z | c) = N(mu_c, L_c L_c^T + Psi_c)
+
+with
+
+    Psi_c = diag(psi_c,s I_Ds, psi_c,p I_Dp).
+
+The ordered-spectrum relation p(h | c) is stored only for pair-risk margins.
+It is never a second classifier.
+
+Base protocol
+-------------
+1. Train the backbone and a temporary linear head with class-balanced CE.
+2. At the first geometry epoch, fit and freeze aggregate global priors from the
+   current full base-training representation.
+3. Fit one frozen pair-risk temperature contract from provisional full-training
+   rows, without committing any class row.
+4. Shape the representation with bidirectional support/query factor-energy
+   episodes. Support rows are detached; gradients flow through query features.
+5. Select checkpoints using current validation factor geometry, not the
+   temporary linear head.
+6. Restore the best representation, run out-of-fold geometry evaluation, fit
+   final rows once, and atomically commit the base GeometryBank.
+7. Delete the temporary linear head and freeze the accepted base backbone.
+
+No old samples, old features, teacher, spectral-conditioned classifier,
+trainable transport, feature replay, or persistent class row is used during
+base optimization.
+"""
+
+import copy
 import json
+import math
 import os
 from contextlib import nullcontext
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, Sampler
 
-from losses.loss import (
-    unified_spectral_geometry_loss,
-    base_center_overlap_diagnostics,
-    spectral_shape_discrimination_loss,
-    geometry_energy_matrix,
-)
+try:
+    from losses.loss import (
+        base_ce_warmup_objective,
+        base_training_objective,
+        pair_risk_confusion_statistics,
+        pairwise_directional_invasion_matrix,
+        risk_guided_all_rival_geometry_loss,
+    )
+except ImportError:  # Standalone validation against generated files.
+    from factor_geometry_loss_v2 import (
+        base_ce_warmup_objective,
+        base_training_objective,
+        pair_risk_confusion_statistics,
+        pairwise_directional_invasion_matrix,
+        risk_guided_all_rival_geometry_loss,
+    )
 
 
+_MISSING = object()
+_CLASSIFICATION_FACTORIZATION = "p(z|c)"
+_SPECTRAL_RELATION = "p(h|c)"
+
+
+# =============================================================================
+# Shared helpers
+# =============================================================================
+
+
+def _unique_ids(
+    values: Iterable[int],
+    *,
+    name: str = "class_ids",
+    allow_empty: bool = False,
+) -> List[int]:
+    output: List[int] = []
+    observed: set[int] = set()
+    for value in values:
+        class_id = int(value)
+        if class_id < 0:
+            raise ValueError(f"{name} contains negative class ID {class_id}")
+        if class_id in observed:
+            raise ValueError(f"{name} contains duplicate class ID {class_id}")
+        observed.add(class_id)
+        output.append(class_id)
+    if not output and not allow_empty:
+        raise ValueError(f"{name} is empty")
+    return output
+
+
+def _item_label(item: Any) -> int:
+    if isinstance(item, Mapping):
+        label = item.get(
+            "label",
+            item.get("labels", item.get("target")),
+        )
+    elif isinstance(item, (tuple, list)) and len(item) >= 2:
+        label = item[1]
+    else:
+        raise RuntimeError(
+            "balanced episodic sampling requires a map-style sample "
+            "containing one label"
+        )
+
+    tensor = torch.as_tensor(label).long().reshape(-1)
+    if tensor.numel() != 1:
+        raise RuntimeError(
+            "each dataset item must contain exactly one label"
+        )
+    return int(tensor.item())
+
+
+def _finite_float(value: Any, *, name: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise RuntimeError(f"{name} must be finite")
+    return result
+
+
+# =============================================================================
+# Balanced episodic sampler
+# =============================================================================
+
+
+class GeometryBalancedBatchSampler(Sampler[List[int]]):
+    """M-way/K-shot base sampler with balanced class-pair exposure.
+
+    The sampler is used only while training phase 0. It does not retain any
+    sample after the base phase and is not exemplar memory.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        class_ids: Sequence[int],
+        *,
+        classes_per_batch: int,
+        samples_per_class: int,
+        num_batches: Optional[int] = None,
+        seed: int = 0,
+    ) -> None:
+        if (
+            not hasattr(dataset, "__len__")
+            or not hasattr(dataset, "__getitem__")
+        ):
+            raise TypeError(
+                "GeometryBalancedBatchSampler requires a map-style dataset"
+            )
+
+        self.dataset = dataset
+        self.class_ids = _unique_ids(class_ids)
+        self.classes_per_batch = int(classes_per_batch)
+        self.samples_per_class = int(samples_per_class)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        if not 2 <= self.classes_per_batch <= len(self.class_ids):
+            raise ValueError(
+                "classes_per_batch must lie in [2, number of base classes]"
+            )
+        if (
+            self.samples_per_class < 6
+            or self.samples_per_class % 2 != 0
+        ):
+            raise ValueError(
+                "samples_per_class must be even and at least six"
+            )
+
+        self.indices_by_class: Dict[int, List[int]] = {
+            class_id: []
+            for class_id in self.class_ids
+        }
+        allowed = set(self.class_ids)
+        for index in range(len(dataset)):
+            class_id = _item_label(dataset[index])
+            if class_id in allowed:
+                self.indices_by_class[class_id].append(index)
+
+        missing = [
+            class_id
+            for class_id, indices
+            in self.indices_by_class.items()
+            if not indices
+        ]
+        if missing:
+            raise RuntimeError(
+                f"base split has no samples for classes {missing}"
+            )
+
+        insufficient = {
+            class_id: len(indices)
+            for class_id, indices
+            in self.indices_by_class.items()
+            if len(indices) < self.samples_per_class
+        }
+        if insufficient:
+            raise RuntimeError(
+                "the base split cannot provide unique within-episode samples; "
+                f"reduce geometry_samples_per_class: {insufficient}"
+            )
+
+        episode_size = (
+            self.classes_per_batch
+            * self.samples_per_class
+        )
+        sample_total = sum(
+            len(values)
+            for values in self.indices_by_class.values()
+        )
+        self.num_batches = int(
+            num_batches
+            if num_batches is not None
+            else max(
+                1,
+                math.ceil(
+                    sample_total / float(episode_size)
+                ),
+            )
+        )
+
+        self.last_pair_counts: Dict[
+            Tuple[int, int],
+            int,
+        ] = {}
+        self.last_class_counts: Dict[int, int] = {}
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    @staticmethod
+    def _subset_score(
+        subset: Sequence[int],
+        pair_counts: Mapping[
+            Tuple[int, int],
+            int,
+        ],
+        class_counts: Mapping[int, int],
+    ) -> Tuple[int, int, int, Tuple[int, ...]]:
+        pairs = [
+            tuple(sorted((
+                int(subset[left]),
+                int(subset[right]),
+            )))
+            for left in range(len(subset))
+            for right in range(left + 1, len(subset))
+        ]
+        pair_values = [
+            pair_counts.get(pair, 0)
+            for pair in pairs
+        ]
+        class_values = [
+            class_counts.get(int(class_id), 0)
+            for class_id in subset
+        ]
+        return (
+            sum(pair_values),
+            max(pair_values, default=0),
+            sum(class_values),
+            tuple(sorted(int(v) for v in subset)),
+        )
+
+    def __iter__(self) -> Iterator[List[int]]:
+        generator = torch.Generator().manual_seed(
+            self.seed + 1009 * self.epoch
+        )
+        pair_counts: Dict[
+            Tuple[int, int],
+            int,
+        ] = {}
+        class_counts = {
+            class_id: 0
+            for class_id in self.class_ids
+        }
+
+        for batch_index in range(self.num_batches):
+            if self.classes_per_batch == len(self.class_ids):
+                chosen = list(self.class_ids)
+            else:
+                candidates: List[List[int]] = []
+                offset = (
+                    batch_index
+                    * self.classes_per_batch
+                ) % len(self.class_ids)
+                candidates.append(
+                    [
+                        self.class_ids[
+                            (offset + position)
+                            % len(self.class_ids)
+                        ]
+                        for position
+                        in range(self.classes_per_batch)
+                    ]
+                )
+                for _ in range(64):
+                    order = torch.randperm(
+                        len(self.class_ids),
+                        generator=generator,
+                    )
+                    candidates.append(
+                        [
+                            self.class_ids[int(index)]
+                            for index in order[
+                                : self.classes_per_batch
+                            ]
+                        ]
+                    )
+                chosen = min(
+                    candidates,
+                    key=lambda subset: self._subset_score(
+                        subset,
+                        pair_counts,
+                        class_counts,
+                    ),
+                )
+
+            for class_id in chosen:
+                class_counts[class_id] += 1
+            for left in range(len(chosen)):
+                for right in range(left + 1, len(chosen)):
+                    pair = tuple(sorted((
+                        chosen[left],
+                        chosen[right],
+                    )))
+                    pair_counts[pair] = (
+                        pair_counts.get(pair, 0) + 1
+                    )
+
+            episode: List[int] = []
+            for class_id in chosen:
+                source = self.indices_by_class[class_id]
+                order = torch.randperm(
+                    len(source),
+                    generator=generator,
+                )[: self.samples_per_class]
+                selected = [
+                    source[int(index)]
+                    for index in order
+                ]
+                if len(selected) != len(set(selected)):
+                    raise RuntimeError(
+                        f"duplicate sample inside class {class_id}"
+                    )
+                episode.extend(selected)
+
+            if len(episode) != len(set(episode)):
+                raise RuntimeError(
+                    "duplicate dataset index inside one episode"
+                )
+            shuffle = torch.randperm(
+                len(episode),
+                generator=generator,
+            ).tolist()
+            yield [
+                episode[index]
+                for index in shuffle
+            ]
+
+        self.last_pair_counts = pair_counts
+        self.last_class_counts = class_counts
+
+
+# =============================================================================
+# Base trainer
+# =============================================================================
 
 
 class BasePhaseTrainer:
-    # ============================================================
-    # Config helpers
-    # ============================================================
-    def _base_cfg_float(self, name: str, default: float) -> float:
-        return float(getattr(self, name, getattr(self.args, name, default)))
+    """Phase-0 trainer for factor GeometryBank preparation.
 
-    def _base_cfg_int(self, name: str, default: int) -> int:
-        return int(getattr(self, name, getattr(self.args, name, default)))
+    Expected host attributes
+    ------------------------
+    model:
+        Revised ``NECILModel``.
+    dataset:
+        Incremental dataset wrapper exposing phase dataloaders.
+    device:
+        Optional device; defaults to ``model.device``.
+    args:
+        Optional configuration namespace.
+    _unpack_hsi_batch(batch):
+        Existing trainer helper returning at least processed patch and labels.
+    """
 
-    def _base_cfg_bool(self, name: str, default: bool) -> bool:
-        v = getattr(self, name, getattr(self.args, name, default))
-        if isinstance(v, str):
-            return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-        return bool(v)
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
 
-    def _zero(self, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if isinstance(ref, torch.Tensor):
-            return ref.sum() * 0.0
-        return torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
-    def _strict_geometry_energy_kwargs(self) -> Dict[str, Any]:
-        """Return the single GeometryBank energy contract used by the stack.
-
-        The classifier, replay filter, base margin, replay statistics, and
-        incremental losses must use identical energy.  Do not inherit historical
-        defaults here: older trainer files defaulted log-determinant energy to
-        ``True`` and residual scaling to ``0.75``, which the current loss correctly
-        rejects.
-        """
-        residual_scale = self._base_cfg_float("residual_variance_scale", 1.0)
-        normalize_by_dim = self._base_cfg_bool("energy_normalize_by_dim", True)
-        use_logdet = self._base_cfg_bool("use_logdet_energy", False)
-        logdet_weight = self._base_cfg_float("logdet_energy_weight", 0.0)
-        center_logdet = self._base_cfg_bool("center_logdet_energy", False)
-        reliability_weight = self._base_cfg_float("reliability_energy_weight", 0.0)
-        use_spectral_energy = self._base_cfg_bool("use_spectral_residual_energy", False)
-        spectral_weight = self._base_cfg_float("spectral_energy_weight", 0.0)
-
-        failures: List[str] = []
-        if abs(residual_scale - 1.0) > 1e-8:
-            failures.append(f"residual_variance_scale={residual_scale} (required 1.0)")
-        if not normalize_by_dim:
-            failures.append("energy_normalize_by_dim=false (required true)")
-        if use_logdet or abs(logdet_weight) > 1e-12 or center_logdet:
-            failures.append(
-                "log-determinant energy enabled "
-                f"(use={use_logdet}, weight={logdet_weight}, center={center_logdet})"
-            )
-        if abs(reliability_weight) > 1e-12:
-            failures.append(
-                f"reliability_energy_weight={reliability_weight} (required 0.0)"
-            )
-        if use_spectral_energy or abs(spectral_weight) > 1e-12:
-            failures.append(
-                "spectral classifier energy enabled "
-                f"(use={use_spectral_energy}, weight={spectral_weight})"
-            )
-        if failures:
-            raise RuntimeError(
-                "Base trainer energy contract disagrees with GeometryBank replay energy: "
-                + "; ".join(failures)
-            )
-
-        return {
-            "variance_floor": self._base_cfg_float("geom_var_floor", 5e-4),
-            "residual_variance_scale": 1.0,
-            "normalize_by_dim": True,
-            "invalid_class_energy": self._base_cfg_float("invalid_class_energy", 1e6),
-            "use_logdet_energy": False,
-            "logdet_energy_weight": 0.0,
-            "center_logdet_energy": False,
-            "reliability_energy_weight": 0.0,
-            "use_spectral_residual_energy": False,
-            "spectral_energy_weight": 0.0,
-        }
-
-    def _enforce_base_contract(self) -> None:
-        """Force a base-only training contract without poisoning incremental args.
-
-        The previous version mutated shared ``args`` fields such as
-        ``use_geometry_transport`` and ``eval_classifier_mode`` during base
-        training. That is a silent architecture bug: after phase 0, the
-        incremental trainer receives already-disabled transport/refinement flags.
-
-        This method now applies only runtime model restrictions for phase 0. It
-        keeps the command-line/incremental configuration intact, while ensuring
-        that the base phase trains only backbone/projection + temporary CE head
-        and builds a clean Spectral-Coupled Tangent Geometry Replay / GeometryBank handoff.
-        """
-        # Keep the method coherent: GICS/PGR/SpectralShape are internal parts of
-        # SRPGR. Do not mutate shared args here. Legacy spectral-GICS knobs are
-        # ignored by the cleaned base objective and must be controlled by the
-        # loss-call kwargs, not by rewriting the global runtime configuration.
-
-        if self._base_cfg_bool("use_mssl_loss", False) and self._base_cfg_float("mssl_weight", 0.0) > 0.0:
-            if not self._base_cfg_bool("unsafe_ablation_use_mssl_loss", False):
-                raise RuntimeError(
-                    "base trainer uses one coherent objective: CE + SRPGR. "
-                    "MSSL must be a separate ablation, not mixed into the main method."
-                )
-
-        # Runtime-only base restrictions. Do not mutate shared args here.
-        for name, value in (
-            ("use_incremental_adapter", False),
-            ("use_bicyc_geometry_cycle", False),
-            ("use_geometry_calibrator", False),
-            ("use_sglat_transport", False),
-            ("use_geometry_transport", False),
-            ("allow_old_model_transport", False),
-        ):
-            if hasattr(self.model, name):
-                setattr(self.model, name, value)
-
-        # Base representation learning uses CE + GICS + PGR (+ optional physical
-        # spectral-shape loss inside losses.loss).  The classifier/certificate
-        # must judge feature GeometryBank quality only; no spectral scoring
-        # branch is allowed in the main classifier path.
-        for attr in (
-            "default_base_classifier_mode",
-            "default_incremental_classifier_mode",
-            "default_eval_classifier_mode",
-        ):
-            if hasattr(self.model, attr):
-                setattr(self.model, attr, "geometry_only")
-
-        # Freeze adapters/calibrators for base without destroying the user's
-        # incremental configuration.  The snapshot/restore guard below restores
-        # runtime flags after phase 0.
-        if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-            self.model.freeze_geometry_plastic_adapter()
-        elif hasattr(self.model, "disable_incremental_adapter"):
-            self.model.disable_incremental_adapter()
-        if hasattr(self.model, "freeze_geometry_calibrator"):
-            self.model.freeze_geometry_calibrator()
-        if hasattr(self.model, "freeze_energy_calibrator"):
-            self.model.freeze_energy_calibrator()
-
-        self._assert_mandatory_base_objective_config()
-
-
-    def _assert_mandatory_base_objective_config(self) -> None:
-        """Base phase has no optional architecture components.
-
-        Phase 0 must always optimize the same canonical objective:
-            balanced CE + GICS + PGR(compact, center, subspace, band, volume)
-            + physical spectral-shape reserve when raw wavelength spectra exist.
-
-        Spectral-shape derivatives cannot be forced when only PCA/reduced
-        components are available. In that case the mandatory HSI reserve is the
-        band-summary term. All other base terms are hard-required.
-        """
-        required_positive = {
-            "base_ce_weight": self._base_cfg_float("base_ce_weight", 1.0),
-            "base_srpgr_weight": self._base_cfg_float("base_srpgr_weight", 1.0),
-            "base_gics_weight": self._base_cfg_float("base_gics_weight", 0.20),
-            "base_energy_margin_weight": self._base_cfg_float("base_energy_margin_weight", 0.15),
-            "base_energy_margin": self._base_cfg_float("base_energy_margin", 0.25),
-            "pgr_weight": self._base_cfg_float("pgr_weight", 0.10),
-            "pgr_compact_weight": self._base_cfg_float("pgr_compact_weight", 0.15),
-            "pgr_center_weight": self._base_cfg_float("pgr_center_weight", 0.20),
-            "pgr_subspace_weight": self._base_cfg_float("pgr_subspace_weight", 0.10),
-            "pgr_band_weight": self._base_cfg_float("pgr_band_weight", 0.05),
-            "pgr_volume_weight": self._base_cfg_float("pgr_volume_weight", 0.05),
-            "base_gics_temperature": self._base_cfg_float("base_gics_temperature", 0.07),
-            "pgr_center_margin": self._base_cfg_float("pgr_center_margin", 1.05),
-            "pgr_max_class_variance": self._base_cfg_float("pgr_max_class_variance", 0.75),
-            "pgr_min_class_variance": self._base_cfg_float("pgr_min_class_variance", 0.015),
-            "pgr_max_subspace_overlap": self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-        }
-        bad = [f"{k}={v}" for k, v in required_positive.items() if float(v) <= 0.0]
-        if bad:
-            raise RuntimeError(
-                "Base phase has no optional core components. Required base weights/values must be > 0: "
-                + ", ".join(bad)
-            )
-        if self._base_cfg_int("pgr_subspace_rank", 3) <= 0:
-            raise RuntimeError("pgr_subspace_rank must be > 0 because subspace reserve is mandatory.")
-        if self._base_cfg_int("pgr_min_class_samples", 3) < 2:
-            raise RuntimeError("pgr_min_class_samples must be >= 2 for compact/center reserve.")
-        if self._base_cfg_int("pgr_subspace_min_samples", 6) < 3:
-            raise RuntimeError("pgr_subspace_min_samples must be >= 3 for low-rank subspace reserve.")
-        if not self._base_cfg_bool("base_class_balance", True):
-            raise RuntimeError("base_class_balance must be true in the main base phase.")
-        if unified_spectral_geometry_loss is None:
-            raise RuntimeError("unified_spectral_geometry_loss is required for mandatory CE+GICS+PGR base training.")
-
-    def _assert_mandatory_base_batch_inputs(
+    def _cfg_any(
         self,
+        names: Sequence[str],
         *,
-        features: torch.Tensor,
-        labels_local: torch.Tensor,
-        key_features: Optional[torch.Tensor],
-        spectral_summary: Optional[torch.Tensor],
-        band_summary: Optional[torch.Tensor],
-    ) -> None:
-        """Fail fast when a required base component cannot be computed."""
-        if not torch.is_tensor(key_features) or key_features.shape != features.shape:
+        default: Any = _MISSING,
+    ) -> Any:
+        for name in names:
+            local = getattr(self, name, _MISSING)
+            if local is not _MISSING and local is not None:
+                return local
+            args = getattr(self, "args", None)
+            if args is not None and hasattr(args, name):
+                value = getattr(args, name)
+                if value is not None:
+                    return value
+        if default is _MISSING:
             raise RuntimeError(
-                "Mandatory GICS requires detached key_features with the same shape as query features. "
-                f"query={tuple(features.shape)}, key={None if key_features is None else tuple(key_features.shape)}"
+                "missing required option; expected one of "
+                f"{list(names)}"
             )
-        if bool(key_features.requires_grad):
-            raise RuntimeError("Mandatory GICS key_features must be detached; otherwise GICS becomes a second train path.")
-        if not torch.is_tensor(spectral_summary) or spectral_summary.dim() != 2 or spectral_summary.size(0) != features.size(0):
-            raise RuntimeError(
-                "Mandatory base HSI reserve requires spectral_summary [B,S] for band/PGR construction. "
-                f"got {None if spectral_summary is None else tuple(spectral_summary.shape)}"
-            )
-        if not torch.is_tensor(band_summary) or band_summary.dim() != 2 or band_summary.size(0) != features.size(0):
-            raise RuntimeError(
-                "Mandatory PGR band reserve requires band_summary [B,S]. "
-                f"got {None if band_summary is None else tuple(band_summary.shape)}"
-            )
-        if band_summary.size(1) <= 0:
-            raise RuntimeError("Mandatory PGR band reserve received zero spectral/band dimension.")
-        if not torch.isfinite(spectral_summary).all() or not torch.isfinite(band_summary).all():
-            raise RuntimeError("spectral_summary/band_summary contains NaN/Inf in mandatory base phase.")
-        if labels_local.numel() != features.size(0):
-            raise RuntimeError("labels/features batch mismatch in mandatory base objective.")
-        # A highly imbalanced loader may occasionally emit a single-class batch.
-        # Do not crash the run; pairwise terms become zero for that batch and
-        # epoch-level coverage checks still require the objective to be exercised.
+        return default
 
-    def _assert_mandatory_base_loss_parts(self, loss_out: Dict[str, Any], *, spectral_summary_is_physical: bool) -> None:
-        """Ensure the unified loss exposes every required base component."""
-        required = (
-            "total", "base_gics", "base_gics_weighted", "base_gics_anchors", "base_gics_pos",
-            "base_pgr", "base_pgr_weighted", "base_compact", "base_center", "base_subspace",
-            "base_band", "base_volume", "base_pgr_valid_class_count", "base_pgr_subspace_pair_count",
-            "base_pgr_band_pair_count", "base_pgr_volume_factor", "base_spectral_shape_active",
-            "base_pgr_subspace_max_overlap", "base_pgr_band_max_similarity",
-            "base_pgr_band_guided_conflict_mean", "base_pgr_band_guided_conflict_max",
-            "base_energy_margin", "base_energy_margin_weighted",
-            "base_energy_margin_violation", "base_energy_margin_gap",
-            "base_spectral_shape_raw", "base_spectral_shape_pair_count",
-            "base_spectral_shape_guided_conflict_mean", "base_spectral_shape_guided_conflict_max",
-        )
-        missing = [k for k in required if k not in loss_out]
-        if missing:
-            raise RuntimeError("unified_spectral_geometry_loss did not return mandatory base keys: " + ", ".join(missing))
-        for k in required:
-            v = loss_out[k]
-            if torch.is_tensor(v) and v.numel() > 0 and not torch.isfinite(v).all():
-                raise RuntimeError(f"mandatory base loss component {k} contains NaN/Inf.")
-        # Structural coverage is enforced over the whole epoch, not on every
-        # mini-batch.  This keeps the method valid for tiny and imbalanced HSI
-        # classes without silently dropping the regularizers globally.
-        if self._base_cfg_bool("base_require_physical_spectral_shape", False) and not bool(spectral_summary_is_physical):
-            raise RuntimeError(
-                "base_require_physical_spectral_shape=true but this batch is not marked physical. "
-                "Provide raw wavelength-ordered center spectra or disable this strict raw-spectrum requirement."
-            )
-
-    def _assert_mandatory_base_epoch_coverage(self, stats: Dict[str, float]) -> None:
-        """Check that required base terms were structurally active over the epoch."""
-        if not self._base_cfg_bool("strict_base_component_coverage", True):
-            return
-        failures: List[str] = []
-        if float(stats.get("gics_anchors", 0.0)) <= 0.0:
-            failures.append("GICS valid anchors were zero")
-        if float(stats.get("pgr_valid_class_count", 0.0)) <= 0.0:
-            failures.append("PGR valid class count was zero")
-        if float(stats.get("pgr_subspace_pair_count", 0.0)) <= 0.0:
-            failures.append("PGR subspace pair count was zero; subspace reserve was not exercised")
-        if float(stats.get("pgr_band_pair_count", 0.0)) <= 0.0:
-            failures.append("PGR band pair count was zero; band reserve was not exercised")
-        if float(stats.get("pgr_volume_factor", 0.0)) <= 0.0:
-            failures.append("PGR volume factor was zero; volume reserve was not exercised")
-        if self._base_cfg_bool("base_require_physical_spectral_shape", False) and float(stats.get("spectral_active", 0.0)) <= 0.0:
-            failures.append("physical spectral-shape reserve was required but never active")
-        if failures:
-            raise RuntimeError(
-                "Mandatory base objective coverage failed. This usually means the base sampler/batch composition "
-                "does not provide enough same-class and cross-class evidence. " + "; ".join(failures)
-            )
-
-    def _capture_incremental_runtime_flags(self) -> Dict[str, Any]:
-        """Snapshot args/model fields that base training must not destroy."""
-        keys = (
-            "use_sglat_transport",
-            "use_geometry_transport",
-            "allow_old_model_transport",
-            "eval_classifier_mode",
-            "incremental_classifier_mode",
-            "base_classifier_mode",
-            "use_incremental_adapter",
-            "use_bicyc_geometry_cycle",
-            "use_geometry_calibrator",
-            "use_energy_calibrator",
-            "use_geometry_gated_adapter",
-            "incremental_update_mode",
-            "base_gics_spectral_weight",
-            "base_gics_band_weight",
-            "base_gics_spectral_temperature",
-            "base_gics_band_temperature",
-        )
-        state: Dict[str, Any] = {"args": {}, "model": {}}
-        for key in keys:
-            if hasattr(self.args, key):
-                state["args"][key] = getattr(self.args, key)
-            if hasattr(self.model, key):
-                state["model"][key] = getattr(self.model, key)
-        for key in ("default_eval_classifier_mode", "default_incremental_classifier_mode", "default_base_classifier_mode"):
-            if hasattr(self.model, key):
-                state["model"][key] = getattr(self.model, key)
-        return state
-
-    def _restore_incremental_runtime_flags(self, state: Optional[Dict[str, Any]]) -> None:
-        """Restore user-requested incremental flags after base phase."""
-        if not isinstance(state, dict):
-            return
-        for key, value in state.get("args", {}).items():
-            try:
-                setattr(self.args, key, value)
-            except Exception:
-                pass
-        for key, value in state.get("model", {}).items():
-            try:
-                setattr(self.model, key, value)
-            except Exception:
-                pass
-        # NECIL-HSI incremental/replay scoring should remain feature-only unless
-        # the user explicitly configured otherwise.
-        if not hasattr(self.args, "incremental_classifier_mode") and hasattr(self.model, "default_incremental_classifier_mode"):
-            self.model.default_incremental_classifier_mode = "geometry_only"
-        if not hasattr(self.args, "eval_classifier_mode") and hasattr(self.model, "default_eval_classifier_mode"):
-            self.model.default_eval_classifier_mode = "geometry_only"
-        self._assert_runtime_state_restored(state)
-
-    def _force_base_validation_geometry_only(self) -> Dict[str, Any]:
-        """Temporarily make validation/certificate measure feature geometry.
-
-        Base CE/SRPGR can use physical spectra, but the incremental phase consumes
-        GeometryBank rows mostly through geometry-only replay/admission. A base
-        certificate based on spectral scoring can hide a dirty feature
-        geometry field. This guard makes validation honest.
-        """
-        state: Dict[str, Any] = {"args_eval": None, "model_eval": None}
-        if hasattr(self.args, "eval_classifier_mode"):
-            state["args_eval"] = getattr(self.args, "eval_classifier_mode")
-            setattr(self.args, "eval_classifier_mode", "geometry_only")
-        if hasattr(self.model, "default_eval_classifier_mode"):
-            state["model_eval"] = getattr(self.model, "default_eval_classifier_mode")
-            self.model.default_eval_classifier_mode = "geometry_only"
-        return state
-
-    def _restore_base_validation_mode(self, state: Optional[Dict[str, Any]]) -> None:
-        if not isinstance(state, dict):
-            return
-        if state.get("args_eval", None) is not None and hasattr(self.args, "eval_classifier_mode"):
-            setattr(self.args, "eval_classifier_mode", state["args_eval"])
-        if state.get("model_eval", None) is not None and hasattr(self.model, "default_eval_classifier_mode"):
-            self.model.default_eval_classifier_mode = state["model_eval"]
-
-    def _set_base_trainability(self, base_head: nn.Module) -> None:
-        """
-        Base phase should train representation + temporary CE head only.
-
-        It must not train geometry classifier/calibrator/adapters. The bank is
-        rebuilt from z after updates; it is not a trainable memory module.
-        """
-        self._enforce_base_contract()
-        blocked_prefixes = (
-            "classifier.",
-            "geometry_bank.",
-            "geometry_calibrator.",
-            "geometry_cycle_calibrator.",
-            "incremental_adapter.",
-            "geometry_plastic_adapter.",
-            "base_ce_head.",
-        )
-        blocked_keywords = ("bicyc", "transport", "calibrator")
-        for name, p in self.model.named_parameters():
-            lname = name.lower()
-            blocked = name.startswith(blocked_prefixes) or any(k in lname for k in blocked_keywords)
-            p.requires_grad = not blocked
-
-        for p in base_head.parameters():
-            p.requires_grad = True
-
-        if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-            self.model.freeze_geometry_plastic_adapter()
-        elif hasattr(self.model, "disable_incremental_adapter"):
-            self.model.disable_incremental_adapter()
-        if hasattr(self.model, "freeze_energy_calibrator"):
-            self.model.freeze_energy_calibrator()
-        if hasattr(self.model, "freeze_geometry_calibrator"):
-            self.model.freeze_geometry_calibrator()
-
-    def _base_trainable_parameters(self, base_head: nn.Module) -> list[nn.Parameter]:
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        params.extend([p for p in base_head.parameters() if p.requires_grad])
-        # deduplicate in case a future model stores the same head internally
-        unique: list[nn.Parameter] = []
-        seen = set()
-        for p in params:
-            pid = id(p)
-            if pid not in seen:
-                unique.append(p)
-                seen.add(pid)
-        if not unique:
-            raise RuntimeError("No trainable parameters found for base phase.")
-        return unique
-
-    # ============================================================
-    # Label mapping / base head
-    # ============================================================
-    def _build_base_label_map(self, phase_class_ids: Iterable[int]) -> Dict[int, int]:
-        return {int(c): i for i, c in enumerate([int(x) for x in phase_class_ids])}
-
-    def _labels_to_local(self, labels: torch.Tensor, label_map: Dict[int, int]) -> torch.Tensor:
-        labels = labels.long().view(-1)
-        local = torch.full_like(labels, -1)
-        for global_cls, local_cls in label_map.items():
-            local[labels == int(global_cls)] = int(local_cls)
-        if (local < 0).any():
-            bad = labels[local < 0].detach().cpu().unique().tolist()
-            raise RuntimeError(f"Base batch contains labels outside phase-0 classes: {bad}")
-        return local
-
-    def _extract_feature_dim(self, train_loader) -> int:
-        was_training = bool(self.model.training)
-        self.model.eval()
-        with torch.no_grad():
-            for batch in train_loader:
-                x, _, _, _ = self._unpack_hsi_batch(batch)
-                x = x.float().to(self.device, non_blocking=True)
-                out = self._call_extract_projected_features(x)
-                features = out["features"]
-                if features.dim() != 2:
-                    raise RuntimeError(f"Projected features must be [B,D], got {tuple(features.shape)}")
-                if was_training:
-                    self.model.train()
-                return int(features.size(1))
-        if was_training:
-            self.model.train()
-        raise RuntimeError("Cannot infer projected feature dimension: train_loader is empty.")
-
-    def _make_base_ce_head(self, feature_dim: int, num_base_classes: int) -> nn.Module:
-        head = nn.Linear(int(feature_dim), int(num_base_classes), bias=True).to(self.device)
-        nn.init.normal_(head.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(head.bias)
-        return head
-
-    @staticmethod
-    def _class_balanced_mean(values: torch.Tensor, labels_local: torch.Tensor) -> torch.Tensor:
-        """Average per-class means, not per-sample means.
-
-        Replay counts and HSI class frequencies must change coverage, not class
-        weight.  This exact class average is therefore used by both CE and the
-        base geometry-margin objective.
-        """
-        if values.dim() != 1 or labels_local.dim() != 1 or values.numel() != labels_local.numel():
-            raise RuntimeError(
-                f"class-balanced mean expects aligned vectors, got values={tuple(values.shape)}, "
-                f"labels={tuple(labels_local.shape)}"
-            )
-        class_means = []
-        for cls in torch.unique(labels_local, sorted=True):
-            mask = labels_local == cls
-            if bool(mask.any().item()):
-                class_means.append(values[mask].mean())
-        return torch.stack(class_means).mean() if class_means else values.sum() * 0.0
-
-    def _batch_balanced_ce(self, logits: torch.Tensor, labels_local: torch.Tensor, num_classes: int) -> torch.Tensor:
-        label_smoothing = self._base_cfg_float("label_smoothing", 0.0)
-        if not self._base_cfg_bool("base_class_balance", True):
-            return F.cross_entropy(logits, labels_local, label_smoothing=label_smoothing)
-        if logits.dim() != 2 or logits.size(1) != int(num_classes):
-            raise RuntimeError(
-                f"base CE logits must be [B,{int(num_classes)}], got {tuple(logits.shape)}"
-            )
-        per_sample = F.cross_entropy(
-            logits, labels_local, label_smoothing=label_smoothing, reduction="none"
-        )
-        return self._class_balanced_mean(per_sample, labels_local)
-
-    def _base_batch_geometry_energy_margin(
+    def _cfg_float(
         self,
-        features: torch.Tensor,
-        labels_local: torch.Tensor,
-        *,
-        num_classes: int,
-    ) -> Dict[str, torch.Tensor]:
-        """Differentiable base geometry margin in the canonical feature space.
-
-        The active loss module does not own this term.  Building it here avoids
-        silently logging a non-existent margin.  Class tangent bases and scales
-        are estimated from detached batch statistics for numerical stability;
-        gradients shape the sample positions and class centers only.
-        """
-        z0 = self._zero(features)
-        result = {
-            "base_energy_margin": z0,
-            "base_energy_margin_weighted": z0,
-            "base_energy_margin_violation": z0.detach(),
-            "base_energy_margin_gap": z0.detach(),
-            "base_energy_margin_min_gap": z0.detach(),
-            "base_energy_margin_class_count": z0.detach(),
-        }
-        if geometry_energy_matrix is None or features.dim() != 2 or features.size(0) == 0:
-            return result
-
-        present = torch.unique(labels_local, sorted=True)
-        if present.numel() < 2:
-            return result
-        D = int(features.size(1))
-        rank_cap = min(
-            max(0, self._base_cfg_int("base_energy_batch_rank", self._base_cfg_int("pgr_subspace_rank", 3))),
-            D,
+        *names: str,
+        default: Any = _MISSING,
+    ) -> float:
+        return _finite_float(
+            self._cfg_any(names, default=default),
+            name=names[0],
         )
-        variance_floor = self._base_cfg_float("geom_var_floor", 5e-4)
-        energy_threshold = self._base_cfg_float("rank_energy_threshold", 0.90)
-        eigen_ratio_threshold = self._base_cfg_float("rank_eigen_ratio_threshold", 1e-2)
-        min_rank = max(0, self._base_cfg_int("min_active_rank", 1))
 
-        means: List[torch.Tensor] = []
-        bases: List[torch.Tensor] = []
-        eigvals: List[torch.Tensor] = []
-        resvars: List[torch.Tensor] = []
-        ranks: List[int] = []
-        counts: List[float] = []
-        local_target = torch.full_like(labels_local, -1)
-
-        for bank_col, cls_t in enumerate(present):
-            mask = labels_local == cls_t
-            zc = features[mask]
-            n = int(zc.size(0))
-            mu = zc.mean(dim=0)
-            means.append(mu)
-            local_target[mask] = int(bank_col)
-            counts.append(float(n))
-
-            basis_pad = torch.zeros((D, rank_cap), device=features.device, dtype=features.dtype)
-            eig_pad = torch.full((rank_cap,), variance_floor, device=features.device, dtype=features.dtype)
-            active_rank = 0
-            with torch.no_grad():
-                centered = zc.detach() - mu.detach().unsqueeze(0)
-                if n >= 2 and rank_cap > 0 and float(centered.abs().sum().item()) > 0.0:
-                    try:
-                        _, singular, vh = torch.linalg.svd(centered, full_matrices=False)
-                        usable = min(rank_cap, max(n - 1, 0), int(vh.size(0)))
-                        if usable > 0:
-                            spectrum = singular[:usable].pow(2) / float(max(n - 1, 1))
-                            total = singular.pow(2).sum().clamp_min(1e-12)
-                            cumulative = singular[:usable].pow(2).cumsum(0) / total
-                            energy_rank = int(
-                                torch.searchsorted(
-                                    cumulative,
-                                    torch.tensor(energy_threshold, device=cumulative.device, dtype=cumulative.dtype),
-                                ).item()
-                            ) + 1
-                            ratio_rank = int((spectrum / spectrum[0].clamp_min(1e-12) >= eigen_ratio_threshold).sum().item())
-                            active_rank = min(usable, max(min_rank, min(energy_rank, max(ratio_rank, 1))))
-                            basis_pad[:, :active_rank] = vh[:active_rank].transpose(0, 1)
-                            eig_pad[:active_rank] = spectrum[:active_rank].clamp_min(variance_floor)
-                    except RuntimeError:
-                        active_rank = 0
-
-                if active_rank > 0:
-                    coeff = centered @ basis_pad[:, :active_rank]
-                    recon = coeff @ basis_pad[:, :active_rank].transpose(0, 1)
-                    residual = centered - recon
-                else:
-                    residual = centered
-                residual_var = residual.pow(2).sum(dim=1).mean() / float(max(D - active_rank, 1))
-                residual_var = residual_var.clamp_min(variance_floor)
-
-            bases.append(basis_pad)
-            eigvals.append(eig_pad)
-            resvars.append(residual_var)
-            ranks.append(active_rank)
-
-        means_t = torch.stack(means, dim=0)
-        bases_t = torch.stack(bases, dim=0).detach()
-        eig_t = torch.stack(eigvals, dim=0).detach()
-        res_t = torch.stack(resvars, dim=0).detach()
-        ranks_t = torch.as_tensor(ranks, device=features.device, dtype=torch.long)
-        counts_t = torch.as_tensor(counts, device=features.device, dtype=features.dtype)
-
-        energy = geometry_energy_matrix(
-            features=features,
-            means=means_t,
-            bases=bases_t,
-            eigvals=eig_t,
-            res_vars=res_t,
-            active_ranks=ranks_t,
-            sample_counts=counts_t,
-            reliability=None,
-            **{
-                **self._strict_geometry_energy_kwargs(),
-                "variance_floor": variance_floor,
-            },
-            return_parts=False,
-        )
-        true_e = energy.gather(1, local_target.view(-1, 1)).squeeze(1)
-        true_mask = torch.zeros_like(energy, dtype=torch.bool).scatter(1, local_target.view(-1, 1), True)
-        rival_e = energy.masked_fill(true_mask, float("inf")).min(dim=1).values
-        gap = rival_e - true_e
-        margin_value = self._base_cfg_float("base_energy_margin", 0.25)
-        per_sample_loss = F.relu(float(margin_value) - gap)
-        raw = self._class_balanced_mean(per_sample_loss, labels_local)
-        weighted = self._base_cfg_float("base_energy_margin_weight", 0.15) * raw
-        violation = self._class_balanced_mean((gap <= 0.0).to(features.dtype), labels_local)
-        mean_gap = self._class_balanced_mean(gap, labels_local)
-
-        return {
-            "base_energy_margin": raw,
-            "base_energy_margin_weighted": weighted,
-            "base_energy_margin_violation": violation.detach(),
-            "base_energy_margin_gap": mean_gap.detach(),
-            "base_energy_margin_min_gap": gap.min().detach(),
-            "base_energy_margin_class_count": torch.tensor(float(present.numel()), device=features.device, dtype=features.dtype),
-        }
-
-    # ============================================================
-    # GICS key view
-    # ============================================================
-    def _augment_gics_key_view(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Mild HSI-safe augmentation for the detached key branch.
-
-        Default is identity. Do not use aggressive band dropping; PCA/band axes
-        carry material information and corrupting them makes GICS learn nonsense.
-        """
-        if x is None or not torch.is_tensor(x) or x.numel() == 0:
-            return x
-
-        x_key = x.clone()
-        noise_std = self._base_cfg_float("base_gics_key_noise_std", 0.0)
-        scale_jitter = self._base_cfg_float("base_gics_key_scale_jitter", 0.0)
-        band_drop = self._base_cfg_float("base_gics_key_band_drop", 0.0)
-        spatial_drop = self._base_cfg_float("base_gics_key_spatial_drop", 0.0)
-
-        if noise_std > 0.0:
-            x_key = x_key + torch.randn_like(x_key) * float(noise_std)
-
-        if scale_jitter > 0.0:
-            shape = [x_key.size(0)] + [1] * (x_key.dim() - 1)
-            scale = 1.0 + float(scale_jitter) * torch.randn(shape, device=x_key.device, dtype=x_key.dtype)
-            x_key = x_key * scale
-
-        if band_drop > 0.0 and x_key.dim() >= 4 and x_key.size(1) > 1:
-            keep = (torch.rand(x_key.size(0), x_key.size(1), 1, 1, device=x_key.device) > float(band_drop)).to(x_key.dtype)
-            all_zero = keep.flatten(1).sum(dim=1) <= 0
-            if bool(all_zero.any().item()):
-                keep[all_zero, 0, 0, 0] = 1.0
-            x_key = x_key * keep
-
-        if spatial_drop > 0.0 and x_key.dim() >= 4 and x_key.size(-2) > 1 and x_key.size(-1) > 1:
-            smask = (torch.rand(x_key.size(0), 1, x_key.size(-2), x_key.size(-1), device=x_key.device) > float(spatial_drop)).to(x_key.dtype)
-            x_key = x_key * smask
-
-        return x_key
-
-    @staticmethod
-    def _band_summary_from_spectral(spectral_summary: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Fallback band signature used only when the model did not expose band_summary.
-
-        The updated NECILModel should normally provide center-pixel band_summary.
-        This fallback is intentionally conservative: signed/PCA-like vectors are
-        converted by softmax, non-negative rows are sum-normalized, and degenerate
-        rows become uniform.  It is a reliability/geometry-conflict signal, not classifier input.
-        """
-        if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-            return None
-        if spectral_summary.dim() != 2 or spectral_summary.size(1) <= 0:
-            return None
-        s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-        if bool((s < 0).any().item()):
-            return torch.softmax(s, dim=1)
-        b = s.clamp_min(0.0)
-        denom = b.sum(dim=1, keepdim=True)
-        uniform = torch.full_like(b, 1.0 / float(max(int(b.size(1)), 1)))
-        return torch.where(denom > 1e-8, b / denom.clamp_min(1e-8), uniform)
-
-
-    def _select_srpgr_band_summary(
+    def _cfg_int(
         self,
-        *,
-        spectral_summary: Optional[torch.Tensor],
-        band_summary: Optional[torch.Tensor],
-        spectral_summary_is_physical: bool,
-        x: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        """Select the band descriptor used by PGR.
-
-        In reduced-band experiments, the model input is PCA/reduced channels
-        while the dataloader may also provide raw wavelength-ordered spectra.
-        The base GeometryBank certificate checks physical band/spectral overlap,
-        so the PGR band reserve must operate on the physical spectrum whenever it
-        is available.  A 30-D PCA vector must not compete with a 200-D physical
-        descriptor.
-        """
+        *names: str,
+        default: Any = _MISSING,
+    ) -> int:
+        value = self._cfg_any(
+            names,
+            default=default,
+        )
         if (
-            torch.is_tensor(spectral_summary)
-            and spectral_summary.dim() == 2
-            and spectral_summary.numel() > 0
-            and bool(spectral_summary_is_physical)
+            isinstance(value, bool)
+            or float(value) != float(int(value))
         ):
-            return spectral_summary
-
-        # If band_summary and spectral_summary disagree in dimensionality, prefer
-        # the one that matches the physical/reliability source.  With PCA input
-        # this avoids passing a reduced component vector into a physical-band
-        # reserve by accident.
-        if (
-            torch.is_tensor(band_summary)
-            and torch.is_tensor(spectral_summary)
-            and band_summary.dim() == 2
-            and spectral_summary.dim() == 2
-            and band_summary.size(0) == spectral_summary.size(0)
-            and band_summary.size(1) != spectral_summary.size(1)
-        ):
-            pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-            uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-            input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
-            if uses_reduction and input_channels > 0 and band_summary.size(1) == input_channels:
-                return spectral_summary
-
-        if torch.is_tensor(band_summary) and band_summary.dim() == 2 and band_summary.numel() > 0:
-            return band_summary
-        return self._band_summary_from_spectral(spectral_summary)
-
-    def _base_spectral_summary_is_physical(self, explicit: Optional[bool] = None) -> bool:
-        """Whether spectral_summary is wavelength-ordered raw HSI, not PCA.
-
-        Spectral derivatives are physically meaningful only for ordered bands.
-        If the pipeline uses PCA and no raw center spectra are supplied, this
-        returns False and the spectral-shape part of SRPGR becomes a safe zero.
-        """
-        if explicit is not None:
-            return bool(explicit)
-        if hasattr(self.args, "base_spectral_summary_is_physical"):
-            return self._base_cfg_bool("base_spectral_summary_is_physical", False)
-        if hasattr(self.args, "spectral_summary_is_physical"):
-            return self._base_cfg_bool("spectral_summary_is_physical", False)
-        pca = int(getattr(self.args, "pca_components", 0) or 0)
-        allow_nonphysical = self._base_cfg_bool("allow_nonphysical_spectral_summary", False)
-        if pca > 0 and not allow_nonphysical:
-            return False
-        return self._base_cfg_bool("assume_input_spectral_order_is_physical", False)
-
-    def _normalize_external_spectra(self, spectra: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
-        """Return external spectra as [B,S] when the loader provides raw center spectra."""
-        if spectra is None or not torch.is_tensor(spectra) or spectra.numel() == 0:
-            return None
-        s = spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
-        if s.dim() == 4:
-            # [B,S,H,W] raw cube: center pixel only.
-            s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-        elif s.dim() == 3:
-            # [B,S,L] raw/reduced spectral metadata: center token only. Flattening
-            # would mix neighboring pixels into the class spectrum and poison
-            # spectral-shape regularization.
-            if s.size(0) == x.size(0) and s.size(1) > 0 and s.size(2) > 1:
-                s = s[:, :, s.size(-1) // 2]
-            elif s.size(0) == x.size(0):
-                s = s.reshape(s.size(0), -1)
-        elif s.dim() == 1:
-            s = s.view(x.size(0), -1)
-        elif s.dim() != 2:
-            s = s.flatten(1)
-        if s.size(0) != x.size(0):
-            raise RuntimeError(f"External spectral summary batch mismatch: spectra={tuple(s.shape)}, x={tuple(x.shape)}")
-        return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
+            raise RuntimeError(
+                f"{names[0]} must be an integer"
+            )
+        return int(value)
 
     @staticmethod
-    def _center_spectrum_from_input(x: torch.Tensor) -> torch.Tensor:
-        """Fallback center spectrum from model input. Usually PCA, so not physical by default."""
-        if x.dim() == 4:
-            return x[:, :, x.size(-2) // 2, x.size(-1) // 2]
-        if x.dim() == 3:
-            return x.flatten(1)
-        if x.dim() == 2:
-            return x
-        return x.flatten(1)
-
-    def _call_extract_projected_features(
-        self,
-        x: torch.Tensor,
-        *,
-        spectral_summary: Optional[torch.Tensor] = None,
-        spectral_summary_is_physical: Optional[bool] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Return canonical pre-adapter projected z for base phase.
-
-        Base GeometryBank rows must be built from the same canonical z-space used
-        by CE/GICS/PGR.  If NECILModel exposes an explicit canonical extractor,
-        prefer it so the geometry-plastic adapter can never leak into phase 0.
-        """
-        physical = self._base_spectral_summary_is_physical(spectral_summary_is_physical)
-        if hasattr(self.model, "extract_canonical_projected_features"):
-            return self.model.extract_canonical_projected_features(
-                x,
-                spectral_summary=spectral_summary,
-                spectral_summary_is_physical=physical,
-            )
-        try:
-            out = self.model.extract_projected_features(
-                x,
-                spectral_summary=spectral_summary,
-                spectral_summary_is_physical=physical,
-            )
-        except TypeError:
-            out = self.model.extract_projected_features(x)
-        # Backward compatibility with models that return both canonical and
-        # adapted features: force the canonical tensors into the public keys.
-        if isinstance(out, dict) and torch.is_tensor(out.get("canonical_projected_features", None)):
-            out = dict(out)
-            z = out["canonical_projected_features"]
-            out["features"] = z
-            out["projected_features"] = z
-        elif isinstance(out, dict) and torch.is_tensor(out.get("canonical_features", None)):
-            out = dict(out)
-            z = out["canonical_features"]
-            out["features"] = z
-            out["projected_features"] = z
-        return out
-
-    def _base_spectral_shape_regularizer(
-        self,
-        *,
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        spectral_summary: Optional[torch.Tensor],
-        spectral_summary_is_physical: bool,
-    ) -> Dict[str, torch.Tensor]:
-        """Spectral-shape component of SRPGR.
-
-        This is a safe no-op unless physical raw spectra are available and the
-        SCTGR loss file exposes spectral_shape_discrimination_loss.
-        """
-        if spectral_shape_discrimination_loss is None:
-            z = self._zero(features)
-            return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-        weight = self._base_cfg_float("base_spectral_shape_weight", 0.05)
-        if weight <= 0.0:
-            z = self._zero(features)
-            return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-        parts = spectral_shape_discrimination_loss(
-            spectral_summary=spectral_summary,
-            labels=labels,
-            features=features,
-            spectral_summary_is_physical=bool(spectral_summary_is_physical),
-            require_physical_summary=self._base_cfg_bool("spectral_require_physical_summary", True),
-            min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-            max_shape_similarity=self._base_cfg_float("base_max_spectral_shape_similarity", 0.75),
-            risk_center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-            risk_weight=self._base_cfg_float("base_spectral_shape_risk_weight", 1.0),
-            return_parts=True,
+    def _parse_bool(
+        value: Any,
+        name: str,
+    ) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }:
+                return True
+            if token in {
+                "0",
+                "false",
+                "no",
+                "n",
+                "off",
+            }:
+                return False
+        raise RuntimeError(
+            f"{name} must be an explicit boolean"
         )
-        if not isinstance(parts, dict):
-            parts = {"total": parts, "spectral_shape": parts.detach()}
-        raw_total = parts.get("total", self._zero(features))
-        parts["raw_total"] = raw_total.detach()
-        parts["total"] = float(weight) * raw_total
-        return parts
 
-    def _extract_base_views(
+    def _cfg_bool(
         self,
-        x: torch.Tensor,
-        external_spectra: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        bool,
-    ]:
-        """Return query/key views for CE + unified SRPGR.
-
-        The spectral summary is physical only when raw wavelength-ordered spectra
-        are supplied by the dataloader. If the model input is PCA, the fallback
-        center vector may still be used for band diagnostics, but not for
-        spectral-shape derivatives.
-        """
-        ext_s = self._normalize_external_spectra(external_spectra, x)
-        if ext_s is not None:
-            input_s = ext_s
-
-            # Reduced-band safety rule.  If metadata spectra have the same
-            # channel count as the model input while PCA/iPCA is active, they are
-            # reduced components, not physical wavelength-ordered spectra.
-            # Treat them as non-physical so SRPGR spectral-derivative terms are
-            # gated off and the model never mixes 30-D band weights with 200-D
-            # raw spectra.
-            pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-            uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-            input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
-            spectra_dim = int(input_s.size(1)) if torch.is_tensor(input_s) and input_s.dim() == 2 else 0
-            reduced_metadata = bool(uses_reduction and input_channels > 0 and spectra_dim == input_channels)
-
-            if reduced_metadata:
-                input_s_is_physical = False
-            else:
-                input_s_is_physical = self._base_spectral_summary_is_physical(
-                    self._base_cfg_bool("external_spectra_are_physical", True)
-                )
-        else:
-            input_s = self._center_spectrum_from_input(x)
-            input_s_is_physical = self._base_spectral_summary_is_physical(None)
-
-        out_q = self._call_extract_projected_features(
-            x,
-            spectral_summary=input_s,
-            spectral_summary_is_physical=input_s_is_physical,
+        *names: str,
+        default: Any = _MISSING,
+    ) -> bool:
+        return self._parse_bool(
+            self._cfg_any(
+                names,
+                default=default,
+            ),
+            names[0],
         )
-        z_q = out_q["features"]
-        if z_q.dim() != 2 or not torch.isfinite(z_q).all():
-            raise RuntimeError(f"Invalid projected query features: {tuple(z_q.shape)}")
-        if "projected_features" in out_q and torch.is_tensor(out_q["projected_features"]):
-            if not torch.allclose(z_q, out_q["projected_features"], atol=1e-5, rtol=1e-4):
-                raise RuntimeError(
-                    "Base feature-space mismatch: out['features'] and out['projected_features'] differ. "
-                    "SRPGR/GeometryBank must all use the same canonical projected z-space."
-                )
 
-        s_q = out_q.get("spectral_summary", None)
-        if not (torch.is_tensor(s_q) and s_q.dim() == 2 and s_q.size(0) == x.size(0)):
-            s_q = input_s
-        spectral_flag = out_q.get("spectral_summary_is_physical", input_s_is_physical)
-        if torch.is_tensor(spectral_flag):
-            spectral_is_physical = bool(spectral_flag.detach().cpu().item())
-        else:
-            spectral_is_physical = bool(spectral_flag)
-        b_q = out_q.get("band_summary", out_q.get("band_importance", None))
-        if b_q is None:
-            b_q = self._band_summary_from_spectral(s_q)
-
-        x_key = self._augment_gics_key_view(x)
-        # The key view uses the same spectral summary because physical spectral
-        # identity belongs to the center pixel/label, not to the mild feature-view
-        # augmentation. This avoids corrupting spectral-shape targets.
-        was_training = bool(self.model.training)
-        self.model.eval()
-        with torch.no_grad():
-            out_k = self._call_extract_projected_features(
-                x_key,
-                spectral_summary=input_s,
-                spectral_summary_is_physical=spectral_is_physical,
+    @property
+    def _trainer_device(self) -> torch.device:
+        return torch.device(
+            getattr(
+                self,
+                "device",
+                getattr(self.model, "device", "cpu"),
             )
-        if was_training:
-            self.model.train()
+        )
 
-        z_k = out_k["features"].detach()
-        if "projected_features" in out_k and torch.is_tensor(out_k["projected_features"]):
-            if not torch.allclose(out_k["features"], out_k["projected_features"], atol=1e-5, rtol=1e-4):
-                raise RuntimeError("SRPGR key branch is not in canonical projected z-space.")
-        s_k = out_k.get("spectral_summary", None)
-        if not (torch.is_tensor(s_k) and s_k.dim() == 2 and s_k.size(0) == x.size(0)):
-            s_k = s_q
-        b_k = out_k.get("band_summary", out_k.get("band_importance", None))
-        if b_k is None:
-            b_k = self._band_summary_from_spectral(s_k)
-        if torch.is_tensor(s_k):
-            s_k = s_k.detach()
-        if torch.is_tensor(b_k):
-            b_k = b_k.detach()
+    def _warmup_epochs(self) -> int:
+        value = self._cfg_int(
+            "base_ce_warmup_epochs",
+            "base_geometry_warmup_epochs",
+            default=10,
+        )
+        if value < 0:
+            raise RuntimeError(
+                "base_ce_warmup_epochs must be non-negative"
+            )
+        return value
 
-        if z_k.shape != z_q.shape:
-            raise RuntimeError(f"SRPGR key/query mismatch: query={tuple(z_q.shape)}, key={tuple(z_k.shape)}")
-        if not torch.isfinite(z_k).all():
-            raise RuntimeError("Projected key features contain NaN/Inf.")
-        return z_q, s_q, b_q, z_k, s_k, b_k, spectral_is_physical
+    def _target_geometry_weight(self) -> float:
+        value = self._cfg_float(
+            "base_geometry_weight",
+            default=1.0,
+        )
+        if value < 0.0:
+            raise RuntimeError(
+                "base_geometry_weight must be non-negative"
+            )
+        return value
 
-    @torch.no_grad()
-    def _rebuild_base_geometry_bank_for_validation(
+    def _geometry_weight_for_epoch(
         self,
-        phase: int,
-        phase_class_ids: Iterable[int],
-        *,
-        split: str = "train",
+        epoch: int,
+    ) -> float:
+        target = self._target_geometry_weight()
+        warmup = self._warmup_epochs()
+        ramp = self._cfg_int(
+            "base_geometry_ramp_epochs",
+            default=10,
+        )
+        if ramp < 0:
+            raise RuntimeError(
+                "base_geometry_ramp_epochs must be non-negative"
+            )
+        if epoch < warmup or target == 0.0:
+            return 0.0
+        if ramp == 0:
+            return target
+        progress = min(
+            1.0,
+            float(epoch - warmup + 1)
+            / float(ramp),
+        )
+        return target * progress
+
+    def _base_margin(self) -> float:
+        value = self._cfg_float(
+            "base_geometry_margin",
+            default=0.50,
+        )
+        if value < 0.0:
+            raise RuntimeError(
+                "base_geometry_margin must be non-negative"
+            )
+        return value
+
+    def _risk_strength(self) -> float:
+        value = self._cfg_float(
+            "base_risk_strength",
+            "risk_strength",
+            default=0.50,
+        )
+        if value < 0.0:
+            raise RuntimeError(
+                "base_risk_strength must be non-negative"
+            )
+        return value
+
+    def _geometry_temperature(self) -> float:
+        value = self._cfg_float(
+            "base_geometry_temperature",
+            default=0.50,
+        )
+        if value <= 0.0:
+            raise RuntimeError(
+                "base_geometry_temperature must be positive"
+            )
+        return value
+
+    def _maximum_margin(self) -> Optional[float]:
+        value = self._cfg_any(
+            ("base_maximum_pair_margin",),
+            default=None,
+        )
+        if value is None:
+            return None
+        result = _finite_float(
+            value,
+            name="base_maximum_pair_margin",
+        )
+        if result <= 0.0:
+            raise RuntimeError(
+                "base_maximum_pair_margin must be positive"
+            )
+        return result
+
+    def _validate_base_configuration(
+        self,
+        phase_class_ids: Sequence[int],
     ) -> None:
-        """Rebuild base GeometryBank rows from canonical z before geometry validation.
+        model = getattr(self, "model", None)
+        if model is None:
+            raise RuntimeError(
+                "BasePhaseTrainer has no model"
+            )
+        if not callable(
+            getattr(
+                model,
+                "assert_architecture_contract",
+                None,
+            )
+        ):
+            raise RuntimeError(
+                "model must expose "
+                "assert_architecture_contract()"
+            )
+        model.assert_architecture_contract()
 
-        Base validation uses the geometry-energy classifier, so the bank must be
-        synchronized with the current representation every epoch. This method
-        bypasses refresh_before_validation because base geometry validation is
-        meaningless with stale or unbuilt rows.
-        """
-        if not hasattr(self, "_build_class_memory_from_current_phase"):
-            raise AttributeError("TrainerHelper._build_class_memory_from_current_phase() is required.")
-        old_training_state = bool(self.model.training)
-        ctx = self.dataset.memory_build_context(int(phase)) if hasattr(self.dataset, "memory_build_context") else None
-        if ctx is None:
-            ctx = nullcontext()
-        with ctx:
-            for cls in [int(c) for c in phase_class_ids]:
-                self._build_class_memory_from_current_phase(cls, split=split)
-        self.model.train(old_training_state)
+        summary = model.architecture_summary()
+        if summary.get(
+            "classification_factorization"
+        ) != _CLASSIFICATION_FACTORIZATION:
+            raise RuntimeError(
+                "base trainer requires factor geometry p(z|c)"
+            )
+        if summary.get(
+            "spectral_relation_factorization"
+        ) != _SPECTRAL_RELATION:
+            raise RuntimeError(
+                "base trainer requires separate pair-risk p(h|c)"
+            )
+        if summary.get(
+            "joint_feature"
+        ) != "direct_[z_s;z_p]":
+            raise RuntimeError(
+                "joint feature must be exact [z_s;z_p]"
+            )
+        if bool(
+            summary.get(
+                "trainable_transport_network",
+                True,
+            )
+        ):
+            raise RuntimeError(
+                "base architecture contains a trainable transport"
+            )
+        if bool(
+            summary.get(
+                "uses_geometry_replay_for_training",
+                True,
+            )
+        ):
+            raise RuntimeError(
+                "geometry replay must not be a training mechanism"
+            )
 
-    @torch.no_grad()
-    def _update_base_replay_statistics(
+        if (
+            model.feature_dim
+            != model.spectral_dim + model.spatial_dim
+        ):
+            raise RuntimeError(
+                "model geometry dimensions are inconsistent"
+            )
+        if (
+            model.geometry_bank.feature_dim
+            != model.feature_dim
+        ):
+            raise RuntimeError(
+                "GeometryBank feature dimension mismatch"
+            )
+        if bool(
+            model.geometry_bank.valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "base optimization must start with no committed rows"
+            )
+        if bool(
+            model.classifier.require_bound_contract
+        ):
+            raise RuntimeError(
+                "classifier must remain unbound before base handoff"
+            )
+        if any(
+            parameter.requires_grad
+            for parameter
+            in model.geometry_bank.parameters()
+        ):
+            raise RuntimeError(
+                "GeometryBank must contain buffers only"
+            )
+        if any(
+            parameter.requires_grad
+            for parameter
+            in model.classifier.parameters()
+        ):
+            raise RuntimeError(
+                "classifier must be parameter-free"
+            )
+
+        ids = _unique_ids(
+            phase_class_ids,
+            name="phase_class_ids",
+        )
+        if len(ids) < 2:
+            raise RuntimeError(
+                "base phase requires at least two classes"
+            )
+
+        self._base_margin()
+        self._risk_strength()
+        self._geometry_temperature()
+        self._maximum_margin()
+
+        smoothing = self._cfg_float(
+            "label_smoothing",
+            default=0.0,
+        )
+        if not 0.0 <= smoothing < 1.0:
+            raise RuntimeError(
+                "label_smoothing must lie in [0,1)"
+            )
+        if (
+            self._cfg_float(
+                "grad_clip_base",
+                default=5.0,
+            )
+            <= 0.0
+        ):
+            raise RuntimeError(
+                "grad_clip_base must be positive"
+            )
+        if (
+            self._cfg_float(
+                "weight_decay",
+                default=1e-4,
+            )
+            < 0.0
+        ):
+            raise RuntimeError(
+                "weight_decay must be non-negative"
+            )
+        if not self._cfg_bool(
+            "base_class_balance",
+            default=True,
+        ):
+            raise RuntimeError(
+                "base_class_balance must be true"
+            )
+        if not self._cfg_bool(
+            "base_use_geometry_balanced_sampler",
+            default=True,
+        ):
+            raise RuntimeError(
+                "base geometry requires balanced episodes"
+            )
+
+        samples_per_class = self._cfg_int(
+            "geometry_samples_per_class",
+            default=8,
+        )
+        if (
+            samples_per_class < 6
+            or samples_per_class % 2 != 0
+        ):
+            raise RuntimeError(
+                "geometry_samples_per_class must be even "
+                "and at least six"
+            )
+
+    # ------------------------------------------------------------------
+    # Loader and batch contract
+    # ------------------------------------------------------------------
+
+    def _build_geometry_balanced_loader(
         self,
-        loader,
-        phase_class_ids: Iterable[int],
-        *,
-        allow_frozen_update: bool = False,
-    ) -> Dict[int, Dict[str, float]]:
-        """Populate aggregate true-energy and margin quantiles for replay.
-
-        GeometryBank row construction is class-local and therefore cannot know
-        rival energies.  This pass measures the complete base classifier field
-        and stores only aggregate quantiles; no old feature or spectrum is kept.
-        """
-        classes = [int(c) for c in phase_class_ids]
-        if len(classes) < 2:
-            raise RuntimeError("At least two base classes are required to compute replay margin statistics.")
-        gb = getattr(self.model, "geometry_bank", None)
-        if gb is None or not hasattr(gb, "update_energy_margin_statistics"):
-            raise AttributeError("GeometryBank.update_energy_margin_statistics() is required.")
-        bank = self._get_valid_base_bank(max(classes))
-        idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-        energies: Dict[int, List[torch.Tensor]] = {c: [] for c in classes}
-        margins: Dict[int, List[torch.Tensor]] = {c: [] for c in classes}
-        was_training = bool(self.model.training)
-        self.model.eval()
-        try:
-            for batch in loader:
-                x, y, spectra, _ = self._unpack_hsi_batch(batch)
-                x = x.float().to(self.device, non_blocking=True)
-                y = y.long().to(self.device, non_blocking=True).view(-1)
-                ext_s = self._normalize_external_spectra(spectra, x)
-                if ext_s is not None:
-                    pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-                    uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-                    reduced_metadata = bool(uses_reduction and int(ext_s.size(1)) == int(x.size(1)))
-                    physical = bool(self._base_cfg_bool("external_spectra_are_physical", True) and not reduced_metadata)
-                    input_s = ext_s
-                else:
-                    input_s = self._center_spectrum_from_input(x)
-                    physical = self._base_spectral_summary_is_physical(None)
-                out = self._call_extract_projected_features(
-                    x, spectral_summary=input_s, spectral_summary_is_physical=physical
+        source_loader: DataLoader,
+        phase_class_ids: Sequence[int],
+    ) -> DataLoader:
+        class_count = len(phase_class_ids)
+        configured_m = self._cfg_int(
+            "geometry_batch_classes",
+            default=0,
+        )
+        classes_per_batch = (
+            class_count
+            if configured_m == 0
+            else configured_m
+        )
+        samples_per_class = self._cfg_int(
+            "geometry_samples_per_class",
+            default=8,
+        )
+        sampler = GeometryBalancedBatchSampler(
+            source_loader.dataset,
+            phase_class_ids,
+            classes_per_batch=classes_per_batch,
+            samples_per_class=samples_per_class,
+            num_batches=(
+                None
+                if self._cfg_int(
+                    "base_steps_per_epoch",
+                    default=0,
                 )
-                z = self._assert_feature_space_consistency(out)
-                if hasattr(self, "_dual_geometry_energy_matrix"):
-                    energy_full = self._dual_geometry_energy_matrix(z, bank, return_parts=False)
-                else:
-                    energy_full = geometry_energy_matrix(
-                        features=z, bank=bank,
-                        **self._strict_geometry_energy_kwargs(),
-                    )
-                energy = energy_full.index_select(1, idx)
-                local = torch.full_like(y, -1)
-                for pos, cls in enumerate(classes):
-                    local[y == int(cls)] = int(pos)
-                valid = local >= 0
-                if not bool(valid.any().item()):
+                <= 0
+                else self._cfg_int(
+                    "base_steps_per_epoch",
+                    default=0,
+                )
+            ),
+            seed=self._cfg_int(
+                "seed",
+                default=0,
+            ),
+        )
+        self._episode_classes = classes_per_batch
+        self._episode_samples_per_class = (
+            samples_per_class
+        )
+
+        kwargs: Dict[str, Any] = {
+            "dataset": source_loader.dataset,
+            "batch_sampler": sampler,
+            "num_workers": int(
+                getattr(
+                    source_loader,
+                    "num_workers",
+                    0,
+                )
+            ),
+            "collate_fn": getattr(
+                source_loader,
+                "collate_fn",
+                None,
+            ),
+            "pin_memory": bool(
+                getattr(
+                    source_loader,
+                    "pin_memory",
+                    False,
+                )
+            ),
+            "worker_init_fn": getattr(
+                source_loader,
+                "worker_init_fn",
+                None,
+            ),
+        }
+        if kwargs["num_workers"] > 0:
+            kwargs["persistent_workers"] = bool(
+                getattr(
+                    source_loader,
+                    "persistent_workers",
+                    False,
+                )
+            )
+            prefetch = getattr(
+                source_loader,
+                "prefetch_factor",
+                None,
+            )
+            if prefetch is not None:
+                kwargs["prefetch_factor"] = prefetch
+
+        loader = DataLoader(**kwargs)
+        print(
+            "[Base episodes] "
+            f"classes={class_count} | "
+            f"M={classes_per_batch} | "
+            f"K={samples_per_class} | "
+            f"batch={classes_per_batch * samples_per_class} | "
+            f"steps={len(sampler)}"
+        )
+        return loader
+
+    def _assert_geometry_batch(
+        self,
+        labels_global: Tensor,
+    ) -> None:
+        unique, counts = torch.unique(
+            labels_global,
+            sorted=True,
+            return_counts=True,
+        )
+        expected_m = int(
+            getattr(
+                self,
+                "_episode_classes",
+                unique.numel(),
+            )
+        )
+        expected_k = int(
+            getattr(
+                self,
+                "_episode_samples_per_class",
+                counts.min().item(),
+            )
+        )
+        if int(unique.numel()) != expected_m:
+            raise RuntimeError(
+                f"episode has {unique.numel()} classes; "
+                f"expected {expected_m}"
+            )
+        if not bool(
+            counts.eq(expected_k).all().item()
+        ):
+            raise RuntimeError(
+                f"episode counts={counts.tolist()}, "
+                f"expected K={expected_k}"
+            )
+
+    @staticmethod
+    def _mapping_sources(
+        batch: Any,
+    ) -> List[Mapping[str, Any]]:
+        if not isinstance(batch, Mapping):
+            return []
+        sources: List[Mapping[str, Any]] = [batch]
+        for key in (
+            "hsi",
+            "inputs",
+            "spectral",
+            "metadata",
+            "raw",
+        ):
+            nested = batch.get(key)
+            if isinstance(nested, Mapping):
+                sources.append(nested)
+        return sources
+
+    def _find_raw_inputs(
+        self,
+        batch: Any,
+        processed_patch: Tensor,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        raw_patch_names = (
+            "raw_spectral_patch",
+            "raw_spectral_patches",
+            "raw_patch",
+            "raw_patches",
+            "physical_spectral_patch",
+            "physical_patch",
+            "original_spectral_patch",
+            "original_patch",
+            "hsi_raw_patch",
+        )
+        raw_center_names = (
+            "raw_center_spectrum",
+            "raw_center_spectra",
+            "center_spectrum_raw",
+            "center_spectra_raw",
+        )
+
+        raw_patch: Optional[Tensor] = None
+        raw_center: Optional[Tensor] = None
+        for source in self._mapping_sources(batch):
+            for name in raw_patch_names:
+                value = source.get(name)
+                if torch.is_tensor(value):
+                    raw_patch = value
+                    break
+            for name in raw_center_names:
+                value = source.get(name)
+                if torch.is_tensor(value):
+                    raw_center = value
+                    break
+
+        expected_patch = (
+            processed_patch.size(0),
+            int(self.model.backbone.raw_num_bands),
+            processed_patch.size(2),
+            processed_patch.size(3),
+        )
+        expected_center = (
+            processed_patch.size(0),
+            int(self.model.backbone.raw_num_bands),
+        )
+
+        if isinstance(batch, (tuple, list)):
+            for value in batch[2:]:
+                if not torch.is_tensor(value):
                     continue
-                e = energy[valid]
-                lv = local[valid]
-                yv = y[valid]
-                true = e.gather(1, lv.view(-1, 1)).squeeze(1)
-                mask = torch.zeros_like(e, dtype=torch.bool).scatter(1, lv.view(-1, 1), True)
-                gap = e.masked_fill(mask, float("inf")).min(dim=1).values - true
-                for cls in classes:
-                    m = yv == int(cls)
-                    if bool(m.any().item()):
-                        energies[cls].append(true[m].detach().cpu())
-                        margins[cls].append(gap[m].detach().cpu())
+                if (
+                    raw_patch is None
+                    and tuple(value.shape)
+                    == expected_patch
+                ):
+                    raw_patch = value
+                elif (
+                    raw_center is None
+                    and tuple(value.shape)
+                    == expected_center
+                ):
+                    raw_center = value
+
+        if raw_patch is not None and raw_center is not None:
+            # Keep the full patch when both are present; the backbone extracts
+            # the center deterministically.
+            raw_center = None
+
+        if (
+            raw_patch is None
+            and raw_center is None
+            and tuple(processed_patch.shape)
+            == expected_patch
+        ):
+            raw_patch = processed_patch
+
+        if raw_patch is None and raw_center is None:
+            raise RuntimeError(
+                "the revised backbone requires either an aligned raw physical "
+                "spectral patch or a raw ordered center spectrum"
+            )
+
+        if raw_patch is not None:
+            if tuple(raw_patch.shape) != expected_patch:
+                raise RuntimeError(
+                    "raw spectral patch shape mismatch: "
+                    f"expected {expected_patch}, "
+                    f"got {tuple(raw_patch.shape)}"
+                )
+            if not torch.isfinite(raw_patch).all():
+                raise RuntimeError(
+                    "raw spectral patch contains NaN/Inf"
+                )
+
+        if raw_center is not None:
+            if tuple(raw_center.shape) != expected_center:
+                raise RuntimeError(
+                    "raw center spectrum shape mismatch: "
+                    f"expected {expected_center}, "
+                    f"got {tuple(raw_center.shape)}"
+                )
+            if not torch.isfinite(raw_center).all():
+                raise RuntimeError(
+                    "raw center spectrum contains NaN/Inf"
+                )
+
+        return raw_patch, raw_center
+
+    def _extract_batch_payload(
+        self,
+        batch: Any,
+        *,
+        require_grad: bool,
+    ) -> Dict[str, Tensor]:
+        unpack = getattr(
+            self,
+            "_unpack_hsi_batch",
+            None,
+        )
+        if not callable(unpack):
+            raise RuntimeError(
+                "trainer must expose _unpack_hsi_batch(batch)"
+            )
+
+        unpacked = unpack(batch)
+        if not isinstance(
+            unpacked,
+            (tuple, list),
+        ) or len(unpacked) < 2:
+            raise RuntimeError(
+                "_unpack_hsi_batch must return at least "
+                "(processed_patch, labels)"
+            )
+        processed_patch = torch.as_tensor(
+            unpacked[0],
+        ).float()
+        labels = torch.as_tensor(
+            unpacked[1],
+        ).long().flatten()
+
+        raw_patch, raw_center = self._find_raw_inputs(
+            batch,
+            processed_patch,
+        )
+
+        processed_device = processed_patch.to(
+            self._trainer_device,
+            non_blocking=True,
+        )
+        labels_device = labels.to(
+            self._trainer_device,
+            non_blocking=True,
+        )
+        raw_patch_device = (
+            None
+            if raw_patch is None
+            else raw_patch.float().to(
+                self._trainer_device,
+                non_blocking=True,
+            )
+        )
+        raw_center_device = (
+            None
+            if raw_center is None
+            else raw_center.float().to(
+                self._trainer_device,
+                non_blocking=True,
+            )
+        )
+
+        context = (
+            nullcontext()
+            if require_grad
+            else torch.inference_mode()
+        )
+        with context:
+            output = self.model.forward_features(
+                processed_device,
+                raw_spectral_patch=
+                    raw_patch_device,
+                raw_center_spectrum=
+                    raw_center_device,
+                deterministic=not require_grad,
+            )
+
+        joint = output["joint_feature"]
+        spectral = output["spectral_feature"]
+        spatial = output["spatial_feature"]
+        raw_spectrum = output[
+            "raw_center_spectrum"
+        ]
+        batch_size = labels_device.numel()
+
+        if joint.shape != (
+            batch_size,
+            self.model.feature_dim,
+        ):
+            raise RuntimeError(
+                "joint feature payload is misaligned"
+            )
+        if spectral.shape != (
+            batch_size,
+            self.model.spectral_dim,
+        ):
+            raise RuntimeError(
+                "spectral feature payload is misaligned"
+            )
+        if spatial.shape != (
+            batch_size,
+            self.model.spatial_dim,
+        ):
+            raise RuntimeError(
+                "spatial feature payload is misaligned"
+            )
+        if raw_spectrum.shape != (
+            batch_size,
+            self.model.backbone.raw_num_bands,
+        ):
+            raise RuntimeError(
+                "raw center spectrum payload is misaligned"
+            )
+        if not torch.equal(
+            joint,
+            torch.cat(
+                [spectral, spatial],
+                dim=1,
+            ),
+        ):
+            raise RuntimeError(
+                "joint feature is not exact [z_s;z_p]"
+            )
+
+        return {
+            "patches": processed_device,
+            "labels": labels_device,
+            "spectral_feature": spectral,
+            "spatial_feature": spatial,
+            "joint_feature": joint,
+            "features": joint,
+            "raw_center_spectrum":
+                raw_spectrum,
+        }
+
+    @torch.no_grad()
+    def _collect_payload(
+        self,
+        loader: DataLoader,
+    ) -> Dict[str, Tensor]:
+        outputs: Dict[str, List[Tensor]] = {
+            "spectral_feature": [],
+            "spatial_feature": [],
+            "joint_feature": [],
+            "raw_center_spectrum": [],
+            "labels": [],
+        }
+
+        was_training = self.model.training
+        self.model.eval()
+        memory_context = (
+            self.dataset.memory_build_context(0)
+            if hasattr(
+                self.dataset,
+                "memory_build_context",
+            )
+            else nullcontext()
+        )
+        try:
+            with memory_context:
+                for batch in loader:
+                    payload = self._extract_batch_payload(
+                        batch,
+                        require_grad=False,
+                    )
+                    for name in outputs:
+                        outputs[name].append(
+                            payload[name].detach()
+                        )
         finally:
             self.model.train(was_training)
 
-        report: Dict[int, Dict[str, float]] = {}
-        for cls in classes:
-            if not energies[cls] or not margins[cls]:
-                raise RuntimeError(f"No energy/margin observations collected for base class {cls}.")
-            e = torch.cat(energies[cls], dim=0).to(self.device)
-            m = torch.cat(margins[cls], dim=0).to(self.device)
-            gb.update_energy_margin_statistics(
-                cls, true_energies=e, margins=m, allow_frozen_update=bool(allow_frozen_update)
+        if not outputs["labels"]:
+            raise RuntimeError(
+                "cannot collect payload from an empty loader"
             )
-            report[cls] = {
-                "n": float(e.numel()),
-                "energy_q50": float(torch.quantile(e, 0.50).item()),
-                "energy_q95": float(torch.quantile(e, 0.95).item()),
-                "margin_q05": float(torch.quantile(m, 0.05).item()),
-                "margin_q10": float(torch.quantile(m, 0.10).item()),
-                "margin_min": float(m.min().item()),
-                "violation_rate": float((m <= 0.0).float().mean().item()),
-            }
-        return report
-
-    # ============================================================
-    # Diagnostics
-    # ============================================================
-    @torch.no_grad()
-    def _base_geometry_global_metrics(self) -> Dict[str, float]:
-        """Bank-level diagnostics for checkpoint scoring.
-
-        Supports both the old bank name ``geometry_diagnostics`` and the cleaned
-        descriptor bank name ``compute_geometry_diagnostics``.
-        """
-        gb = getattr(self.model, "geometry_bank", None)
-        if gb is None:
-            return {}
-        try:
-            if hasattr(gb, "compute_geometry_diagnostics"):
-                diag = gb.compute_geometry_diagnostics()
-            elif hasattr(gb, "geometry_diagnostics"):
-                diag = gb.geometry_diagnostics()
-            else:
-                diag = {}
-        except Exception:
-            diag = {}
-        out: Dict[str, float] = {}
-        aliases = {
-            "feature_subspace_overlap": ("feature_subspace_overlap", "mean_subspace_overlap", "subspace_overlap_mean"),
-            "band_overlap": ("band_overlap", "mean_band_similarity", "band_similarity_mean"),
-            "spectral_shape_overlap": ("spectral_shape_overlap", "mean_spectral_similarity", "spectral_similarity_mean"),
-            "spectral_shape_similarity_mean": ("spectral_shape_similarity_mean", "mean_spectral_similarity", "spectral_similarity_mean"),
-            "spectral_shape_similarity_max": ("spectral_shape_similarity_max", "max_spectral_similarity", "spectral_similarity_max"),
-            "geometry_conflict_mean": ("geometry_conflict_mean", "mean_geometry_conflict", "conflict_mean"),
-            "geometry_conflict_max": ("geometry_conflict_max", "max_geometry_conflict", "conflict_max"),
-            "geometry_reserve_score": ("geometry_reserve_score", "reserve_score"),
-            "feature_rank_usage": ("feature_rank_usage", "rank_usage"),
+        result = {
+            name: torch.cat(values, dim=0)
+            for name, values in outputs.items()
         }
-        for public_key, candidates in aliases.items():
-            for key in candidates:
-                value = diag.get(key, None) if isinstance(diag, dict) else None
-                if torch.is_tensor(value) and value.numel() == 1:
-                    out[public_key] = float(value.detach().cpu().item())
-                    break
-                if isinstance(value, (int, float)):
-                    out[public_key] = float(value)
-                    break
-        return out
+        result["features"] = result["joint_feature"]
+        count = result["labels"].numel()
+        if any(
+            value.size(0) != count
+            for name, value in result.items()
+            if name not in {"labels"}
+        ):
+            raise RuntimeError(
+                "collected payload is misaligned"
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Base trainability
+    # ------------------------------------------------------------------
+
+    def _make_base_head(
+        self,
+        phase_class_ids: Sequence[int],
+    ) -> nn.Linear:
+        head = self.model.ensure_base_ce_head(
+            phase_class_ids
+        )
+        if not isinstance(head, nn.Linear):
+            raise RuntimeError(
+                "ensure_base_ce_head() must return nn.Linear"
+            )
+        if head.in_features != self.model.feature_dim:
+            raise RuntimeError(
+                "base CE head input width is not model.feature_dim"
+            )
+        return head
+
+    def _set_base_trainability(
+        self,
+        base_head: nn.Module,
+    ) -> None:
+        self.model.set_base_mode()
+        for parameter in base_head.parameters():
+            parameter.requires_grad_(True)
+
+        forbidden = [
+            name
+            for name, parameter
+            in self.model.named_parameters()
+            if parameter.requires_grad
+            and not (
+                name.startswith("backbone.")
+                or name.startswith("base_ce_head.")
+            )
+        ]
+        if forbidden:
+            raise RuntimeError(
+                "unexpected trainable base parameters: "
+                f"{forbidden[:20]}"
+            )
+
+    def _base_trainable_parameters(
+        self,
+    ) -> List[nn.Parameter]:
+        parameters: List[nn.Parameter] = []
+        observed: set[int] = set()
+        for parameter in self.model.parameters():
+            if (
+                parameter.requires_grad
+                and id(parameter) not in observed
+            ):
+                observed.add(id(parameter))
+                parameters.append(parameter)
+        if not parameters:
+            raise RuntimeError(
+                "base phase has no trainable parameters"
+            )
+        return parameters
+
+    # ------------------------------------------------------------------
+    # Cross-fitting
+    # ------------------------------------------------------------------
+
+    def _crossfit_indices(
+        self,
+        labels_global: Tensor,
+        class_order_global: Sequence[int],
+        *,
+        step: int,
+        epoch: int,
+    ) -> Tuple[Tensor, Tensor]:
+        support: List[Tensor] = []
+        query: List[Tensor] = []
+        minimum = self._cfg_int(
+            "base_min_samples_per_class_in_batch",
+            default=6,
+        )
+        for class_id in class_order_global:
+            indices = torch.nonzero(
+                labels_global.eq(int(class_id)),
+                as_tuple=False,
+            ).flatten()
+            if indices.numel() < minimum:
+                raise RuntimeError(
+                    f"class {class_id} has "
+                    f"{indices.numel()} samples; "
+                    f"expected at least {minimum}"
+                )
+
+            generator = torch.Generator().manual_seed(
+                self._cfg_int(
+                    "seed",
+                    default=0,
+                )
+                + 130363 * int(epoch)
+                + 8191 * int(step)
+                + 257 * int(class_id)
+            )
+            order = torch.randperm(
+                indices.numel(),
+                generator=generator,
+            ).to(indices.device)
+            shuffled = indices.index_select(
+                0,
+                order,
+            )
+            split = shuffled.numel() // 2
+            first = shuffled[:split]
+            second = shuffled[split:]
+            if first.numel() < 3 or second.numel() < 3:
+                raise RuntimeError(
+                    f"class {class_id} support/query folds "
+                    f"require at least three samples"
+                )
+            support.append(first)
+            query.append(second)
+
+        return (
+            torch.cat(support),
+            torch.cat(query),
+        )
+
+    @torch.no_grad()
+    def _temporary_rows_from_support(
+        self,
+        payload: Mapping[str, Tensor],
+        support_index: Tensor,
+        class_order_global: Sequence[int],
+    ) -> Dict[int, Dict[str, Tensor]]:
+        rows = self.model.build_geometry_rows(
+            class_ids=class_order_global,
+            features=payload["joint_feature"].index_select(
+                0,
+                support_index,
+            ).detach(),
+            raw_center_spectra=payload[
+                "raw_center_spectrum"
+            ].index_select(
+                0,
+                support_index,
+            ).detach(),
+            labels=payload["labels"].index_select(
+                0,
+                support_index,
+            ).detach(),
+            sample_weights=None,
+        )
+        return {
+            int(class_id): {
+                key: (
+                    value.detach()
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in row.items()
+            }
+            for class_id, row in rows.items()
+        }
+
+    def _one_way_crossfit_episode(
+        self,
+        *,
+        payload: Mapping[str, Tensor],
+        support_index: Tensor,
+        query_index: Tensor,
+        class_order_global: Sequence[int],
+        geometry_weight: float,
+    ) -> Dict[str, Tensor]:
+        rows = self._temporary_rows_from_support(
+            payload,
+            support_index,
+            class_order_global,
+        )
+        pair_risk = (
+            self.model.geometry_bank
+            .pair_risk_matrix(
+                class_order_global,
+                rows=rows,
+            )
+        )
+
+        query_features = payload[
+            "joint_feature"
+        ].index_select(0, query_index)
+        query_labels = payload["labels"].index_select(
+            0,
+            query_index,
+        )
+        scored = self.model.compute_logits_from_features(
+            query_features,
+            class_ids=class_order_global,
+            temporary_rows=rows,
+            targets=query_labels,
+            targets_are_global=True,
+            return_parts=True,
+        )
+        base_logits = self.model.base_ce_logits(
+            query_features
+        )
+
+        objective = base_training_objective(
+            base_logits,
+            query_labels,
+            class_order_global,
+            query_energy=scored["energy"],
+            query_targets_global=query_labels,
+            pair_risk=pair_risk,
+            geometry_weight=geometry_weight,
+            base_margin=self._base_margin(),
+            risk_strength=self._risk_strength(),
+            geometry_temperature=
+                self._geometry_temperature(),
+            maximum_margin=self._maximum_margin(),
+            label_smoothing=self._cfg_float(
+                "label_smoothing",
+                default=0.0,
+            ),
+            class_balanced=True,
+            return_parts=True,
+        )
+        assert isinstance(objective, Mapping)
+
+        geometry = (
+            risk_guided_all_rival_geometry_loss(
+                scored["energy"],
+                scored["class_ids"],
+                query_labels,
+                pair_risk=pair_risk,
+                base_margin=self._base_margin(),
+                risk_strength=self._risk_strength(),
+                temperature=
+                    self._geometry_temperature(),
+                maximum_margin=
+                    self._maximum_margin(),
+                class_balanced=True,
+                return_parts=True,
+            )
+        )
+        assert isinstance(geometry, Mapping)
+
+        return {
+            "total": objective["total"],
+            "ce": objective["ce"],
+            "geometry": objective["geometry"],
+            "head_accuracy":
+                objective["ce_accuracy"],
+            "geometry_accuracy":
+                geometry["accuracy"],
+            "mean_gap":
+                geometry["mean_gap"],
+            "q05_gap":
+                geometry["q05_gap"],
+            "minimum_gap":
+                geometry["minimum_gap"],
+            "classification_violation_rate":
+                geometry[
+                    "classification_violation_rate"
+                ],
+            "margin_violation_rate":
+                geometry["margin_violation_rate"],
+            "mean_nearest_pair_risk":
+                geometry[
+                    "nearest_pair_risk"
+                ].mean().detach(),
+            "mean_required_margin":
+                geometry[
+                    "nearest_required_margin"
+                ].mean().detach(),
+        }
 
     @staticmethod
-    def _scalar(value: Any, default: float = 0.0) -> float:
-        if torch.is_tensor(value):
-            if value.numel() == 0:
-                return float(default)
-            return float(value.detach().float().mean().cpu().item())
-        if isinstance(value, (int, float)):
-            return float(value)
-        return float(default)
+    def _average_episode_results(
+        first: Mapping[str, Tensor],
+        second: Mapping[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        if set(first) != set(second):
+            raise RuntimeError(
+                "bidirectional episode metrics differ"
+            )
+        return {
+            key: 0.5 * (
+                first[key] + second[key]
+            )
+            for key in first
+        }
 
-    @torch.no_grad()
-    def _build_base_geometry_certificate(
+    def _cross_fitted_episode(
         self,
-        phase_class_ids: Iterable[int],
+        payload: Mapping[str, Tensor],
         *,
-        val_stats: Optional[Dict[str, Any]] = None,
-        train_stats: Optional[Dict[str, Any]] = None,
-        head_train_acc: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Create the base-to-incremental SCTGR geometry certificate.
-
-        Important semantic fix:
-        raw band/spectral similarity is **not** a hard failure by itself.
-        In HSI, two classes can be physically similar.  The base handoff is unsafe
-        only when high physical similarity is accompanied by unsafe learned
-        feature geometry.  Therefore the hard checks are geometry-energy and
-        band/spectral-guided geometry conflict, not raw spectral similarity.
-        """
-        classes = [int(c) for c in phase_class_ids]
-        cert: Dict[str, Any] = {
-            "phase": 0,
-            "class_ids": classes,
-            "base_class_ids": classes,
-            "num_base_classes": len(classes),
-            "valid": False,
-            "errors": [],
-            "warnings": [],
-        }
-        if not classes:
-            cert["errors"].append("no base classes")
-            return cert
-
-        try:
-            self._assert_base_bank_valid(classes)
-            bank = self._get_valid_base_bank(max(classes))
-        except Exception as exc:
-            cert["errors"].append(f"bank_invalid: {exc}")
-            return cert
-
-        idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-        gb = getattr(self.model, "geometry_bank", None)
-        counts = bank.get("sample_counts")
-        ranks = bank.get("active_ranks")
-        rel = bank.get("reliability")
-        variances = bank.get("variances")
-        means = bank.get("means")
-
-        def _take(t: Optional[torch.Tensor], fill: float = 0.0) -> torch.Tensor:
-            if not torch.is_tensor(t) or t.numel() <= int(idx.max().item()):
-                return torch.full((len(classes),), float(fill), device=self.device, dtype=torch.float32)
-            return t.to(device=self.device).flatten().index_select(0, idx).float()
-
-        count_v = _take(counts, 0.0)
-        rank_v = _take(ranks, 0.0)
-        rel_v = _take(rel, 0.0)
-        spectral_rank_v = _take(bank.get("spectral_active_ranks"), 0.0)
-        coupling_rel_v = _take(bank.get("coupling_reliability"), 0.0)
-        energy_q = bank.get("energy_quantiles", None)
-        margin_q = bank.get("margin_quantiles", None)
-        if torch.is_tensor(energy_q) and energy_q.dim() == 2 and energy_q.size(0) > int(idx.max().item()):
-            energy_q_v = energy_q.to(self.device).index_select(0, idx).float()
-        else:
-            energy_q_v = torch.zeros((len(classes), 4), device=self.device)
-        if torch.is_tensor(margin_q) and margin_q.dim() == 2 and margin_q.size(0) > int(idx.max().item()):
-            margin_q_v = margin_q.to(self.device).index_select(0, idx).float()
-        else:
-            margin_q_v = torch.zeros((len(classes), 2), device=self.device)
-        if torch.is_tensor(variances) and variances.dim() == 2 and variances.size(0) > int(idx.max().item()):
-            res_v = variances.to(device=self.device).index_select(0, idx)[:, -1].float()
-            eig_v = variances.to(device=self.device).index_select(0, idx)[:, :-1].float()
-        else:
-            res_v = torch.zeros((len(classes),), device=self.device)
-            eig_v = torch.zeros((len(classes), 0), device=self.device)
-
-        center = self._pairwise_matrix_or_zeros(gb, ("pairwise_center_distance",), idx) if gb is not None else torch.zeros((len(classes), len(classes)), device=self.device)
-        sub = self._pairwise_matrix_or_zeros(gb, ("pairwise_subspace_overlap",), idx) if gb is not None else torch.zeros_like(center)
-        band = self._pairwise_matrix_or_zeros(gb, ("pairwise_band_similarity",), idx) if gb is not None else torch.zeros_like(center)
-        spec = self._pairwise_matrix_or_zeros(gb, ("pairwise_spectral_similarity", "pairwise_spectral_shape_similarity"), idx) if gb is not None else torch.zeros_like(center)
-        conflict = self._pairwise_matrix_or_zeros(gb, ("geometry_conflict_matrix",), idx) if gb is not None else torch.zeros_like(center)
-
-        eye = torch.eye(len(classes), device=self.device, dtype=torch.bool)
-
-        def _pair_mean_max(mat: torch.Tensor) -> Tuple[float, float, int]:
-            if mat.numel() == 0 or mat.size(0) < 2:
-                return 0.0, 0.0, 0
-            pair = mat[~eye]
-            pair = pair[torch.isfinite(pair)]
-            if pair.numel() == 0:
-                return 0.0, 0.0, 0
-            return float(pair.mean().cpu().item()), float(pair.max().cpu().item()), int(pair.numel())
-
-        center_mean, center_min = 0.0, 0.0
-        if center.numel() > 0 and center.size(0) >= 2:
-            pair_center = center[~eye]
-            if pair_center.numel() > 0:
-                center_mean = float(pair_center.mean().cpu().item())
-                center_min = float(pair_center.min().cpu().item())
-
-        sub_mean, sub_max, pair_count = _pair_mean_max(sub)
-        band_mean, band_max, _ = _pair_mean_max(band)
-        spec_mean, spec_max, spec_pair_count = _pair_mean_max(spec)
-        conflict_mean, conflict_max, _ = _pair_mean_max(conflict)
-        geom = self._base_geometry_global_metrics()
-
-        # Thresholds.
-        thr = {
-            "min_geom_acc": self._base_cfg_float("base_cert_min_geom_acc", 95.0),
-            "min_reliability": self._base_cfg_float("base_cert_min_reliability", 0.15),
-            "min_mean_reliability": self._base_cfg_float("base_cert_min_mean_reliability", 0.35),
-
-            # Strict subspace overlap is diagnostic only.  The handoff fails only
-            # when overlap exceeds the warning cap or when energy/guided conflict fails.
-            "max_subspace_overlap": self._base_cfg_float("base_cert_max_subspace_overlap", 0.55),
-            "subspace_warn_overlap": self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72),
-
-            "max_geometry_conflict": self._base_cfg_float("base_cert_max_geometry_conflict", 1.35),
-            "max_band_similarity": self._base_cfg_float("base_cert_max_band_similarity", 0.90),
-            "max_spectral_shape_similarity": self._base_cfg_float("base_cert_max_spectral_shape_similarity", 0.85),
-            "max_guided_geometry_conflict": self._base_cfg_float("base_cert_max_guided_geometry_conflict", 0.18),
-        }
-
-        def _guided_conflict(raw_sim: torch.Tensor, raw_thr: float) -> torch.Tensor:
-            """Hard physical-pair × unsafe learned-geometry pressure."""
-            if raw_sim.numel() == 0:
-                return torch.zeros_like(raw_sim)
-            raw_den = max(1.0 - float(raw_thr), 1e-6)
-            hard_pair = F.relu(raw_sim.float() - float(raw_thr)) / raw_den
-
-            sub_den = max(1.0 - float(thr["subspace_warn_overlap"]), 1e-6)
-            sub_pressure = F.relu(sub.float() - float(thr["subspace_warn_overlap"])) / sub_den
-
-            conf_den = max(float(thr["max_geometry_conflict"]), 1e-6)
-            conflict_pressure = F.relu(conflict.float() - float(thr["max_geometry_conflict"])) / conf_den
-
-            feature_pressure = torch.maximum(sub_pressure, conflict_pressure).clamp_min(0.0)
-            guided = (hard_pair * feature_pressure).masked_fill(eye, 0.0)
-            return torch.nan_to_num(guided, nan=0.0, posinf=1e3, neginf=0.0)
-
-        band_guided = _guided_conflict(band, thr["max_band_similarity"])
-        spec_guided = _guided_conflict(spec, thr["max_spectral_shape_similarity"])
-        band_guided_mean, band_guided_max, _ = _pair_mean_max(band_guided)
-        spec_guided_mean, spec_guided_max, _ = _pair_mean_max(spec_guided)
-
-        cert.update({
-            "feature_dim": int(means.size(1)) if torch.is_tensor(means) and means.dim() == 2 else int(getattr(self.model, "d_model", 0)),
-            "geom_val_acc": float((val_stats or {}).get("acc", 0.0)),
-            "geom_val_loss": float((val_stats or {}).get("loss", 0.0)),
-            "geom_train_acc": float((train_stats or {}).get("acc", 0.0)),
-            "head_train_acc": float(head_train_acc) if head_train_acc is not None else 0.0,
-            "valid_geometry_rows": classes,
-            "valid_row_count": int((count_v > 0).sum().detach().cpu().item()),
-            "sample_counts": {int(c): float(count_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "reliability": {int(c): float(rel_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "active_rank": {int(c): int(rank_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "residual_variance": {int(c): float(res_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "eigenvalue_mean": {int(c): float(eig_v[i].mean().detach().cpu().item()) if eig_v.numel() else 0.0 for i, c in enumerate(classes)},
-            "min_sample_count": float(count_v.min().detach().cpu().item()) if count_v.numel() else 0.0,
-            "mean_sample_count": float(count_v.mean().detach().cpu().item()) if count_v.numel() else 0.0,
-            "min_reliability": float(rel_v.min().detach().cpu().item()) if rel_v.numel() else 0.0,
-            "mean_reliability": float(rel_v.mean().detach().cpu().item()) if rel_v.numel() else 0.0,
-            "spectral_active_rank": {int(c): int(spectral_rank_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "coupling_reliability": {int(c): float(coupling_rel_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-            "min_coupling_reliability": float(coupling_rel_v.min().detach().cpu().item()) if coupling_rel_v.numel() else 0.0,
-            "mean_coupling_reliability": float(coupling_rel_v.mean().detach().cpu().item()) if coupling_rel_v.numel() else 0.0,
-            "energy_quantiles": {int(c): energy_q_v[i].detach().cpu().tolist() for i, c in enumerate(classes)},
-            "margin_quantiles": {int(c): margin_q_v[i].detach().cpu().tolist() for i, c in enumerate(classes)},
-            "mean_active_rank": float(rank_v.mean().detach().cpu().item()) if rank_v.numel() else 0.0,
-            "max_active_rank": float(rank_v.max().detach().cpu().item()) if rank_v.numel() else 0.0,
-            "mean_res_var": float(res_v.mean().detach().cpu().item()) if res_v.numel() else 0.0,
-            "max_res_var": float(res_v.max().detach().cpu().item()) if res_v.numel() else 0.0,
-            "pair_count": pair_count,
-            "mean_center_distance": center_mean,
-            "min_center_distance": center_min,
-            "mean_subspace_overlap": sub_mean,
-            "max_subspace_overlap": sub_max,
-            "mean_band_similarity": band_mean,
-            "max_band_similarity": band_max,
-            "mean_spectral_shape_similarity": spec_mean,
-            "max_spectral_shape_similarity": spec_max,
-            "spectral_shape_pair_count": spec_pair_count,
-            "mean_geometry_conflict": conflict_mean,
-            "max_geometry_conflict": conflict_max,
-            "mean_band_guided_geometry_conflict": band_guided_mean,
-            "max_band_guided_geometry_conflict": band_guided_max,
-            "mean_spectral_guided_geometry_conflict": spec_guided_mean,
-            "max_spectral_guided_geometry_conflict": spec_guided_max,
-            "geometry_reserve_score": float(geom.get("geometry_reserve_score", max(0.0, 1.0 - conflict_max - max(band_guided_max, spec_guided_max)))),
-            "feature_rank_usage": float(geom.get("feature_rank_usage", 0.0)),
-            "center_distance_matrix": center.detach().cpu().tolist(),
-            "subspace_overlap_matrix": sub.detach().cpu().tolist(),
-            "band_similarity_matrix": band.detach().cpu().tolist(),
-            "spectral_similarity_matrix": spec.detach().cpu().tolist(),
-            "geometry_conflict_matrix": conflict.detach().cpu().tolist(),
-            "band_guided_geometry_conflict_matrix": band_guided.detach().cpu().tolist(),
-            "spectral_guided_geometry_conflict_matrix": spec_guided.detach().cpu().tolist(),
-            "thresholds": thr,
-        })
-
-        # Warnings: raw physical similarity and strict subspace overlap are
-        # informative hard-pair diagnostics, not automatic failures.
-        if sub_max > thr["max_subspace_overlap"]:
-            cert["warnings"].append("strict_subspace_overlap_high_but_energy_guided_gate_used")
-        if band_max > thr["max_band_similarity"]:
-            cert["warnings"].append("raw_band_similarity_high_used_as_hard_pair_weight")
-        if spec_pair_count > 0 and spec_max > thr["max_spectral_shape_similarity"]:
-            cert["warnings"].append("raw_spectral_shape_similarity_high_used_as_hard_pair_weight")
-
-        self._compute_pair_risks(cert, center, sub, conflict, band, spec)
-        self._add_handoff_recommendations(cert)
-
-        guided_max = max(
-            float(cert.get("max_band_guided_geometry_conflict", 0.0)),
-            float(cert.get("max_spectral_guided_geometry_conflict", 0.0)),
+        step: int,
+        epoch: int,
+        geometry_weight: float,
+    ) -> Dict[str, Tensor]:
+        class_order_global = [
+            int(value)
+            for value in torch.unique(
+                payload["labels"],
+                sorted=True,
+            ).detach().cpu().tolist()
+        ]
+        support, query = self._crossfit_indices(
+            payload["labels"],
+            class_order_global,
+            step=step,
+            epoch=epoch,
         )
-        # Geometry conflict is a bank-level risk score, not an energy accuracy.
-        # The strict threshold is kept as the preferred operating point, but a
-        # small soft band is allowed when the actual guided-geometry conflict is
-        # clean and the base geometry classifier is already highly accurate.
-        # This prevents meaningless FAILs such as 1.353 vs 1.350 while still
-        # rejecting truly unsafe geometry.
-        conflict_soft_cap = self._base_cfg_float(
-            "base_cert_max_geometry_conflict_soft",
-            max(float(thr["max_geometry_conflict"]) + 0.05, float(thr["max_geometry_conflict"]) * 1.05),
+        first = self._one_way_crossfit_episode(
+            payload=payload,
+            support_index=support,
+            query_index=query,
+            class_order_global=
+                class_order_global,
+            geometry_weight=geometry_weight,
         )
-        energy_geometry_preferred_ok = cert["max_geometry_conflict"] <= thr["max_geometry_conflict"]
-        energy_geometry_soft_ok = (
-            cert["max_geometry_conflict"] <= conflict_soft_cap
-            and guided_max <= thr["max_guided_geometry_conflict"]
-            and cert["geom_val_acc"] >= thr["min_geom_acc"]
+        second = self._one_way_crossfit_episode(
+            payload=payload,
+            support_index=query,
+            query_index=support,
+            class_order_global=
+                class_order_global,
+            geometry_weight=geometry_weight,
         )
-        if (not energy_geometry_preferred_ok) and energy_geometry_soft_ok:
-            cert["warnings"].append(
-                "geometry_conflict_slightly_above_strict_threshold_but_guided_energy_safe"
-            )
-        cert["max_guided_geometry_conflict"] = guided_max
-        cert["energy_geometry_preferred_ok"] = bool(energy_geometry_preferred_ok)
-        cert["energy_geometry_soft_ok"] = bool(energy_geometry_soft_ok)
+        return self._average_episode_results(
+            first,
+            second,
+        )
 
-        require_coupling = self._base_cfg_bool(
-            "base_require_spectral_coupling",
-            self._base_cfg_bool("use_spectral_coupled_replay", True),
+    def _ce_only_episode(
+        self,
+        payload: Mapping[str, Tensor],
+        phase_class_ids: Sequence[int],
+    ) -> Dict[str, Tensor]:
+        logits = self.model.base_ce_logits(
+            payload["joint_feature"]
         )
-        coupling_ready = bool(
-            (spectral_rank_v > 0).all().item()
-            and torch.isfinite(coupling_rel_v).all().item()
-            and (coupling_rel_v >= self._base_cfg_float("coupling_min_reliability", 0.20)).all().item()
-        )
-        replay_stats_ready = bool(
-            torch.isfinite(energy_q_v).all().item()
-            and torch.isfinite(margin_q_v).all().item()
-            and (energy_q_v[:, 1:] >= energy_q_v[:, :-1] - 1e-7).all().item()
-            and (margin_q_v[:, 1] >= margin_q_v[:, 0] - 1e-7).all().item()
-            and (energy_q_v.abs().sum(dim=1) > 1e-8).all().item()
-        )
-        hard_checks = {
-            "all_base_rows_valid": cert["valid_row_count"] == len(classes),
-            "sample_counts_positive": cert["min_sample_count"] > 0.0,
-            "spectral_coupling_ready": coupling_ready if require_coupling else True,
-            "replay_quantiles_ready": replay_stats_ready,
-        }
-        diagnostic_checks = {
-            "geom_acc_ok": cert["geom_val_acc"] >= thr["min_geom_acc"],
-            "min_reliability_ok": cert["min_reliability"] >= thr["min_reliability"],
-            "mean_reliability_ok": cert["mean_reliability"] >= thr["min_mean_reliability"],
-            "energy_geometry_ok": bool(energy_geometry_preferred_ok or energy_geometry_soft_ok),
-            "subspace_warning_gate_ok": cert["max_subspace_overlap"] <= thr["subspace_warn_overlap"],
-            "band_guided_geometry_ok": cert["max_band_guided_geometry_conflict"] <= thr["max_guided_geometry_conflict"],
-            "spectral_guided_geometry_ok": (
-                int(cert.get("spectral_shape_pair_count", 0)) == 0
-                or cert["max_spectral_guided_geometry_conflict"] <= thr["max_guided_geometry_conflict"]
+        ce = base_ce_warmup_objective(
+            logits,
+            payload["labels"],
+            phase_class_ids,
+            label_smoothing=self._cfg_float(
+                "label_smoothing",
+                default=0.0,
             ),
+            class_balanced=True,
+            return_parts=True,
+        )
+        assert isinstance(ce, Mapping)
+        zero = ce["total"] * 0.0
+        return {
+            "total": ce["total"],
+            "ce": ce["total"],
+            "geometry": zero,
+            "head_accuracy": ce["accuracy"],
+            "geometry_accuracy": zero.detach(),
+            "mean_gap": zero.detach(),
+            "q05_gap": zero.detach(),
+            "minimum_gap": zero.detach(),
+            "classification_violation_rate":
+                zero.detach(),
+            "margin_violation_rate":
+                zero.detach(),
+            "mean_nearest_pair_risk":
+                zero.detach(),
+            "mean_required_margin":
+                zero.detach(),
         }
-        cert["checks"] = {**hard_checks, **diagnostic_checks}
-        cert["hard_checks"] = hard_checks
-        cert["diagnostic_checks"] = diagnostic_checks
-        cert["soft_state_report"] = True
-        cert["valid"] = bool(all(hard_checks.values()) and len(cert["errors"]) == 0)
-        if not cert["valid"]:
-            cert["errors"].extend([k for k, ok in hard_checks.items() if not ok])
-        failed_diag = [k for k, ok in diagnostic_checks.items() if not ok]
-        if failed_diag:
-            cert["warnings"].append("diagnostic_geometry_risk_soft_only:" + ",".join(failed_diag))
-        return cert
 
-    def _print_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-        print("[Base Geometry State]")
-        if not certificate:
-            print("  unavailable")
-            return
-        status = "PASS" if bool(certificate.get("valid", False)) else "WARN/FAIL"
-        print(f"  status={status} | classes={certificate.get('class_ids', [])}")
-        print(
-            "  "
-            f"GeomValAcc={float(certificate.get('geom_val_acc', 0.0)):.2f}% | "
-            f"valid_rows={int(certificate.get('valid_row_count', 0))}/{int(certificate.get('num_base_classes', 0))} | "
-            f"rel(min/mean)={float(certificate.get('min_reliability', 0.0)):.3f}/{float(certificate.get('mean_reliability', 0.0)):.3f} | "
-            f"coupling(min/mean)={float(certificate.get('min_coupling_reliability', 0.0)):.3f}/{float(certificate.get('mean_coupling_reliability', 0.0)):.3f} | "
-            f"subspace(max/mean)={float(certificate.get('max_subspace_overlap', 0.0)):.3f}/{float(certificate.get('mean_subspace_overlap', 0.0)):.3f} | "
-            f"band(raw max/mean)={float(certificate.get('max_band_similarity', 0.0)):.3f}/{float(certificate.get('mean_band_similarity', 0.0)):.3f} | "
-            f"spec(raw max/mean)={float(certificate.get('max_spectral_shape_similarity', 0.0)):.3f}/{float(certificate.get('mean_spectral_shape_similarity', 0.0)):.3f} | "
-            f"conflict(max/mean)={float(certificate.get('max_geometry_conflict', 0.0)):.3f}/{float(certificate.get('mean_geometry_conflict', 0.0)):.3f} | "
-            f"guided(band/spec)={float(certificate.get('max_band_guided_geometry_conflict', 0.0)):.3f}/{float(certificate.get('max_spectral_guided_geometry_conflict', 0.0)):.3f}"
-        )
-        if certificate.get("errors"):
-            print(f"  failed_checks={certificate.get('errors')}")
-        if certificate.get("warnings"):
-            print(f"  warnings={certificate.get('warnings')}")
-
-    def _enforce_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-        """Warn by default; optionally hard-stop if the user requests strict gating."""
-        self._last_base_geometry_certificate = certificate
-        try:
-            setattr(self.model, "base_geometry_certificate", certificate)
-        except Exception:
-            pass
-        self._print_base_geometry_certificate(certificate)
-        if bool(certificate.get("valid", False)):
-            return
-        msg = (
-            "Base geometry state contains invalid compact rows. Incremental training requires valid "
-            "GeometryBank descriptors. Failed hard checks: "
-            f"{certificate.get('errors', [])}"
-        )
-        # No hard overlap/spectral handoff gate is used. Invalid compact rows are
-        # still real code errors and are normally caught earlier by bank validation.
-        print(f"[Base Geometry State WARN] {msg}")
-
-    def _get_valid_base_bank(self, max_class_id: Optional[int] = None) -> Dict[str, torch.Tensor]:
-        if not hasattr(self, "_safe_get_subspace_bank"):
-            raise AttributeError("TrainerHelper._safe_get_subspace_bank() is required.")
-        bank = self._safe_get_subspace_bank()
-        required = ("means", "bases", "variances", "sample_counts")
-        missing = [k for k in required if k not in bank or not torch.is_tensor(bank[k]) or bank[k].numel() == 0]
-        if missing:
-            raise RuntimeError(f"Base GeometryBank is not ready; missing/empty keys: {missing}")
-        if max_class_id is not None and int(max_class_id) >= bank["means"].size(0):
-            raise RuntimeError(f"Bank has {bank['means'].size(0)} rows but needs class id {int(max_class_id)}")
-        return bank
+    # ------------------------------------------------------------------
+    # Priors and pair-risk contract
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _print_base_geometry_diagnostics(self, phase_class_ids: Iterable[int]) -> None:
-        if not self.debug and not bool(getattr(self.args, "print_base_geometry_diagnostics", True)):
-            return
-        try:
-            bank = self._get_valid_base_bank()
-        except Exception as exc:
-            print(f"[Base Geometry Diagnostics] unavailable: {exc}")
-            return
-
-        counts = bank.get("sample_counts", None)
-        active_ranks = bank.get("active_ranks", None)
-        reliability = bank.get("reliability", None)
-        variances = bank.get("variances", None)
-        means = bank.get("means", None)
-        bands = bank.get("band_importances", bank.get("band_importance", None))
-        spec_rel = bank.get("spectral_shape_reliability", None)
-
-        print("[Base Geometry Diagnostics]")
-        print("  cls | count | rank | rel  | spec-rel | resvar   | mean_norm | band_entropy")
-        for cls in [int(c) for c in phase_class_ids]:
-            count = float(counts[cls].detach().item()) if torch.is_tensor(counts) and counts.numel() > cls else -1.0
-            rank = int(active_ranks[cls].detach().item()) if torch.is_tensor(active_ranks) and active_ranks.numel() > cls else -1
-            rel = float(reliability[cls].detach().item()) if torch.is_tensor(reliability) and reliability.numel() > cls else -1.0
-            srel = float(spec_rel[cls].detach().item()) if torch.is_tensor(spec_rel) and spec_rel.numel() > cls else -1.0
-            rv = float(variances[cls, -1].detach().item()) if torch.is_tensor(variances) and variances.size(0) > cls else -1.0
-            mn = float(means[cls].norm().detach().item()) if torch.is_tensor(means) and means.size(0) > cls else -1.0
-            bent = -1.0
-            if torch.is_tensor(bands) and bands.dim() == 2 and bands.size(0) > cls:
-                b = bands[cls].detach().float().clamp_min(0.0)
-                b = b / b.sum().clamp_min(1e-8)
-                bent = float((-(b * torch.log(b.clamp_min(1e-8))).sum()).cpu().item())
-            print(f"  {cls:3d} | {count:5.0f} | {rank:4d} | {rel:4.2f} | {srel:8.3f} | {rv:8.5f} | {mn:9.4f} | {bent:12.4f}")
-
-        geom = self._base_geometry_global_metrics()
-        if geom:
-            print("  " + " | ".join(f"{k}={v:.4f}" for k, v in geom.items()))
-
-    @torch.no_grad()
-    def _batch_base_overlap_diagnostics(self, features: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
-        try:
-            diag = base_center_overlap_diagnostics(
-                features,
-                labels,
-                normalize=True,
-                min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
+    def _initialize_geometry_contract(
+        self,
+        train_payload: Mapping[str, Tensor],
+        class_ids: Sequence[int],
+    ) -> Dict[str, Any]:
+        bank = self.model.geometry_bank
+        if bool(bank.global_priors_ready.item()):
+            bank.assert_global_priors_ready()
+            if not bool(
+                bank.global_priors_frozen.item()
+            ):
+                raise RuntimeError(
+                    "existing global priors are not frozen"
+                )
+            priors = {
+                "reused": True,
+                "sample_count": int(
+                    train_payload["labels"].numel()
+                ),
+            }
+        else:
+            priors = self.model.fit_global_priors(
+                train_payload["joint_feature"],
+                train_payload[
+                    "raw_center_spectrum"
+                ],
+                freeze=True,
+                overwrite=False,
             )
-        except Exception:
-            return {"batch_compact": 0.0, "batch_center_margin": 0.0, "batch_min_center_margin": 0.0}
+
+        full_index = torch.arange(
+            train_payload["labels"].numel(),
+            device=train_payload["labels"].device,
+        )
+        rows = self._temporary_rows_from_support(
+            train_payload,
+            full_index,
+            class_ids,
+        )
+
+        if bool(
+            bank.overlap_temperatures_ready.item()
+        ):
+            if not bool(
+                bank.overlap_temperatures_frozen.item()
+            ):
+                raise RuntimeError(
+                    "existing overlap temperatures are not frozen"
+                )
+            temperatures = {
+                "reused": True,
+                "spectral_temperature": float(
+                    bank.spectral_overlap_temperature.item()
+                ),
+                "geometry_temperature": float(
+                    bank.geometry_overlap_temperature.item()
+                ),
+            }
+        else:
+            # The revised GeometryBank accepts detached provisional rows here.
+            # No persistent class row is committed.
+            temperatures = (
+                bank.fit_overlap_temperatures(
+                    class_ids,
+                    rows=rows,
+                    freeze=True,
+                    overwrite=False,
+                )
+            )
+
+        if bool(bank.valid_mask().any().item()):
+            raise RuntimeError(
+                "global geometry contract initialization "
+                "must not commit class rows"
+            )
         return {
-            "batch_compact": float(diag.get("compact", self._zero(features)).detach().cpu().item()),
-            "batch_center_margin": float(diag.get("mean_center_margin", self._zero(features)).detach().cpu().item()),
-            "batch_min_center_margin": float(diag.get("min_center_margin", self._zero(features)).detach().cpu().item()),
+            "global_priors": dict(priors),
+            "overlap_temperatures":
+                dict(temperatures),
+            "provisional_rows_committed": False,
         }
 
-    # ============================================================
-    # Clean strict geometry public structure / assertions / handoff
-    # ============================================================
-    def configure_base_contract(self, phase: int = 0) -> None:
-        if int(phase) != 0:
-            raise ValueError("BasePhaseTrainer.configure_base_contract() is phase-0 only.")
-        self._enforce_base_contract()
+    # ------------------------------------------------------------------
+    # Epoch training
+    # ------------------------------------------------------------------
 
-    def snapshot_runtime_state(self) -> Dict[str, Any]:
-        return self._capture_incremental_runtime_flags()
+    def _train_epoch(
+        self,
+        loader: DataLoader,
+        optimizer: optim.Optimizer,
+        trainable_parameters: Sequence[nn.Parameter],
+        phase_class_ids: Sequence[int],
+        *,
+        epoch: int,
+        geometry_weight: float,
+    ) -> Dict[str, float]:
+        if bool(
+            self.model.geometry_bank
+            .valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "persistent class rows must remain empty "
+                "during base optimization"
+            )
 
-    def restore_runtime_state(self, state: Optional[Dict[str, Any]]) -> None:
-        self._restore_incremental_runtime_flags(state)
+        self.model.train(True)
+        if self.model.base_ce_head is None:
+            raise RuntimeError(
+                "base CE head is absent"
+            )
+        self.model.base_ce_head.train(True)
 
-    def build_base_label_map(self, phase_class_ids: Iterable[int]) -> Dict[int, int]:
-        return self._build_base_label_map(phase_class_ids)
+        sampler = getattr(
+            loader,
+            "batch_sampler",
+            None,
+        )
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
 
-    def configure_base_trainability(self, base_head: nn.Module) -> None:
-        self._set_base_trainability(base_head)
-        self._assert_forbidden_modules_frozen()
-    def build_temporary_ce_head(self, feature_dim: int, num_base_classes: int) -> nn.Module:
-        return self._make_base_ce_head(feature_dim, num_base_classes)
+        metric_names = (
+            "total",
+            "ce",
+            "geometry",
+            "head_accuracy",
+            "geometry_accuracy",
+            "mean_gap",
+            "q05_gap",
+            "minimum_gap",
+            "classification_violation_rate",
+            "margin_violation_rate",
+            "mean_nearest_pair_risk",
+            "mean_required_margin",
+        )
+        sums = {
+            name: 0.0
+            for name in metric_names
+        }
+        gradient_norm_sum = 0.0
+        steps = 0
 
-    def extract_base_features(self, x: torch.Tensor, external_spectra: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        z, s, b, zk, sk, bk, physical = self._extract_base_views(x, external_spectra)
-        self._assert_feature_space_consistency({"features": z, "projected_features": z})
+        for step, batch in enumerate(loader):
+            payload = self._extract_batch_payload(
+                batch,
+                require_grad=True,
+            )
+            self._assert_geometry_batch(
+                payload["labels"]
+            )
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            result = (
+                self._ce_only_episode(
+                    payload,
+                    phase_class_ids,
+                )
+                if geometry_weight <= 0.0
+                else self._cross_fitted_episode(
+                    payload,
+                    step=step,
+                    epoch=epoch,
+                    geometry_weight=geometry_weight,
+                )
+            )
+            loss = result["total"]
+            if (
+                loss.dim() != 0
+                or not torch.isfinite(loss)
+            ):
+                raise RuntimeError(
+                    "base loss is not a finite scalar"
+                )
+            loss.backward()
+
+            gradient_norm = (
+                torch.nn.utils.clip_grad_norm_(
+                    list(trainable_parameters),
+                    self._cfg_float(
+                        "grad_clip_base",
+                        default=5.0,
+                    ),
+                )
+            )
+            if not torch.isfinite(
+                torch.as_tensor(gradient_norm)
+            ):
+                raise RuntimeError(
+                    "base gradient norm is NaN/Inf"
+                )
+            optimizer.step()
+
+            for name in metric_names:
+                sums[name] += float(
+                    result[name]
+                    .detach()
+                    .float()
+                    .mean()
+                    .cpu()
+                    .item()
+                )
+            gradient_norm_sum += float(
+                torch.as_tensor(
+                    gradient_norm
+                ).detach().cpu().item()
+            )
+            steps += 1
+
+        if steps == 0:
+            raise RuntimeError(
+                "base training loader is empty"
+            )
+        result = {
+            name: value / steps
+            for name, value in sums.items()
+        }
+        result["gradient_norm"] = (
+            gradient_norm_sum / steps
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Geometry scoring
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _full_temporary_rows(
+        self,
+        train_payload: Mapping[str, Tensor],
+        class_ids: Sequence[int],
+    ) -> Dict[int, Dict[str, Tensor]]:
+        index = torch.arange(
+            train_payload["labels"].numel(),
+            device=train_payload["labels"].device,
+        )
+        return self._temporary_rows_from_support(
+            train_payload,
+            index,
+            class_ids,
+        )
+
+    @torch.no_grad()
+    def _score_with_rows(
+        self,
+        payload: Mapping[str, Tensor],
+        class_ids: Sequence[int],
+        rows: Mapping[int, Mapping[str, Any]],
+        *,
+        mode: str = "factor_geometry",
+    ) -> Dict[str, Any]:
+        scored = self.model.compute_logits_from_features(
+            payload["joint_feature"],
+            class_ids=class_ids,
+            temporary_rows=rows,
+            targets=payload["labels"],
+            targets_are_global=True,
+            mode=mode,
+            return_parts=True,
+            return_diagnostics=True,
+        )
+        diagnostics = dict(
+            scored["diagnostics"]
+        )
+
+        pair_risk = (
+            self.model.geometry_bank
+            .pair_risk_matrix(
+                class_ids,
+                rows=rows,
+            )
+        )
+        geometry = (
+            risk_guided_all_rival_geometry_loss(
+                scored["energy"],
+                scored["class_ids"],
+                payload["labels"],
+                pair_risk=pair_risk,
+                base_margin=self._base_margin(),
+                risk_strength=self._risk_strength(),
+                temperature=
+                    self._geometry_temperature(),
+                maximum_margin=
+                    self._maximum_margin(),
+                class_balanced=True,
+                return_parts=True,
+            )
+        )
+        assert isinstance(geometry, Mapping)
+
+        class_tensor = scored[
+            "class_ids"
+        ]
+        predicted_global = (
+            class_tensor.index_select(
+                0,
+                scored["energy"].argmin(dim=1),
+            )
+        )
+        per_class_accuracy: Dict[int, float] = {}
+        per_class_correct: Dict[int, int] = {}
+        per_class_total: Dict[int, int] = {}
+        for class_id in class_ids:
+            selected = payload[
+                "labels"
+            ].eq(int(class_id))
+            total = int(
+                selected.sum().item()
+            )
+            correct = int(
+                predicted_global[selected]
+                .eq(payload["labels"][selected])
+                .sum()
+                .item()
+            )
+            per_class_total[int(class_id)] = total
+            per_class_correct[int(class_id)] = correct
+            per_class_accuracy[int(class_id)] = (
+                100.0 * correct / max(total, 1)
+            )
+
+        minimum_class = min(
+            class_ids,
+            key=lambda class_id: (
+                per_class_accuracy[int(class_id)],
+                int(class_id),
+            ),
+        )
+
+        invasion = (
+            pairwise_directional_invasion_matrix(
+                scored["energy"],
+                scored["class_ids"],
+                payload["labels"],
+            )
+        )
+        risk_confusion = (
+            pair_risk_confusion_statistics(
+                pair_risk,
+                invasion["invasion_matrix"],
+            )
+        )
+
         return {
-            "features": z,
-            "projected_features": z,
-            "spectral_summary": s,
-            "band_summary": b,
-            "key_features": zk,
-            "key_spectral_summary": sk,
-            "key_band_summary": bk,
-            "spectral_summary_is_physical": bool(physical),
+            "mode": mode,
+            "accuracy": 100.0 * float(
+                predicted_global
+                .eq(payload["labels"])
+                .float()
+                .mean()
+                .item()
+            ),
+            "mean_gap": float(
+                geometry["mean_gap"].item()
+            ),
+            "q05_gap": float(
+                geometry["q05_gap"].item()
+            ),
+            "minimum_gap": float(
+                geometry["minimum_gap"].item()
+            ),
+            "classification_violation_rate":
+                float(
+                    geometry[
+                        "classification_violation_rate"
+                    ].item()
+                ),
+            "margin_violation_rate":
+                float(
+                    geometry[
+                        "margin_violation_rate"
+                    ].item()
+                ),
+            "minimum_per_class_accuracy":
+                float(
+                    per_class_accuracy[
+                        int(minimum_class)
+                    ]
+                ),
+            "minimum_accuracy_class_id":
+                int(minimum_class),
+            "per_class_accuracy":
+                per_class_accuracy,
+            "per_class_correct":
+                per_class_correct,
+            "per_class_total":
+                per_class_total,
+            "maximum_directional_invasion":
+                float(
+                    invasion[
+                        "maximum_directional_invasion"
+                    ].item()
+                ),
+            "mean_directional_invasion":
+                float(
+                    invasion[
+                        "mean_directional_invasion"
+                    ].item()
+                ),
+            "pearson_risk_invasion":
+                float(
+                    risk_confusion[
+                        "pearson_risk_invasion"
+                    ].item()
+                ),
+            "diagnostics": diagnostics,
+            "energy":
+                scored["energy"].detach(),
+            "class_ids":
+                scored["class_ids"].detach(),
+            "targets":
+                payload["labels"].detach(),
+            "pair_risk":
+                pair_risk.detach(),
+            "invasion_matrix":
+                invasion[
+                    "invasion_matrix"
+                ].detach(),
+            "gap_q05_matrix":
+                invasion[
+                    "gap_q05_matrix"
+                ].detach(),
         }
 
-    def train_one_base_epoch(self, *args, **kwargs) -> Tuple[float, float]:
-        return self._train_epoch_base_geometry(*args, **kwargs)
+    @torch.no_grad()
+    def _score_committed_payload(
+        self,
+        payload: Mapping[str, Tensor],
+        class_ids: Sequence[int],
+        *,
+        mode: str = "factor_geometry",
+    ) -> Dict[str, Any]:
+        rows = {
+            int(class_id):
+                self.model.geometry_bank
+                .get_class_row(
+                    int(class_id),
+                    clone=False,
+                )
+            for class_id in class_ids
+        }
+        return self._score_with_rows(
+            payload,
+            class_ids,
+            rows,
+            mode=mode,
+        )
 
     @torch.no_grad()
-    def rebuild_base_geometry_bank(self, phase: int, phase_class_ids: Iterable[int], *, split: str = "train") -> None:
-        self._rebuild_base_geometry_bank_for_validation(int(phase), phase_class_ids, split=split)
-        self._assert_base_bank_valid([int(c) for c in phase_class_ids])
+    def _evaluate_out_of_fold(
+        self,
+        payload: Mapping[str, Tensor],
+        class_ids: Sequence[int],
+    ) -> Dict[str, Any]:
+        ids = _unique_ids(class_ids)
+        labels = payload["labels"]
+        configured_folds = self._cfg_int(
+            "base_oof_folds",
+            default=3,
+        )
+        if configured_folds < 2:
+            raise RuntimeError(
+                "base_oof_folds must be at least two"
+            )
+
+        folds_by_class: Dict[
+            int,
+            List[Tensor],
+        ] = {}
+        for class_id in ids:
+            indices = torch.nonzero(
+                labels.eq(class_id),
+                as_tuple=False,
+            ).flatten()
+            if indices.numel() < 6:
+                raise RuntimeError(
+                    f"class {class_id} has "
+                    f"{indices.numel()} samples; "
+                    "OOF requires at least six"
+                )
+            fold_count = min(
+                configured_folds,
+                max(
+                    2,
+                    int(indices.numel() // 3),
+                ),
+            )
+            generator = torch.Generator().manual_seed(
+                self._cfg_int(
+                    "seed",
+                    default=0,
+                )
+                + 9176 * class_id
+            )
+            order = torch.randperm(
+                indices.numel(),
+                generator=generator,
+            ).to(indices.device)
+            folds = list(
+                torch.tensor_split(
+                    indices.index_select(0, order),
+                    fold_count,
+                )
+            )
+            if any(
+                fold.numel() == 0
+                for fold in folds
+            ):
+                raise RuntimeError(
+                    f"class {class_id} cannot populate OOF folds"
+                )
+            folds_by_class[class_id] = folds
+
+        fold_count = min(
+            len(folds)
+            for folds in folds_by_class.values()
+        )
+        modes = (
+            "factor_geometry",
+            "quadratic_only",
+            "diagonal_geometry",
+            "prototype",
+        )
+        energy_by_mode: Dict[
+            str,
+            List[Tensor],
+        ] = {
+            mode: []
+            for mode in modes
+        }
+        target_parts: List[Tensor] = []
+        pair_risk_parts: List[Tensor] = []
+
+        for fold_index in range(fold_count):
+            support_parts: List[Tensor] = []
+            query_parts: List[Tensor] = []
+            for class_id in ids:
+                folds = folds_by_class[class_id]
+                query_parts.append(
+                    folds[fold_index]
+                )
+                support_parts.append(
+                    torch.cat(
+                        [
+                            fold
+                            for index, fold
+                            in enumerate(folds)
+                            if index != fold_index
+                        ]
+                    )
+                )
+
+            support_index = torch.cat(
+                support_parts
+            )
+            query_index = torch.cat(
+                query_parts
+            )
+            rows = self._temporary_rows_from_support(
+                payload,
+                support_index,
+                ids,
+            )
+            query_features = payload[
+                "joint_feature"
+            ].index_select(0, query_index)
+            query_labels = labels.index_select(
+                0,
+                query_index,
+            )
+            pair_risk = (
+                self.model.geometry_bank
+                .pair_risk_matrix(
+                    ids,
+                    rows=rows,
+                )
+            )
+            pair_risk_parts.append(
+                pair_risk
+            )
+            for mode in modes:
+                scored = (
+                    self.model
+                    .compute_logits_from_features(
+                        query_features,
+                        class_ids=ids,
+                        temporary_rows=rows,
+                        mode=mode,
+                        return_parts=True,
+                    )
+                )
+                energy_by_mode[mode].append(
+                    scored["energy"].detach()
+                )
+            target_parts.append(
+                query_labels
+            )
+
+        targets = torch.cat(
+            target_parts,
+            dim=0,
+        )
+        if targets.numel() != labels.numel():
+            raise RuntimeError(
+                "OOF did not evaluate every base sample exactly once"
+            )
+
+        class_tensor = torch.tensor(
+            ids,
+            device=targets.device,
+            dtype=torch.long,
+        )
+        results: Dict[str, Any] = {
+            "protocol":
+                "stratified_out_of_fold_factor_geometry",
+            "folds": fold_count,
+            "classification_factorization":
+                _CLASSIFICATION_FACTORIZATION,
+        }
+        for mode in modes:
+            energy = torch.cat(
+                energy_by_mode[mode],
+                dim=0,
+            )
+            predicted_global = (
+                class_tensor.index_select(
+                    0,
+                    energy.argmin(dim=1),
+                )
+            )
+            results[mode] = {
+                "accuracy": 100.0 * float(
+                    predicted_global
+                    .eq(targets)
+                    .float()
+                    .mean()
+                    .item()
+                )
+            }
+            if mode == "factor_geometry":
+                mean_pair_risk = torch.stack(
+                    pair_risk_parts,
+                ).mean(dim=0)
+                geometry = (
+                    risk_guided_all_rival_geometry_loss(
+                        energy,
+                        class_tensor,
+                        targets,
+                        pair_risk=
+                            mean_pair_risk,
+                        base_margin=
+                            self._base_margin(),
+                        risk_strength=
+                            self._risk_strength(),
+                        temperature=
+                            self._geometry_temperature(),
+                        maximum_margin=
+                            self._maximum_margin(),
+                        class_balanced=True,
+                        return_parts=True,
+                    )
+                )
+                assert isinstance(
+                    geometry,
+                    Mapping,
+                )
+                invasion = (
+                    pairwise_directional_invasion_matrix(
+                        energy,
+                        class_tensor,
+                        targets,
+                    )
+                )
+                risk_stats = (
+                    pair_risk_confusion_statistics(
+                        mean_pair_risk,
+                        invasion[
+                            "invasion_matrix"
+                        ],
+                    )
+                )
+
+                per_class: Dict[int, float] = {}
+                for class_id in ids:
+                    selected = targets.eq(class_id)
+                    per_class[class_id] = (
+                        100.0
+                        * float(
+                            predicted_global[selected]
+                            .eq(targets[selected])
+                            .float()
+                            .mean()
+                            .item()
+                        )
+                    )
+                results[mode].update(
+                    {
+                        "mean_gap": float(
+                            geometry[
+                                "mean_gap"
+                            ].item()
+                        ),
+                        "q05_gap": float(
+                            geometry[
+                                "q05_gap"
+                            ].item()
+                        ),
+                        "minimum_gap": float(
+                            geometry[
+                                "minimum_gap"
+                            ].item()
+                        ),
+                        "classification_violation_rate":
+                            float(
+                                geometry[
+                                    "classification_violation_rate"
+                                ].item()
+                            ),
+                        "margin_violation_rate":
+                            float(
+                                geometry[
+                                    "margin_violation_rate"
+                                ].item()
+                            ),
+                        "minimum_per_class_accuracy":
+                            min(per_class.values()),
+                        "per_class_accuracy":
+                            per_class,
+                        "maximum_directional_invasion":
+                            float(
+                                invasion[
+                                    "maximum_directional_invasion"
+                                ].item()
+                            ),
+                        "mean_directional_invasion":
+                            float(
+                                invasion[
+                                    "mean_directional_invasion"
+                                ].item()
+                            ),
+                        "pearson_risk_invasion":
+                            float(
+                                risk_stats[
+                                    "pearson_risk_invasion"
+                                ].item()
+                            ),
+                        "pair_risk":
+                            mean_pair_risk.detach(),
+                    }
+                )
+
+        results["factor_minus_prototype"] = (
+            results["factor_geometry"][
+                "accuracy"
+            ]
+            - results["prototype"][
+                "accuracy"
+            ]
+        )
+        results["factor_minus_diagonal"] = (
+            results["factor_geometry"][
+                "accuracy"
+            ]
+            - results["diagonal_geometry"][
+                "accuracy"
+            ]
+        )
+        return results
 
     @torch.no_grad()
-    def validate_geometry_only(self, loader, *, old_class_count: int = 0) -> Dict[str, Any]:
-        state = self._force_base_validation_geometry_only()
-        try:
-            return self._validate_split_metrics(loader, old_class_count=int(old_class_count))
-        finally:
-            self._restore_base_validation_mode(state)
+    def _evaluate_sampling_diagnostic(
+        self,
+        class_ids: Sequence[int],
+    ) -> Dict[str, Any]:
+        samples = (
+            self.model.geometry_bank
+            .sample_geometry(
+                class_ids,
+                self._cfg_int(
+                    "base_diagnostic_samples_per_class",
+                    default=32,
+                ),
+            )
+        )
+        scored = self.model.compute_logits_from_features(
+            samples["features"],
+            class_ids=class_ids,
+            targets=samples["labels"],
+            targets_are_global=True,
+            return_parts=True,
+            return_diagnostics=True,
+        )
+        return {
+            "accuracy": 100.0
+            * float(
+                scored["diagnostics"][
+                    "accuracy"
+                ]
+            ),
+            "mean_margin": float(
+                scored["diagnostics"][
+                    "mean_margin"
+                ]
+            ),
+            "violation_rate": float(
+                scored["diagnostics"][
+                    "violation_rate"
+                ]
+            ),
+            "training_use": False,
+            "persistent_samples": False,
+        }
 
-    @torch.no_grad()
-    def compute_base_certificate(self, phase_class_ids: Iterable[int], **kwargs: Any) -> Dict[str, Any]:
-        return self._build_base_geometry_certificate(phase_class_ids, **kwargs)
+    # ------------------------------------------------------------------
+    # Reporting
+    # ------------------------------------------------------------------
 
-    def compute_checkpoint_score(self, val_stats: Dict[str, Any], geom_stats: Optional[Dict[str, Any]] = None) -> float:
-        return self._select_base_checkpoint_score(val_stats, geom_stats)
-
-    def _jsonify(self, value: Any) -> Any:
+    @staticmethod
+    def _jsonify(value: Any) -> Any:
         if torch.is_tensor(value):
-            if value.numel() == 1:
-                return float(value.detach().cpu().item())
-            return value.detach().cpu().tolist()
-        if isinstance(value, dict):
-            return {str(k): self._jsonify(v) for k, v in value.items()}
+            tensor = value.detach().cpu()
+            return (
+                tensor.item()
+                if tensor.numel() == 1
+                else tensor.tolist()
+            )
+        if isinstance(value, Mapping):
+            return {
+                str(key):
+                    BasePhaseTrainer._jsonify(item)
+                for key, item in value.items()
+            }
         if isinstance(value, (list, tuple)):
-            return [self._jsonify(v) for v in value]
-        if isinstance(value, (int, float, str, bool)) or value is None:
+            return [
+                BasePhaseTrainer._jsonify(item)
+                for item in value
+            ]
+        if isinstance(value, set):
+            return [
+                BasePhaseTrainer._jsonify(item)
+                for item in sorted(
+                    value,
+                    key=str,
+                )
+            ]
+        if (
+            isinstance(
+                value,
+                (str, int, float, bool),
+            )
+            or value is None
+        ):
             return value
         return str(value)
 
-    def _diagnostic_output_dir(self) -> str:
-        for name in ("save_dir", "output_dir", "results_dir", "log_dir"):
-            value = getattr(self.args, name, None)
-            if value:
-                path = os.path.abspath(str(value))
-                os.makedirs(path, exist_ok=True)
-                return path
-        path = os.path.abspath("./results")
-        os.makedirs(path, exist_ok=True)
+    def _output_dir(self) -> str:
+        path = os.path.abspath(
+            str(
+                self._cfg_any(
+                    ("save_dir",),
+                    default="./outputs",
+                )
+            )
+        )
+        os.makedirs(
+            path,
+            exist_ok=True,
+        )
         return path
 
-    def _assert_runtime_state_restored(self, state: Optional[Dict[str, Any]]) -> None:
-        if not isinstance(state, dict):
-            return
-        failures: List[str] = []
-        for key, value in state.get("args", {}).items():
-            if hasattr(self.args, key) and getattr(self.args, key) != value:
-                failures.append(f"args.{key}: expected {value!r}, got {getattr(self.args, key)!r}")
-        for key, value in state.get("model", {}).items():
-            if hasattr(self.model, key) and getattr(self.model, key) != value:
-                failures.append(f"model.{key}: expected {value!r}, got {getattr(self.model, key)!r}")
-        if failures:
-            raise RuntimeError("Base phase failed to restore runtime state: " + "; ".join(failures))
-
-    def _assert_feature_space_consistency(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if "features" not in out:
-            raise RuntimeError("Feature output must contain 'features'.")
-        features = out["features"]
-        projected = out.get("projected_features", features)
-        if not torch.is_tensor(features) or features.dim() != 2:
-            raise RuntimeError(f"features must be [B,D], got {tuple(features.shape) if torch.is_tensor(features) else type(features)}")
-        if not torch.is_tensor(projected) or projected.shape != features.shape:
-            raise RuntimeError("projected_features must exist and match features shape.")
-        if not torch.allclose(features, projected, atol=1e-5, rtol=1e-4):
-            raise RuntimeError("features and projected_features are not the same canonical z tensor.")
-        if not torch.isfinite(features).all():
-            raise RuntimeError("canonical base features contain NaN/Inf.")
-        gb = getattr(self.model, "geometry_bank", None)
-        bank_dim = int(getattr(gb, "feature_dim", getattr(gb, "d_model", features.size(1)))) if gb is not None else features.size(1)
-        if int(features.size(1)) != int(bank_dim):
-            raise RuntimeError(f"feature dim {features.size(1)} does not match GeometryBank feature_dim={bank_dim}.")
-        return features
-
-    def _assert_base_batch_labels(self, labels_global: torch.Tensor, labels_local: torch.Tensor, phase_class_ids: Iterable[int], num_base: int) -> None:
-        if labels_global.numel() == 0:
-            raise RuntimeError("Base batch is empty.")
-        allowed = {int(c) for c in phase_class_ids}
-        bad = sorted(set(int(x) for x in labels_global.detach().cpu().view(-1).tolist()).difference(allowed))
-        if bad:
-            raise RuntimeError(f"Base batch contains non-base/future/background labels: {bad}; allowed={sorted(allowed)}")
-        if labels_local.numel() != labels_global.numel():
-            raise RuntimeError("Local/global label count mismatch.")
-        if int(labels_local.min().item()) < 0 or int(labels_local.max().item()) >= int(num_base):
-            raise RuntimeError(f"Local CE labels out of range [0,{int(num_base)-1}].")
-
-    def _assert_base_ce_logits(self, logits: torch.Tensor, labels_local: torch.Tensor, num_base: int) -> None:
-        if not torch.is_tensor(logits) or logits.dim() != 2:
-            raise RuntimeError(f"Base CE logits must be [B,C], got {tuple(logits.shape) if torch.is_tensor(logits) else type(logits)}")
-        if logits.size(0) != labels_local.numel() or logits.size(1) != int(num_base):
-            raise RuntimeError(f"Base CE logits shape {tuple(logits.shape)} incompatible with labels={labels_local.numel()} and num_base={num_base}.")
-        if not torch.isfinite(logits).all():
-            raise RuntimeError("Base CE logits contain NaN/Inf.")
-
-    def _assert_finite_loss(self, value: torch.Tensor, name: str) -> None:
-        if not torch.is_tensor(value) or value.numel() != 1 or not torch.isfinite(value).all():
-            raise RuntimeError(f"{name} must be a finite scalar tensor.")
-
-    @torch.no_grad()
-    def _assert_base_bank_valid(self, phase_class_ids: Iterable[int]) -> None:
-        classes = [int(c) for c in phase_class_ids]
-        if not classes:
-            raise RuntimeError("No base classes for GeometryBank validation.")
-        gb = getattr(self.model, "geometry_bank", None)
-        if gb is None:
-            raise RuntimeError("Model has no GeometryBank.")
-        if hasattr(gb, "assert_bank_valid"):
-            gb.assert_bank_valid(seen_classes=classes, strict=True)
-        bank = self._get_valid_base_bank(max(classes))
-        idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-        means = bank["means"].index_select(0, idx)
-        bases = bank["bases"].index_select(0, idx)
-        variances = bank["variances"].index_select(0, idx)
-        counts = bank["sample_counts"].to(device=self.device).flatten().index_select(0, idx)
-        if not torch.isfinite(means).all():
-            raise RuntimeError("Base GeometryBank means contain NaN/Inf.")
-        if not torch.isfinite(bases).all():
-            raise RuntimeError("Base GeometryBank bases contain NaN/Inf.")
-        if not torch.isfinite(variances).all():
-            raise RuntimeError("Base GeometryBank variances contain NaN/Inf.")
-        if not bool((counts > 0).all().item()):
-            raise RuntimeError("Every base class must have positive GeometryBank sample_count.")
-        if bool((variances < -1e-8).any().item()):
-            raise RuntimeError("GeometryBank eigen/residual variances must be non-negative.")
-        # Orthonormality check for active columns. Zero-padded inactive columns are allowed.
-        ranks = bank.get("active_ranks", None)
-        if torch.is_tensor(ranks):
-            ranks = ranks.to(device=self.device).long().flatten().index_select(0, idx)
-        else:
-            ranks = torch.full((len(classes),), bases.size(2), device=self.device, dtype=torch.long)
-        eye_cache: Dict[int, torch.Tensor] = {}
-        for row, r_t in enumerate(ranks):
-            r = int(r_t.item())
-            if r <= 0:
+    def _class_name(
+        self,
+        class_id: int,
+    ) -> str:
+        class_id = int(class_id)
+        for owner in (
+            getattr(self, "dataset", None),
+            getattr(self, "args", None),
+        ):
+            if owner is None:
                 continue
-            U = bases[row, :, :r]
-            eye = eye_cache.setdefault(r, torch.eye(r, device=U.device, dtype=U.dtype))
-            err = (U.t() @ U - eye).abs().max()
-            if float(err.detach().cpu().item()) > 5e-3:
-                raise RuntimeError(f"Base GeometryBank basis for class {classes[row]} is not orthonormal; max_err={float(err):.4e}")
-        max_cls = max(classes)
-        counts_full = bank["sample_counts"].to(device=self.device).flatten()
-        if counts_full.numel() > max_cls + 1:
-            future_valid = counts_full[max_cls + 1:] > 0
-            if bool(future_valid.any().item()):
-                bad = (torch.nonzero(future_valid, as_tuple=False).flatten() + max_cls + 1).detach().cpu().tolist()
-                raise RuntimeError(f"Future/non-base classes have valid geometry after base phase: {bad}")
-
-    def _assert_forbidden_modules_frozen(self) -> None:
-        forbidden = ("classifier.", "geometry_bank.", "geometry_calibrator", "calibrator", "adapter", "transport", "cycle")
-        offenders = []
-        for name, p in self.model.named_parameters():
-            lname = name.lower()
-            if any(tok in lname for tok in forbidden) and p.requires_grad:
-                # Backbone/projection names may contain no forbidden token. Classifier/adapters must be frozen.
-                offenders.append(name)
-        if offenders:
-            raise RuntimeError("Forbidden base-phase modules are trainable: " + ", ".join(offenders[:20]))
-
-    def _assert_base_ce_head_discarded(self) -> None:
-        if getattr(self, "_base_ce_head", None) is not None:
-            raise RuntimeError("Temporary base CE head is still attached to trainer after base finalization.")
-        if hasattr(self.model, "base_ce_head") and getattr(self.model, "base_ce_head") is not None:
-            raise RuntimeError("Temporary model base_ce_head was not dropped after base finalization.")
-
-    def _pairwise_matrix_or_zeros(self, gb: Any, method_names: Iterable[str], idx: torch.Tensor) -> torch.Tensor:
-        for name in method_names:
-            if hasattr(gb, name):
-                mat = getattr(gb, name)()
-                if torch.is_tensor(mat) and mat.dim() == 2 and mat.size(0) > int(idx.max().item()) and mat.size(1) > int(idx.max().item()):
-                    return mat.to(device=self.device).index_select(0, idx).index_select(1, idx).float()
-        n = int(idx.numel())
-        return torch.zeros((n, n), device=self.device, dtype=torch.float32)
-
-    def _compute_pair_risks(self, cert: Dict[str, Any], center: torch.Tensor, sub: torch.Tensor, conflict: torch.Tensor, band: torch.Tensor, spec: torch.Tensor) -> None:
-        """Pair-level SCTGR conflict diagnostics.
-
-        Raw band/spectral similarity is reported as hard-pair context.  A pair is
-        unsafe only when physical similarity coincides with unsafe learned
-        geometry or the learned geometry itself violates the energy/subspace gate.
-        """
-        classes = [int(c) for c in cert.get("class_ids", [])]
-        n = len(classes)
-        thr = cert.get("thresholds", {})
-        unsafe_pairs = []
-        hard_pairs = []
-        conflict_by_class = {int(c): 0.0 for c in classes}
-
-        band_guided = torch.as_tensor(cert.get("band_guided_geometry_conflict_matrix", []), device=self.device, dtype=torch.float32)
-        spec_guided = torch.as_tensor(cert.get("spectral_guided_geometry_conflict_matrix", []), device=self.device, dtype=torch.float32)
-        if band_guided.dim() != 2 or band_guided.size(0) != n:
-            band_guided = torch.zeros((n, n), device=self.device)
-        if spec_guided.dim() != 2 or spec_guided.size(0) != n:
-            spec_guided = torch.zeros((n, n), device=self.device)
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                reasons: List[str] = []
-                context: List[str] = []
-                sub_ij = float(max(sub[i, j].item(), sub[j, i].item())) if sub.numel() else 0.0
-                conf_ij = float(max(conflict[i, j].item(), conflict[j, i].item())) if conflict.numel() else 0.0
-                band_ij = float(max(band[i, j].item(), band[j, i].item())) if band.numel() else 0.0
-                spec_ij = float(max(spec[i, j].item(), spec[j, i].item())) if spec.numel() else 0.0
-                bguide_ij = float(max(band_guided[i, j].item(), band_guided[j, i].item())) if band_guided.numel() else 0.0
-                sguide_ij = float(max(spec_guided[i, j].item(), spec_guided[j, i].item())) if spec_guided.numel() else 0.0
-                dist_ij = float(center[i, j].item()) if center.numel() else 0.0
-
-                if band_ij > float(thr.get("max_band_similarity", 0.90)):
-                    context.append("raw_band_hard_pair")
-                if spec_ij > float(thr.get("max_spectral_shape_similarity", 0.85)):
-                    context.append("raw_spectral_hard_pair")
-
-                if sub_ij > float(thr.get("subspace_warn_overlap", 0.72)):
-                    reasons.append("subspace_warning_gate")
-                if conf_ij > float(thr.get("max_geometry_conflict", 1.35)):
-                    reasons.append("energy_geometry")
-                if bguide_ij > float(thr.get("max_guided_geometry_conflict", 0.18)):
-                    reasons.append("band_guided_geometry")
-                if sguide_ij > float(thr.get("max_guided_geometry_conflict", 0.18)):
-                    reasons.append("spectral_guided_geometry")
-
-                pair_score = max(
-                    0.0,
-                    sub_ij if "subspace_warning_gate" in reasons else 0.0,
-                    conf_ij if "energy_geometry" in reasons else 0.0,
-                    bguide_ij,
-                    sguide_ij,
+            for attribute in (
+                "target_names",
+                "class_names",
+            ):
+                source = getattr(
+                    owner,
+                    attribute,
+                    None,
                 )
+                value = None
+                if isinstance(source, Mapping):
+                    value = source.get(
+                        class_id,
+                        source.get(str(class_id)),
+                    )
+                elif (
+                    isinstance(source, Sequence)
+                    and not isinstance(
+                        source,
+                        (str, bytes, bytearray),
+                    )
+                    and 0 <= class_id < len(source)
+                ):
+                    value = source[class_id]
+                if (
+                    value is not None
+                    and str(value).strip()
+                ):
+                    return str(value).strip()
+        return f"Class-{class_id}"
 
-                if context:
-                    hard_pairs.append({
-                        "class_i": classes[i],
-                        "class_j": classes[j],
-                        "context": context,
-                        "center_distance": dist_ij,
-                        "subspace_overlap": sub_ij,
-                        "geometry_conflict": conf_ij,
-                        "band_similarity": band_ij,
-                        "spectral_similarity": spec_ij,
-                        "band_guided_geometry_conflict": bguide_ij,
-                        "spectral_guided_geometry_conflict": sguide_ij,
-                    })
-
-                if reasons:
-                    item = {
-                        "class_i": classes[i],
-                        "class_j": classes[j],
-                        "geometry_conflict_score": float(pair_score),
-                        "risk": float(pair_score),  # backward-compatible alias
-                        "reasons": reasons,
-                        "context": context,
-                        "center_distance": dist_ij,
-                        "subspace_overlap": sub_ij,
-                        "geometry_conflict": conf_ij,
-                        "band_similarity": band_ij,
-                        "spectral_similarity": spec_ij,
-                        "band_guided_geometry_conflict": bguide_ij,
-                        "spectral_guided_geometry_conflict": sguide_ij,
-                    }
-                    unsafe_pairs.append(item)
-                    conflict_by_class[classes[i]] = max(float(conflict_by_class[classes[i]]), float(pair_score))
-                    conflict_by_class[classes[j]] = max(float(conflict_by_class[classes[j]]), float(pair_score))
-
-        unsafe_pairs = sorted(unsafe_pairs, key=lambda x: x["geometry_conflict_score"], reverse=True)
-        hard_pairs = sorted(hard_pairs, key=lambda x: max(float(x.get("band_similarity", 0.0)), float(x.get("spectral_similarity", 0.0))), reverse=True)
-        cert["unsafe_class_pairs"] = unsafe_pairs
-        cert["hard_physical_pairs"] = hard_pairs
-
-        geometry_conflict_by_class = {int(k): float(v) for k, v in conflict_by_class.items()}
-        cert["geometry_conflict_by_class"] = geometry_conflict_by_class
-        cert["risk_by_class"] = geometry_conflict_by_class
-        cert["high_conflict_old_classes"] = [int(c) for c, v in geometry_conflict_by_class.items() if float(v) > 0.0]
-        cert["high_risk_old_classes"] = cert["high_conflict_old_classes"]
-
-    def _add_handoff_recommendations(self, cert: Dict[str, Any]) -> None:
-        conflict_by_class = {int(k): float(v) for k, v in cert.get("geometry_conflict_by_class", cert.get("risk_by_class", {})).items()}
-        base_replay = self._base_cfg_int("base_recommend_replay_per_class", 16)
-        max_replay = self._base_cfg_int("base_recommend_max_replay_per_class", 64)
-        replay_plan = {}
-        for cls in cert.get("class_ids", []):
-            cls_conflict = conflict_by_class.get(int(cls), 0.0)
-            replay_plan[int(cls)] = int(min(max_replay, max(base_replay, round(base_replay * (1.0 + cls_conflict)))))
-
-        max_pair_conflict = max(conflict_by_class.values()) if conflict_by_class else 0.0
-        max_guided = max(
-            float(cert.get("max_band_guided_geometry_conflict", 0.0)),
-            float(cert.get("max_spectral_guided_geometry_conflict", 0.0)),
-        )
-        max_conflict = max(float(cert.get("max_geometry_conflict", 0.0)), max_pair_conflict, max_guided)
-        margin_base = self._base_cfg_float("base_recommend_insertion_margin", 1.0)
-
-        cert["recommended_replay_per_class"] = replay_plan
-        cert["recommended_insertion_margin"] = float(margin_base * (1.0 + 0.25 * max_conflict))
-
-        # Main SCTGR path does not use old-row transport.
-        cert["recommended_transport_activation"] = False
-        cert["transport_required"] = False
-
-        cert["recommended_reserved_alignment"] = bool(
-            max_guided > self._base_cfg_float("base_cert_max_guided_geometry_conflict", 0.18)
-            or float(cert.get("max_geometry_conflict", 0.0)) > self._base_cfg_float("base_cert_max_geometry_conflict", 1.35)
-            or float(cert.get("max_subspace_overlap", 0.0)) > self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72)
-        )
-        cert["recommended_old_new_energy_margin"] = float(
-            self._base_cfg_float("base_recommend_old_new_energy_margin", 0.30) * (1.0 + 0.25 * max_conflict)
+    def _build_final_report(
+        self,
+        class_ids: Sequence[int],
+        *,
+        train_metrics: Mapping[str, Any],
+        validation_metrics: Mapping[str, Any],
+        oof_metrics: Mapping[str, Any],
+        sampling_metrics: Mapping[str, Any],
+        model_handoff: Mapping[str, Any],
+        history: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        ids = _unique_ids(class_ids)
+        admission = (
+            self.model.geometry_admission_report(
+                ids,
+                maximum_reconstruction_error=
+                    self._cfg_float(
+                        "maximum_geometry_reconstruction_error",
+                        default=0.75,
+                    ),
+                minimum_effective_dimension=
+                    self._cfg_float(
+                        "minimum_geometry_effective_dimension",
+                        default=1.25,
+                    ),
+                require_statistics=True,
+            )
         )
 
-    @torch.no_grad()
-    def finalize_base_handoff(self, phase_class_ids: Iterable[int], certificate: Dict[str, Any], history: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        classes = [int(c) for c in phase_class_ids]
-        feature_dim = int(getattr(getattr(self.model, "geometry_bank", None), "feature_dim", getattr(self.model, "d_model", 0)))
+        factor_oof = oof_metrics[
+            "factor_geometry"
+        ]
+        gates = {
+            "structural_geometry_valid":
+                bool(admission.get("ok", False)),
+            "factor_beats_prototype":
+                float(
+                    oof_metrics[
+                        "factor_minus_prototype"
+                    ]
+                ) >= self._cfg_float(
+                    "base_min_factor_gain_over_prototype",
+                    default=0.0,
+                ),
+            "factor_beats_diagonal":
+                float(
+                    oof_metrics[
+                        "factor_minus_diagonal"
+                    ]
+                ) >= self._cfg_float(
+                    "base_min_factor_gain_over_diagonal",
+                    default=0.0,
+                ),
+            "minimum_class_accuracy":
+                float(
+                    factor_oof[
+                        "minimum_per_class_accuracy"
+                    ]
+                ) >= self._cfg_float(
+                    "base_admission_min_class_accuracy",
+                    default=0.0,
+                ),
+            "classification_violation":
+                float(
+                    factor_oof[
+                        "classification_violation_rate"
+                    ]
+                ) <= self._cfg_float(
+                    "base_admission_max_classification_violation",
+                    default=1.0,
+                ),
+        }
+        enforced = self._cfg_bool(
+            "base_admission_enforce",
+            default=False,
+        )
+        failures = [
+            name
+            for name, passed in gates.items()
+            if not bool(passed)
+        ]
+
+        bank = self.model.geometry_bank
+        return {
+            "phase": 0,
+            "method":
+                "transport-verified spectral-spatial factor geometry",
+            "classification_factorization":
+                _CLASSIFICATION_FACTORIZATION,
+            "spectral_relation_factorization":
+                _SPECTRAL_RELATION,
+            "class_ids": ids,
+            "class_names": {
+                class_id:
+                    self._class_name(class_id)
+                for class_id in ids
+            },
+            "feature_contract": {
+                "token_dim": int(
+                    self.model.backbone.token_dim
+                ),
+                "spectral_dim": int(
+                    self.model.spectral_dim
+                ),
+                "spatial_dim": int(
+                    self.model.spatial_dim
+                ),
+                "feature_dim": int(
+                    self.model.feature_dim
+                ),
+                "joint_feature":
+                    "exact_[z_s;z_p]",
+                "final_feature_normalization":
+                    False,
+            },
+            "training_contract": {
+                "temporary_linear_head": True,
+                "bidirectional_crossfit": True,
+                "query_rows_detached": True,
+                "query_loss_weighting": False,
+                "persistent_rows_during_epochs":
+                    False,
+                "trainable_transport": False,
+                "geometry_replay_training":
+                    False,
+            },
+            "global_priors": {
+                "ready": bool(
+                    bank.global_priors_ready.item()
+                ),
+                "frozen": bool(
+                    bank.global_priors_frozen.item()
+                ),
+                "spectral_residual_prior":
+                    float(
+                        bank.global_residual_prior_spectral.item()
+                    ),
+                "spatial_residual_prior":
+                    float(
+                        bank.global_residual_prior_spatial.item()
+                    ),
+            },
+            "pair_risk_contract": {
+                "temperatures_ready": bool(
+                    bank.overlap_temperatures_ready.item()
+                ),
+                "temperatures_frozen": bool(
+                    bank.overlap_temperatures_frozen.item()
+                ),
+                "spectral_temperature":
+                    float(
+                        bank.spectral_overlap_temperature.item()
+                    ),
+                "geometry_temperature":
+                    float(
+                        bank.geometry_overlap_temperature.item()
+                    ),
+                "used_for_inference": False,
+                "used_for_training_margin": True,
+            },
+            "train": dict(train_metrics),
+            "validation": dict(
+                validation_metrics
+            ),
+            "out_of_fold": dict(
+                oof_metrics
+            ),
+            "sampling_diagnostic": dict(
+                sampling_metrics
+            ),
+            "geometry_admission":
+                admission,
+            "admission_enforced": enforced,
+            "admission_gates": gates,
+            "admission_passed":
+                not failures,
+            "admission_failures":
+                failures,
+            "memory_cost":
+                bank.memory_cost_summary(),
+            "model_handoff":
+                dict(model_handoff),
+            "best_epoch":
+                history.get("best_epoch"),
+        }
+
+    def finalize_base_handoff(
+        self,
+        class_ids: Sequence[int],
+        report: Mapping[str, Any],
+        history: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        ids = _unique_ids(class_ids)
         handoff = {
             "phase": 0,
-            "base_classes": classes,
-            "feature_dim": feature_dim,
-            "geometry_bank_ready": bool(certificate.get("valid_row_count", 0) == len(classes)),
-            "geometry_certificate": certificate,
-            "geometry_conflict_by_class": certificate.get("geometry_conflict_by_class", certificate.get("risk_by_class", {})),
-            "risk_by_class": certificate.get("risk_by_class", {}),  # backward-compatible alias
-            "unsafe_class_pairs": certificate.get("unsafe_class_pairs", []),
-            "recommended_replay_per_class": certificate.get("recommended_replay_per_class", {}),
-            "recommended_insertion_margin": certificate.get("recommended_insertion_margin", 1.0),
-            "transport_required": False,
-            "reserved_alignment_required": bool(certificate.get("recommended_reserved_alignment", False)),
-            "recommended_old_new_energy_margin": certificate.get("recommended_old_new_energy_margin", 0.30),
-            "coupling_reliability": certificate.get("coupling_reliability", {}),
-            "energy_quantiles": certificate.get("energy_quantiles", {}),
-            "margin_quantiles": certificate.get("margin_quantiles", {}),
-            "replay_ready": bool(certificate.get("hard_checks", {}).get("replay_quantiles_ready", False)),
-            "high_conflict_old_classes": certificate.get("high_conflict_old_classes", certificate.get("high_risk_old_classes", [])),
-            "high_risk_old_classes": certificate.get("high_risk_old_classes", []),  # backward-compatible alias
+            "method":
+                "transport-verified spectral-spatial factor geometry",
+            "classification_factorization":
+                _CLASSIFICATION_FACTORIZATION,
+            "spectral_relation_factorization":
+                _SPECTRAL_RELATION,
+            "base_classes": ids,
+            "token_dim": int(
+                self.model.backbone.token_dim
+            ),
+            "spectral_dim": int(
+                self.model.spectral_dim
+            ),
+            "spatial_dim": int(
+                self.model.spatial_dim
+            ),
+            "feature_dim": int(
+                self.model.feature_dim
+            ),
+            "geometry_bank_ready":
+                bool(
+                    self.model.geometry_bank
+                    .valid_mask().any().item()
+                ),
+            "classifier_bound":
+                bool(
+                    self.model.classifier
+                    .require_bound_contract
+                ),
+            "bank_contract_digest":
+                self.model.classifier
+                .bank_contract_digest(
+                    self.model.geometry_bank
+                ),
+            "rows_digest":
+                self.model.geometry_bank
+                .rows_digest(ids),
+            "admission_passed":
+                bool(
+                    report.get(
+                        "admission_passed",
+                        False,
+                    )
+                ),
+            "feature_space_policy":
+                "frozen_until_incremental_phase_policy_is_selected",
+            "geometry_report":
+                dict(report),
         }
-        out_dir = self._diagnostic_output_dir()
-        json_path = os.path.join(out_dir, "phase_0_base_handoff.json")
-        pt_path = os.path.join(out_dir, "phase_0_base_handoff.pt")
-        cert_path = os.path.join(out_dir, "phase_0_base_geometry_certificate.json")
-        diag_path = os.path.join(out_dir, "phase_0_base_diagnostics.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(self._jsonify(handoff), f, indent=2)
-        with open(cert_path, "w", encoding="utf-8") as f:
-            json.dump(self._jsonify(certificate), f, indent=2)
-        if history is not None:
-            with open(diag_path, "w", encoding="utf-8") as f:
-                json.dump(self._jsonify(history), f, indent=2)
-        torch.save(self._jsonify(handoff), pt_path)
-        handoff["handoff_json_path"] = json_path
-        handoff["handoff_pt_path"] = pt_path
-        handoff["certificate_json_path"] = cert_path
-        handoff["diagnostics_json_path"] = diag_path if history is not None else None
-        try:
-            setattr(self.model, "base_handoff", handoff)
-            setattr(self.model, "base_geometry_certificate", certificate)
-        except Exception:
-            pass
+
+        output = self._output_dir()
+        paths = {
+            "handoff_json_path":
+                os.path.join(
+                    output,
+                    "phase_0_base_handoff.json",
+                ),
+            "handoff_pt_path":
+                os.path.join(
+                    output,
+                    "phase_0_base_handoff.pt",
+                ),
+            "report_json_path":
+                os.path.join(
+                    output,
+                    "phase_0_base_geometry_report.json",
+                ),
+            "history_json_path":
+                os.path.join(
+                    output,
+                    "phase_0_base_history.json",
+                ),
+        }
+        with open(
+            paths["handoff_json_path"],
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(
+                self._jsonify(handoff),
+                stream,
+                indent=2,
+            )
+        torch.save(
+            self._jsonify(handoff),
+            paths["handoff_pt_path"],
+        )
+        with open(
+            paths["report_json_path"],
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(
+                self._jsonify(report),
+                stream,
+                indent=2,
+            )
+        with open(
+            paths["history_json_path"],
+            "w",
+            encoding="utf-8",
+        ) as stream:
+            json.dump(
+                self._jsonify(history),
+                stream,
+                indent=2,
+            )
+
+        handoff.update(paths)
+        self.model.base_handoff = handoff
         return handoff
 
-    # ============================================================
-    # Base objective: unified_spectral_geometry_loss(phase="base")
-    # ============================================================
-    def _train_epoch_base_geometry(
-        self,
-        loader,
-        optimizer,
-        base_head: nn.Module,
-        phase_class_ids: Iterable[int],
-        label_map: Dict[int, int],
-        trainable_params: list[nn.Parameter],
-    ) -> Tuple[float, float]:
-        self._assert_mandatory_base_objective_config()
-        self.model.train()
-        base_head.train()
+    # ------------------------------------------------------------------
+    # Main phase entry
+    # ------------------------------------------------------------------
 
-        num_base = len([int(c) for c in phase_class_ids])
-        total_loss = 0.0
-        total_correct = 0
-        total_count = 0
-        stat_steps = 0
-        stat_sums = {
-            "ce": 0.0,
-            "srpgr": 0.0,
-            "compact_sep": 0.0,
-            "gics": 0.0,
-            "weighted_gics": 0.0,
-            "energy_margin": 0.0,
-            "energy_margin_weighted": 0.0,
-            "energy_margin_violation": 0.0,
-            "energy_margin_gap": 0.0,
-            "gics_anchors": 0.0,
-            "gics_pos": 0.0,
-            "pgr": 0.0,
-            "pgr_unweighted": 0.0,
-            "pgr_compact": 0.0,
-            "pgr_center": 0.0,
-            "pgr_subspace": 0.0,
-            "pgr_band": 0.0,
-            "pgr_volume": 0.0,
-            "pgr_valid_class_count": 0.0,
-            "pgr_subspace_pair_count": 0.0,
-            "pgr_band_pair_count": 0.0,
-            "pgr_volume_factor": 0.0,
-            "pgr_subspace_max_overlap": 0.0,
-            "pgr_band_max_similarity": 0.0,
-            "pgr_band_guided_conflict_mean": 0.0,
-            "pgr_band_guided_conflict_max": 0.0,
-            "spectral_shape": 0.0,
-            "spectral_shape_raw": 0.0,
-            "spectral_shape_mean_similarity": 0.0,
-            "spectral_shape_pairs": 0.0,
-            "spectral_shape_guided_conflict_mean": 0.0,
-            "spectral_shape_guided_conflict_max": 0.0,
-            "spectral_active": 0.0,
-            "batch_compact": 0.0,
-            "batch_center_margin": 0.0,
-            "batch_min_center_margin": 0.0,
+    def train_base_phase(
+        self,
+        phase: int,
+        epochs: int,
+        batch_size: int = 64,
+        lr: float = 1e-4,
+    ) -> Dict[str, Any]:
+        phase = int(phase)
+        epochs = int(epochs)
+        if phase != 0:
+            raise ValueError(
+                "train_base_phase() is phase-0 only"
+            )
+        if epochs <= 0:
+            raise RuntimeError(
+                "epochs must be positive"
+            )
+        if float(lr) <= 0.0:
+            raise RuntimeError(
+                "lr must be positive"
+            )
+
+        self.dataset.start_phase(phase)
+        phase_class_ids = _unique_ids(
+            self.dataset.phase_to_classes[phase],
+            name="phase_class_ids",
+        )
+        self._validate_base_configuration(
+            phase_class_ids
+        )
+
+        print(
+            "==== Base Phase | "
+            "Spectral-Spatial Factor Geometry ===="
+        )
+        self.model.set_base_mode()
+        base_head = self._make_base_head(
+            phase_class_ids
+        )
+        self._set_base_trainability(
+            base_head
+        )
+        if bool(
+            self.model.geometry_bank
+            .valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "base phase must begin with zero committed rows"
+            )
+
+        raw_train_loader = (
+            self.dataset
+            .get_phase_dataloader(
+                phase,
+                split="train",
+                batch_size=int(batch_size),
+                shuffle=False,
+            )
+        )
+        train_loader = (
+            self._build_geometry_balanced_loader(
+                raw_train_loader,
+                phase_class_ids,
+            )
+        )
+        train_eval_loader = (
+            self.dataset
+            .get_phase_dataloader(
+                phase,
+                split="train",
+                batch_size=int(batch_size),
+                shuffle=False,
+            )
+        )
+        val_loader = (
+            self.dataset
+            .get_cumulative_dataloader(
+                phase,
+                split="val",
+                batch_size=int(batch_size),
+                shuffle=False,
+            )
+        )
+
+        trainable = (
+            self._base_trainable_parameters()
+        )
+        optimizer = optim.AdamW(
+            trainable,
+            lr=float(lr),
+            weight_decay=self._cfg_float(
+                "weight_decay",
+                default=1e-4,
+            ),
+        )
+        scheduler: Optional[
+            optim.lr_scheduler.LRScheduler
+        ] = None
+        if self._cfg_bool(
+            "base_use_cosine_scheduler",
+            default=True,
+        ):
+            scheduler = (
+                optim.lr_scheduler
+                .CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, epochs),
+                    eta_min=float(lr)
+                    * self._cfg_float(
+                        "base_min_lr_ratio",
+                        default=0.05,
+                    ),
+                )
+            )
+
+        history: Dict[str, Any] = {
+            "architecture":
+                self.model.architecture_summary(),
+            "train": [],
+            "validation": [],
+            "persistent_rows_during_training":
+                [],
+            "geometry_contract": None,
+            "best_epoch": None,
+            "best_validation_accuracy": None,
+            "best_validation_q05_gap": None,
         }
 
-        for batch in loader:
-            x, y, spectra, _ = self._unpack_hsi_batch(batch)
-            x = x.float().to(self.device, non_blocking=True)
-            y = y.long().to(self.device, non_blocking=True)
-            y_local = self._labels_to_local(y, label_map)
-            self._assert_base_batch_labels(y, y_local, phase_class_ids, num_base)
+        geometry_contract_ready = False
+        best_state: Optional[
+            Dict[str, Any]
+        ] = None
+        best_epoch = -1
+        best_accuracy = float("-inf")
+        best_q05 = float("-inf")
+        best_min_class = float("-inf")
+        stale_evaluations = 0
+        patience = self._cfg_int(
+            "base_early_stop_patience",
+            default=0,
+        )
+        eval_every = max(
+            1,
+            self._cfg_int(
+                "base_eval_every",
+                default=1,
+            ),
+        )
 
-            optimizer.zero_grad(set_to_none=True)
+        print(
+            "[Base contract] CE warm-up -> frozen aggregate priors -> "
+            "frozen pair-risk temperatures -> bidirectional support/query "
+            "factor geometry -> atomic final commit."
+        )
+        print(
+            "[Base memory] No persistent class row is committed during "
+            "optimization."
+        )
 
-            features, spectral_summary, band_summary, key_features, _, _, spectral_summary_is_physical = self._extract_base_views(x, spectra)
-            self._assert_feature_space_consistency({"features": features, "projected_features": features})
-
-            # PGR band reserve must use the physical spectrum when raw spectra are
-            # available.  This is the fix for the previous 200-D raw spectrum vs
-            # 30-D PCA band-vector mismatch and for weak band/spectral certificates.
-            band_for_srpgr = self._select_srpgr_band_summary(
-                spectral_summary=spectral_summary,
-                band_summary=band_summary,
-                spectral_summary_is_physical=bool(spectral_summary_is_physical),
-                x=x,
+        for epoch in range(epochs):
+            geometry_weight = (
+                self._geometry_weight_for_epoch(
+                    epoch
+                )
             )
 
-            self._assert_mandatory_base_batch_inputs(
-                features=features,
-                labels_local=y_local,
-                key_features=key_features,
-                spectral_summary=spectral_summary,
-                band_summary=band_for_srpgr,
-            )
-            if torch.is_tensor(key_features) and key_features.requires_grad:
-                raise RuntimeError("SRPGR/GICS key_features must be detached; otherwise the key branch becomes a second train path.")
-            logits = base_head(features)
-            self._assert_base_ce_logits(logits, y_local, num_base)
-
-            # Architecture fix: base CE must be class-balanced independently of
-            # SRPGR. Indian Pines style base phases contain tiny classes; plain
-            # CE can learn a high-accuracy head while leaving minority geometry
-            # dirty. The unified loss still owns SRPGR; CE is computed here so
-            # class-balanced CE can be used without changing the public loss API.
-            loss_out = unified_spectral_geometry_loss(
-                phase="base",
-                logits=logits,
-                features=features,
-                labels=y_local,
-                key_features=key_features,
-                band_summary=band_for_srpgr,
-                spectral_summary=spectral_summary,
-                spectral_summary_is_physical=bool(spectral_summary_is_physical),
-                ce_weight=0.0,
-                base_geometry_weight=self._base_cfg_float("base_srpgr_weight", 1.0),
-                label_smoothing=self._base_cfg_float("label_smoothing", 0.0),
-                gics_weight=self._base_cfg_float("base_gics_weight", 0.20),
-                pgr_weight=self._base_cfg_float("pgr_weight", 0.10),
-                spectral_shape_weight=self._base_cfg_float("base_spectral_shape_weight", 0.05),
-                gics_temperature=self._base_cfg_float("base_gics_temperature", 0.07),
-                base_energy_margin_weight=self._base_cfg_float("base_energy_margin_weight", 0.15),
-                base_energy_margin=self._base_cfg_float("base_energy_margin", 0.25),
-                base_energy_variance_floor=self._base_cfg_float("geom_var_floor", 5e-4),
-                pgr_compact_weight=self._base_cfg_float("pgr_compact_weight", 0.15),
-                pgr_center_weight=self._base_cfg_float("pgr_center_weight", 0.20),
-                pgr_subspace_weight=self._base_cfg_float("pgr_subspace_weight", 0.10),
-                pgr_band_weight=self._base_cfg_float("pgr_band_weight", 0.05),
-                pgr_volume_weight=self._base_cfg_float("pgr_volume_weight", 0.05),
-                pgr_center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-                pgr_max_band_similarity=self._base_cfg_float("pgr_band_overlap_max", 0.75),
-                pgr_max_class_variance=self._base_cfg_float("pgr_max_class_variance", 0.75),
-                pgr_min_class_variance=self._base_cfg_float("pgr_min_class_variance", 0.015),
-                pgr_max_subspace_overlap=self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-                subspace_overlap_max=self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-                subspace_rank=self._base_cfg_int("pgr_subspace_rank", 3),
-                min_class_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-                subspace_min_samples=self._base_cfg_int("pgr_subspace_min_samples", 6),
-                max_spectral_shape_similarity=self._base_cfg_float("base_max_spectral_shape_similarity", 0.75),
-                spectral_shape_risk_weight=self._base_cfg_float("base_spectral_shape_risk_weight", 1.0),
-                require_physical_summary=self._base_cfg_bool("spectral_require_physical_summary", True),
-                return_parts=True,
-            )
-            if not isinstance(loss_out, dict) or "total" not in loss_out:
-                raise RuntimeError("unified_spectral_geometry_loss(phase='base') must return a dict containing 'total'.")
-            margin_out = self._base_batch_geometry_energy_margin(
-                features, y_local, num_classes=num_base
-            )
-            loss_out.update(margin_out)
-            self._assert_mandatory_base_loss_parts(
-                loss_out,
-                spectral_summary_is_physical=bool(spectral_summary_is_physical),
-            )
-            ce = self._batch_balanced_ce(logits, y_local, num_base)
-            # The differentiable SRPGR/GICS/PGR graph is in loss_out["total"]
-            # because ce_weight=0.0.  The geometry-energy margin is constructed
-            # explicitly above against batch low-rank geometry.
-            srpgr_total = loss_out.get("total", self._zero(features))
-            if not torch.is_tensor(srpgr_total):
-                srpgr_total = torch.as_tensor(float(srpgr_total), device=features.device, dtype=features.dtype)
-            energy_margin_total = margin_out["base_energy_margin_weighted"]
-            loss = self._base_cfg_float("base_ce_weight", 1.0) * ce + srpgr_total + energy_margin_total
-            loss_out["ce"] = ce.detach()
-            loss_out["base_geometry_train"] = srpgr_total.detach()
-            loss_out["total"] = loss
-            self._assert_finite_loss(ce, "base_ce")
-            self._assert_finite_loss(srpgr_total, "base_srpgr")
-            self._assert_finite_loss(loss, "base_total_loss")
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, float(self.grad_clip_base))
-            optimizer.step()
-
-            pred = logits.argmax(dim=1)
-            total_loss += float(loss.detach().item())
-            total_correct += int((pred == y_local).sum().item())
-            total_count += int(y_local.numel())
-            stat_steps += 1
-
-            batch_diag = self._batch_base_overlap_diagnostics(features.detach(), y.detach())
-
-            def _lstat(key: str, default: float = 0.0) -> float:
-                value = loss_out.get(key, None)
-                if torch.is_tensor(value):
-                    return float(value.detach().float().mean().cpu().item())
-                if isinstance(value, (int, float)):
-                    return float(value)
-                return float(default)
-
-            stat_sums["ce"] += _lstat("ce")
-            stat_sums["srpgr"] += _lstat("base_geometry_train", _lstat("base_geometry"))
-            stat_sums["compact_sep"] += _lstat("base_gics")
-            stat_sums["gics"] += _lstat("base_gics")
-            stat_sums["weighted_gics"] += _lstat("base_gics_weighted", _lstat("base_gics"))
-            stat_sums["energy_margin"] += _lstat("base_energy_margin")
-            stat_sums["energy_margin_weighted"] += _lstat("base_energy_margin_weighted", _lstat("base_energy_margin"))
-            stat_sums["energy_margin_violation"] += _lstat("base_energy_margin_violation")
-            stat_sums["energy_margin_gap"] += _lstat("base_energy_margin_gap")
-            stat_sums["gics_anchors"] += _lstat("base_gics_anchors")
-            stat_sums["gics_pos"] += _lstat("base_gics_pos")
-            stat_sums["pgr"] += _lstat("base_pgr_weighted", _lstat("base_pgr"))
-            stat_sums["pgr_unweighted"] += _lstat("base_pgr")
-            stat_sums["pgr_compact"] += _lstat("base_compact")
-            stat_sums["pgr_center"] += _lstat("base_center")
-            stat_sums["pgr_subspace"] += _lstat("base_subspace")
-            stat_sums["pgr_band"] += _lstat("base_band")
-            stat_sums["pgr_volume"] += _lstat("base_volume")
-            stat_sums["pgr_valid_class_count"] += _lstat("base_pgr_valid_class_count")
-            stat_sums["pgr_subspace_pair_count"] += _lstat("base_pgr_subspace_pair_count")
-            stat_sums["pgr_band_pair_count"] += _lstat("base_pgr_band_pair_count")
-            stat_sums["pgr_volume_factor"] += _lstat("base_pgr_volume_factor")
-            stat_sums["pgr_subspace_max_overlap"] += _lstat("base_pgr_subspace_max_overlap")
-            stat_sums["pgr_band_max_similarity"] += _lstat("base_pgr_band_max_similarity")
-            stat_sums["pgr_band_guided_conflict_mean"] += _lstat("base_pgr_band_guided_conflict_mean")
-            stat_sums["pgr_band_guided_conflict_max"] += _lstat("base_pgr_band_guided_conflict_max")
-            stat_sums["spectral_shape"] += _lstat("base_spectral_shape")
-            stat_sums["spectral_shape_raw"] += _lstat("base_spectral_shape_raw", _lstat("base_spectral_shape"))
-            stat_sums["spectral_shape_mean_similarity"] += _lstat("base_spectral_shape_mean_similarity")
-            stat_sums["spectral_shape_pairs"] += _lstat("base_spectral_shape_pair_count")
-            stat_sums["spectral_shape_guided_conflict_mean"] += _lstat("base_spectral_shape_guided_conflict_mean")
-            stat_sums["spectral_shape_guided_conflict_max"] += _lstat("base_spectral_shape_guided_conflict_max")
-            stat_sums["spectral_active"] += _lstat("base_spectral_shape_active", 1.0 if bool(spectral_summary_is_physical) else 0.0)
-            for k, v in batch_diag.items():
-                stat_sums[k] += float(v)
-
-        self._last_base_stats = {k: v / max(stat_steps, 1) for k, v in stat_sums.items()}
-        self._assert_mandatory_base_epoch_coverage(self._last_base_stats)
-        return total_loss / max(stat_steps, 1), 100.0 * total_correct / max(total_count, 1)
-
-    # backward-compatible alias for trainer.py calls that still use the old name
-    def _train_epoch_base_gics(self, *args, **kwargs):
-        return self._train_epoch_base_geometry(*args, **kwargs)
-
-    # ============================================================
-    # Checkpoint score
-    # ============================================================
-    def _select_base_checkpoint_score(self, val_stats: Dict, geom_stats: Optional[Dict] = None) -> float:
-        metric = str(getattr(self.args, "best_state_metric", "geometry_score")).lower()
-        geom_stats = geom_stats or {}
-        if metric in {"geometry_score", "geo", "reserve"}:
-            acc = float(val_stats.get("acc", 0.0))
-            reserve = float(geom_stats.get("geometry_reserve_score", val_stats.get("geometry_score", 0.0)))
-            conflict_mean = float(geom_stats.get("geometry_conflict_mean", 0.0))
-            conflict_max = float(val_stats.get("cert_max_geometry_conflict", geom_stats.get("geometry_conflict_max", conflict_mean)))
-            overlap_mean = float(geom_stats.get("feature_subspace_overlap", 0.0))
-            overlap_max = float(val_stats.get("cert_max_subspace_overlap", overlap_mean))
-            overlap_warn = self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72)
-            overlap_excess = max(0.0, overlap_max - overlap_warn)
-            guided_band = float(val_stats.get("cert_max_band_guided_geometry_conflict", 0.0))
-            guided_spec = float(val_stats.get("cert_max_spectral_guided_geometry_conflict", 0.0))
-            guided_conflict = max(guided_band, guided_spec)
-            energy_margin_violation = float(val_stats.get("base_energy_margin_violation", 0.0))
-            energy_margin_gap = float(val_stats.get("base_energy_margin_gap", 0.0))
-            gap_target = max(self._base_cfg_float("base_score_energy_gap_target", 1.0), 1e-6)
-            # Raw gaps are unbounded and previously dominated checkpoint
-            # selection.  Saturation rewards reaching a healthy gap but not
-            # inflating it at the expense of overlap or conflict.
-            energy_gap_reward = float(torch.tanh(torch.tensor(max(0.0, energy_margin_gap) / gap_target)).item())
-            cert_valid = 1.0 if bool(val_stats.get("cert_valid", False)) else 0.0
-
-            a = self._base_cfg_float("base_score_reserve_alpha", 8.0)
-            b_conf_max = self._base_cfg_float("base_score_conflict_max_beta", 7.0)
-            b_conf_mean = self._base_cfg_float("base_score_conflict_mean_beta", 3.0)
-            g_overlap_excess = self._base_cfg_float("base_score_overlap_excess_gamma", 8.0)
-            g_overlap_mean = self._base_cfg_float("base_score_overlap_mean_gamma", 0.5)
-            d_guided = self._base_cfg_float("base_score_guided_conflict_delta", 6.0)
-            cert_bonus = self._base_cfg_float("base_score_cert_bonus", 3.0)
-            e_viol_beta = self._base_cfg_float("base_score_energy_violation_beta", 10.0)
-            e_gap_alpha = self._base_cfg_float("base_score_energy_gap_alpha", 2.0)
-            return (
-                acc
-                + a * reserve
-                + e_gap_alpha * energy_gap_reward
-                - e_viol_beta * max(0.0, energy_margin_violation)
-                + cert_bonus * cert_valid
-                - b_conf_max * conflict_max
-                - b_conf_mean * conflict_mean
-                - g_overlap_excess * overlap_excess
-                - g_overlap_mean * overlap_mean
-                - d_guided * guided_conflict
-            )
-        if metric in {"acc", "accuracy", "oa", "val_acc"}:
-            return float(val_stats.get("acc", 0.0))
-        if metric in {"loss", "val_loss"}:
-            return -float(val_stats.get("loss", 1e9))
-        if metric in {"hm", "harmonic"}:
-            return float(val_stats.get("hm", val_stats.get("acc", 0.0)))
-        return float(val_stats.get("acc", 0.0))
-
-    def train_base_phase(self, phase, epochs, batch_size=64, lr=1e-4) -> Dict:
-        phase = int(phase)
-        if phase != 0:
-            raise ValueError("train_base_phase() must only be called for phase 0.")
-
-        incremental_runtime_state = self.snapshot_runtime_state()
-        base_eval_state = None
-        base_head: Optional[nn.Module] = None
-        history: Dict[str, Any] = {}
-        phase_class_ids: List[int] = []
-        try:
-            base_eval_state = self._force_base_validation_geometry_only()
-            self.configure_base_contract(phase)
-
-            print("==== Base Phase Training | Spectral-Coupled Tangent Geometry Replay Preparation ====")
-            self.dataset.start_phase(phase)
-            phase_class_ids = [int(c) for c in self.dataset.phase_to_classes[phase]]
-            if not phase_class_ids:
-                raise RuntimeError("Phase 0 has no base classes.")
-            label_map = self.build_base_label_map(phase_class_ids)
-            self._set_model_phase_and_old_count(phase, 0)
-
-            needed_classes = max(phase_class_ids) + 1
-            if hasattr(self.model, "ensure_class_capacity"):
-                self.model.ensure_class_capacity(needed_classes)
-
-            train_loader = self.dataset.get_phase_dataloader(phase, split="train", batch_size=batch_size, shuffle=True)
-            val_loader = self.dataset.get_cumulative_dataloader(phase, split="val", batch_size=batch_size, shuffle=False)
-
-            feature_dim = self._extract_feature_dim(train_loader)
-            base_head = self.build_temporary_ce_head(feature_dim, len(phase_class_ids))
-            self._base_ce_head = base_head
-            self.configure_base_trainability(base_head)
-            trainable_params = self._base_trainable_parameters(base_head)
-
-            optimizer = optim.Adam(
-                trainable_params,
-                lr=float(lr),
-                weight_decay=float(getattr(self.args, "weight_decay", 1e-4)),
-            )
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, int(epochs))
-
-            history = {
-                "train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [],
-                "val_old_acc": [], "val_new_acc": [], "val_hm": [], "checkpoint_score": [],
-                "base_ce": [], "base_srpgr": [], "base_compact_sep": [], "base_gics": [], "base_weighted_gics": [],
-                "base_energy_margin": [], "base_energy_margin_weighted": [],
-                "base_energy_margin_violation": [], "base_energy_margin_gap": [],
-                "base_gics_anchors": [], "base_gics_pos": [],
-                "base_pgr": [], "base_pgr_unweighted": [], "base_pgr_compact": [],
-                "base_pgr_center": [], "base_pgr_subspace": [], "base_pgr_band": [], "base_pgr_volume": [],
-                "base_pgr_valid_class_count": [], "base_pgr_subspace_pair_count": [], "base_pgr_band_pair_count": [], "base_pgr_volume_factor": [],
-                "base_pgr_subspace_max_overlap": [], "base_pgr_band_max_similarity": [],
-                "base_pgr_band_guided_conflict_mean": [], "base_pgr_band_guided_conflict_max": [],
-                "base_spectral_shape": [], "base_spectral_shape_raw": [], "base_spectral_shape_mean_similarity": [],
-                "base_spectral_shape_pairs": [], "base_spectral_shape_guided_conflict_mean": [],
-                "base_spectral_shape_guided_conflict_max": [], "base_spectral_active": [],
-                "batch_compact": [], "batch_center_margin": [], "batch_min_center_margin": [],
-                "feature_subspace_overlap": [], "band_overlap": [], "spectral_shape_overlap": [],
-                "spectral_shape_similarity_mean": [], "spectral_shape_similarity_max": [],
-                "geometry_conflict_mean": [], "geometry_conflict_max": [], "geometry_reserve_score": [],
-                "base_cert_geom_acc": [], "base_cert_min_reliability": [],
-                "base_cert_max_subspace_overlap": [], "base_cert_max_band_similarity": [], "base_cert_max_spectral_shape_similarity": [],
-                "base_cert_max_geometry_conflict": [], "base_cert_max_band_guided_geometry_conflict": [],
-                "base_cert_max_spectral_guided_geometry_conflict": [], "base_cert_valid": [],
-                "base_replay_statistics": [],
-                "base_replay_max_violation": [], "base_replay_min_margin_q05": [],
-            }
-
-            best_score = -1e18
-            # Lexicographic health selection: valid rows, acceptable margin
-            # violation, validation accuracy, guided conflict, geometry conflict,
-            # overlap, then the saturated scalar score as a final tie-breaker.
-            best_key = (-1, -1, -1e18, -1e18, -1e18, -1e18, -1e18)
-            best_state = None
-            best_epoch_cert: Optional[Dict[str, Any]] = None
-            no_improve = 0
-            epochs = int(epochs)
-
-            if hasattr(self, "_print_trainable_summary"):
-                self._print_trainable_summary(phase)
-            print(f"[Base] Temporary CE head: feature_dim={feature_dim}, classes={len(phase_class_ids)}. It will be discarded after geometry handoff.")
-            print("[Base Objective] MANDATORY: balanced CE + GICS + PGR(compact, center, subspace, band, volume) + base geometry-energy margin on canonical projected z-space.")
-
-            for epoch in range(epochs):
-                self._base_epoch = int(epoch)
-                self._set_model_phase_and_old_count(phase, 0)
-
-                tr_loss, head_train_acc = self.train_one_base_epoch(
-                    train_loader,
-                    optimizer,
-                    base_head,
-                    phase_class_ids,
-                    label_map,
-                    trainable_params,
+            if (
+                geometry_weight > 0.0
+                and not geometry_contract_ready
+            ):
+                contract_payload = (
+                    self._collect_payload(
+                        train_eval_loader
+                    )
+                )
+                history["geometry_contract"] = (
+                    self._initialize_geometry_contract(
+                        contract_payload,
+                        phase_class_ids,
+                    )
+                )
+                geometry_contract_ready = True
+                print(
+                    "[Base geometry contract] "
+                    "global priors and pair-risk temperatures "
+                    "fitted and frozen; committed rows=0"
                 )
 
-                self.rebuild_base_geometry_bank(phase, phase_class_ids, split="train")
-                epoch_replay_stats = self._update_base_replay_statistics(
-                    train_loader, phase_class_ids, allow_frozen_update=False
-                )
-
-                train_eval_stats = self.validate_geometry_only(train_loader, old_class_count=0)
-                val_stats = self.validate_geometry_only(val_loader, old_class_count=0)
+            train_stats = self._train_epoch(
+                train_loader,
+                optimizer,
+                trainable,
+                phase_class_ids,
+                epoch=epoch,
+                geometry_weight=
+                    geometry_weight,
+            )
+            if scheduler is not None:
                 scheduler.step()
 
-                base_stats = getattr(self, "_last_base_stats", {})
-                geom_stats = self._base_geometry_global_metrics()
-                epoch_cert = self.compute_base_certificate(
+            validation_metrics: Dict[
+                str,
+                Any,
+            ] = {}
+            should_evaluate = (
+                (epoch + 1) % eval_every == 0
+                or epoch == epochs - 1
+            )
+            if (
+                should_evaluate
+                and geometry_contract_ready
+            ):
+                train_payload = (
+                    self._collect_payload(
+                        train_eval_loader
+                    )
+                )
+                val_payload = (
+                    self._collect_payload(
+                        val_loader
+                    )
+                )
+                rows = self._full_temporary_rows(
+                    train_payload,
                     phase_class_ids,
-                    val_stats=val_stats,
-                    train_stats=train_eval_stats,
-                    head_train_acc=head_train_acc,
                 )
-
-                history["train_loss"].append(float(tr_loss))
-                history["train_acc"].append(float(train_eval_stats["acc"]))
-                history["val_loss"].append(float(val_stats["loss"]))
-                history["val_acc"].append(float(val_stats["acc"]))
-                history["val_old_acc"].append(float(val_stats.get("old_acc", 0.0)))
-                history["val_new_acc"].append(float(val_stats.get("new_acc", 0.0)))
-                history["val_hm"].append(float(val_stats.get("hm", 0.0)))
-
-                for k in (
-                    "ce", "srpgr", "compact_sep", "gics", "weighted_gics",
-                    "energy_margin", "energy_margin_weighted", "energy_margin_violation", "energy_margin_gap",
-                    "gics_anchors", "gics_pos", "pgr", "pgr_unweighted",
-                    "pgr_compact", "pgr_center", "pgr_subspace", "pgr_band", "pgr_volume",
-                    "pgr_valid_class_count", "pgr_subspace_pair_count", "pgr_band_pair_count", "pgr_volume_factor",
-                    "pgr_subspace_max_overlap", "pgr_band_max_similarity", "pgr_band_guided_conflict_mean", "pgr_band_guided_conflict_max",
-                    "spectral_shape", "spectral_shape_raw", "spectral_shape_mean_similarity", "spectral_shape_pairs",
-                    "spectral_shape_guided_conflict_mean", "spectral_shape_guided_conflict_max", "spectral_active",
-                    "batch_compact", "batch_center_margin", "batch_min_center_margin",
-                ):
-                    history_key = f"base_{k}" if k not in {"batch_compact", "batch_center_margin", "batch_min_center_margin"} else k
-                    if history_key in history:
-                        history[history_key].append(float(base_stats.get(k, 0.0)))
-
-                for k in ("feature_subspace_overlap", "band_overlap", "spectral_shape_overlap", "spectral_shape_similarity_mean", "spectral_shape_similarity_max", "geometry_conflict_mean", "geometry_conflict_max", "geometry_reserve_score"):
-                    history[k].append(float(geom_stats.get(k, 0.0)))
-
-                history["base_cert_geom_acc"].append(float(epoch_cert.get("geom_val_acc", 0.0)))
-                history["base_cert_min_reliability"].append(float(epoch_cert.get("min_reliability", 0.0)))
-                history["base_cert_max_subspace_overlap"].append(float(epoch_cert.get("max_subspace_overlap", 0.0)))
-                history["base_cert_max_band_similarity"].append(float(epoch_cert.get("max_band_similarity", 0.0)))
-                history["base_cert_max_spectral_shape_similarity"].append(float(epoch_cert.get("max_spectral_shape_similarity", 0.0)))
-                history["base_cert_max_geometry_conflict"].append(float(epoch_cert.get("max_geometry_conflict", 0.0)))
-                history["base_cert_max_band_guided_geometry_conflict"].append(float(epoch_cert.get("max_band_guided_geometry_conflict", 0.0)))
-                history["base_cert_max_spectral_guided_geometry_conflict"].append(float(epoch_cert.get("max_spectral_guided_geometry_conflict", 0.0)))
-                history["base_cert_valid"].append(1.0 if bool(epoch_cert.get("valid", False)) else 0.0)
-                history["base_replay_statistics"].append(self._jsonify(epoch_replay_stats))
-                replay_max_violation = max(
-                    (float(v.get("violation_rate", 0.0)) for v in epoch_replay_stats.values()),
-                    default=1.0,
+                validation_metrics = (
+                    self._score_with_rows(
+                        val_payload,
+                        phase_class_ids,
+                        rows,
+                    )
                 )
-                replay_min_margin_q05 = min(
-                    (float(v.get("margin_q05", 0.0)) for v in epoch_replay_stats.values()),
-                    default=0.0,
+                train_geometry = (
+                    self._score_with_rows(
+                        train_payload,
+                        phase_class_ids,
+                        rows,
+                    )
                 )
-                history["base_replay_max_violation"].append(replay_max_violation)
-                history["base_replay_min_margin_q05"].append(replay_min_margin_q05)
+                validation_metrics[
+                    "train_geometry_accuracy"
+                ] = train_geometry["accuracy"]
 
-                score_stats = dict(val_stats)
-                score_stats.update(geom_stats)
-                score_stats.update({f"cert_{k}": v for k, v in epoch_cert.items() if isinstance(v, (int, float, bool))})
-                score_stats["geometry_score"] = float(geom_stats.get("geometry_reserve_score", 0.0))
-                score_stats["base_energy_margin_violation"] = float(replay_max_violation)
-                score_stats["base_energy_margin_gap"] = float(replay_min_margin_q05)
-                score = self.compute_checkpoint_score(score_stats, geom_stats)
-                history["checkpoint_score"].append(float(score))
-
-                print(
-                    f"[Base Prep] Epoch {epoch + 1:03d}/{epochs} | "
-                    f"Loss={tr_loss:.4f} | HeadAcc={head_train_acc:.2f}% | "
-                    f"GeomTrain={train_eval_stats['acc']:.2f}% | GeomVal={val_stats['acc']:.2f}% | "
-                    f"CE={float(base_stats.get('ce', 0.0)):.4f} | "
-                    f"EnergyMargin={float(base_stats.get('energy_margin_weighted', 0.0)):.4f} | "
-                    f"EViol={float(base_stats.get('energy_margin_violation', 0.0)):.3f} | "
-                    f"EGap={float(base_stats.get('energy_margin_gap', 0.0)):.4f} | "
-                    f"ReplayViolMax={float(replay_max_violation):.3f} | "
-                    f"ReplayQ05Min={float(replay_min_margin_q05):.4f} | "
-                    f"Compact={float(base_stats.get('pgr_compact', 0.0)):.4f} | "
-                    f"Sep={float(base_stats.get('pgr_center', 0.0)):.4f} | "
-                    f"Subspace={float(base_stats.get('pgr_subspace', 0.0)):.4f} | "
-                    f"Band={float(base_stats.get('pgr_band', 0.0)):.4f} | "
-                    f"Volume={float(base_stats.get('pgr_volume', 0.0)):.4f} | "
-                    f"SpecShape={float(base_stats.get('spectral_shape', 0.0)):.4f} | "
-                    f"PGRSubMax={float(base_stats.get('pgr_subspace_max_overlap', 0.0)):.4f} | "
-                    f"PGRBandMax={float(base_stats.get('pgr_band_max_similarity', 0.0)):.4f} | "
-                    f"PGRBandGuide={float(base_stats.get('pgr_band_guided_conflict_max', 0.0)):.4f} | "
-                    f"SpecGuide={float(base_stats.get('spectral_shape_guided_conflict_max', 0.0)):.4f} | "
-                    f"OverlapMax={float(epoch_cert.get('max_subspace_overlap', 0.0)):.4f} | "
-                    f"ConflictMax={float(epoch_cert.get('max_geometry_conflict', 0.0)):.4f} | "
-                    f"GuidedMax={max(float(epoch_cert.get('max_band_guided_geometry_conflict', 0.0)), float(epoch_cert.get('max_spectral_guided_geometry_conflict', 0.0))):.4f} | "
-                    f"Reserve={float(epoch_cert.get('geometry_reserve_score', 0.0)):.4f} | "
-                    f"Score={float(score):.4f} | State={'PASS' if bool(epoch_cert.get('valid', False)) else 'CONFLICT'}"
+                accuracy = float(
+                    validation_metrics[
+                        "accuracy"
+                    ]
                 )
-
-                # Checkpoint selection is geometry-health aware.  Accuracy is
-                # optimized only after valid replay rows and an acceptable real
-                # margin-violation rate are established.  Raw energy-gap growth
-                # is only a saturated scalar tie-breaker.
-                cert_priority = 1 if bool(epoch_cert.get("valid", False)) else 0
-                violation = float(replay_max_violation)
-                violation_ok = 1 if violation <= self._base_cfg_float("base_checkpoint_max_energy_violation", 0.02) else 0
-                guided = max(
-                    float(epoch_cert.get("max_band_guided_geometry_conflict", 0.0)),
-                    float(epoch_cert.get("max_spectral_guided_geometry_conflict", 0.0)),
+                q05 = float(
+                    validation_metrics[
+                        "q05_gap"
+                    ]
                 )
-                candidate_key = (
-                    cert_priority,
-                    violation_ok,
-                    float(val_stats.get("acc", 0.0)),
-                    -guided,
-                    -float(epoch_cert.get("max_geometry_conflict", 0.0)),
-                    -float(epoch_cert.get("max_subspace_overlap", 0.0)),
-                    float(score),
+                min_class = float(
+                    validation_metrics[
+                        "minimum_per_class_accuracy"
+                    ]
                 )
-                if candidate_key > best_key:
-                    best_key = candidate_key
-                    best_score = float(score)
-                    best_state = self._capture_state()
-                    best_epoch_cert = dict(epoch_cert)
-                    no_improve = 0
+                improved = (
+                    accuracy > best_accuracy + 1e-12
+                    or (
+                        abs(
+                            accuracy - best_accuracy
+                        ) <= 1e-12
+                        and q05 > best_q05 + 1e-12
+                    )
+                    or (
+                        abs(
+                            accuracy - best_accuracy
+                        ) <= 1e-12
+                        and abs(
+                            q05 - best_q05
+                        ) <= 1e-12
+                        and min_class > best_min_class
+                    )
+                )
+                if improved:
+                    best_accuracy = accuracy
+                    best_q05 = q05
+                    best_min_class = min_class
+                    best_epoch = epoch
+                    best_state = copy.deepcopy(
+                        self.model.state_dict()
+                    )
+                    stale_evaluations = 0
                 else:
-                    no_improve += 1
+                    stale_evaluations += 1
 
-                if self.early_stop_patience > 0 and no_improve >= self.early_stop_patience:
-                    print(f"[EarlyStop] Base phase: no improvement for {no_improve} epochs.")
-                    break
-
-            if best_state is not None:
-                self.model.load_state_dict(best_state)
-                self._set_model_phase_and_old_count(phase, 0)
-                if isinstance(best_epoch_cert, dict):
-                    self._best_base_epoch_certificate = best_epoch_cert
-                    print(
-                        "[Base] Restored state-aware best state | "
-                        f"State={'PASS' if bool(best_epoch_cert.get('valid', False)) else 'CONFLICT'} | "
-                        f"Score={best_score:.4f}"
-                    )
-
-            print("[Base] Final replay-ready GeometryBank rebuild from restored best canonical z-space.")
-            # Do not call the generic finalizer here: it rebuilds and freezes in
-            # one operation, which would leave class-local zero energy/margin
-            # quantiles.  Build first, measure the complete rival field, then
-            # freeze the finished replay rows.
-            self.rebuild_base_geometry_bank(phase, phase_class_ids, split="train")
-            final_replay_stats = self._update_base_replay_statistics(
-                train_loader, phase_class_ids, allow_frozen_update=False
+            history["train"].append(
+                {
+                    "epoch": epoch + 1,
+                    "geometry_weight":
+                        geometry_weight,
+                    "learning_rate":
+                        float(
+                            optimizer.param_groups[0][
+                                "lr"
+                            ]
+                        ),
+                    **train_stats,
+                }
             )
-            history["final_base_replay_statistics"] = self._jsonify(final_replay_stats)
-            if hasattr(self.dataset, "finalize_phase"):
-                self.dataset.finalize_phase(phase)
-            # Remain in phase-0 mode until the handoff assertion promotes the
-            # committed base rows to the old set for phase 1.
-            self.model.current_phase = 0
-            self._assert_base_bank_valid(phase_class_ids)
+            history["validation"].append(
+                {
+                    "epoch": epoch + 1,
+                    **validation_metrics,
+                }
+            )
+            committed_count = int(
+                self.model.geometry_bank
+                .valid_mask().sum().item()
+            )
+            history[
+                "persistent_rows_during_training"
+            ].append(committed_count)
+            if committed_count != 0:
+                raise RuntimeError(
+                    "persistent class rows appeared during base optimization"
+                )
 
-            # Freeze only after feature geometry, spectral tangent coupling and
-            # aggregate replay quantiles are complete.
-            if hasattr(self.model, "assert_base_handoff_ready"):
-                self.model.assert_base_handoff_ready(phase_class_ids, freeze=True, strict=True)
-            elif hasattr(self.model, "geometry_bank"):
-                gb = self.model.geometry_bank
-                if hasattr(gb, "assert_phase0_base_handoff_ready"):
-                    gb.assert_phase0_base_handoff_ready(phase_class_ids, freeze=True, strict=True)
-                elif hasattr(gb, "freeze_classes"):
-                    gb.freeze_classes(phase_class_ids)
-                elif hasattr(gb, "freeze_classes_up_to"):
-                    gb.freeze_classes_up_to(max(phase_class_ids) + 1)
-            self._assert_base_bank_valid(phase_class_ids)
-            self._print_base_geometry_diagnostics(phase_class_ids)
+            message = (
+                f"[Base] Epoch {epoch + 1:03d}/{epochs} | "
+                f"Loss={train_stats['total']:.4f} | "
+                f"CE={train_stats['ce']:.4f} | "
+                f"Geom={train_stats['geometry']:.4f} | "
+                f"GeomW={geometry_weight:.3f} | "
+                f"Head={100.0 * train_stats['head_accuracy']:.2f}%"
+            )
+            if geometry_weight > 0.0:
+                message += (
+                    f" | QueryGeom="
+                    f"{100.0 * train_stats['geometry_accuracy']:.2f}%"
+                    f" | GapQ05={train_stats['q05_gap']:.3f}"
+                )
+            if validation_metrics:
+                message += (
+                    f" | Val={validation_metrics['accuracy']:.2f}%"
+                    f" | ValQ05={validation_metrics['q05_gap']:.3f}"
+                    f" | ValMin="
+                    f"{validation_metrics['minimum_per_class_accuracy']:.2f}%"
+                )
+            message += (
+                f" | Rows={committed_count}"
+            )
+            print(message)
 
-            final_train_stats = self.validate_geometry_only(train_loader, old_class_count=0)
-            final_val_stats = self.validate_geometry_only(val_loader, old_class_count=0)
-            final_cert = self.compute_base_certificate(
+            if (
+                patience > 0
+                and geometry_contract_ready
+                and stale_evaluations >= patience
+            ):
+                print(
+                    "[Base early stop] no validation geometry improvement "
+                    f"for {stale_evaluations} evaluations"
+                )
+                break
+
+        # A CE-only experiment still needs a valid geometry contract before
+        # final handoff.
+        if not geometry_contract_ready:
+            contract_payload = (
+                self._collect_payload(
+                    train_eval_loader
+                )
+            )
+            history["geometry_contract"] = (
+                self._initialize_geometry_contract(
+                    contract_payload,
+                    phase_class_ids,
+                )
+            )
+            geometry_contract_ready = True
+            rows = self._full_temporary_rows(
+                contract_payload,
                 phase_class_ids,
-                val_stats=final_val_stats,
-                train_stats=final_train_stats,
-                head_train_acc=history["train_acc"][-1] if history.get("train_acc") else None,
             )
-            history["base_geometry_certificate"] = final_cert
-            self._enforce_base_geometry_certificate(final_cert)
-            base_handoff = self.finalize_base_handoff(phase_class_ids, final_cert, history)
-            history["base_handoff"] = base_handoff
-
-            run_persistent_diagnostics = self._base_cfg_bool("save_geometry_diagnostics", True) or self._base_cfg_bool("print_base_geometry_diagnostics", True)
-            if run_persistent_diagnostics and hasattr(self, "diagnose_full_base_geometry"):
-                try:
-                    self._last_base_geometry_diagnostics = self.diagnose_full_base_geometry(
-                        loader=val_loader,
-                        phase_class_ids=phase_class_ids,
-                        anchors_per_class=int(getattr(self.args, "geometry_diag_anchors_per_class", 64)),
-                        topk_pairs=int(getattr(self.args, "geometry_diag_topk_pairs", 20)),
-                        topk_bands=int(getattr(self.args, "geometry_diag_topk_bands", 5)),
-                    )
-                    if hasattr(self, "_print_geometry_diagnostics_summary"):
-                        self._print_geometry_diagnostics_summary(self._last_base_geometry_diagnostics)
-                    if hasattr(self, "_save_geometry_diagnostics_to_files"):
-                        saved_paths = self._save_geometry_diagnostics_to_files(self._last_base_geometry_diagnostics, phase=phase)
-                        print(f"[Geometry Health] saved diagnostics: {saved_paths.get('json', '')}")
-                except Exception as exc:
-                    print(f"[Geometry Health WARN] could not create persistent diagnostics: {exc}")
-
-            self._base_ce_head = None
-            if hasattr(self.model, "drop_base_ce_head"):
-                self.model.drop_base_ce_head()
-            self._assert_base_ce_head_discarded()
-            if hasattr(self, "save_checkpoint"):
-                self.save_checkpoint(phase, history)
-            print(
-                f"[Base Handoff] saved: {base_handoff.get('handoff_json_path')} | "
-                f"reserved_alignment_required={base_handoff.get('reserved_alignment_required')} | "
-                f"recommended_margin={float(base_handoff.get('recommended_insertion_margin', 0.0)):.3f}"
+            val_payload = self._collect_payload(
+                val_loader
             )
-            return history
-        finally:
-            if base_eval_state is not None:
-                self._restore_base_validation_mode(base_eval_state)
-            self.restore_runtime_state(incremental_runtime_state)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# from typing import Any, Dict, Iterable, Optional, Tuple, List
-
-# import copy
-# import json
-# import os
-# from contextlib import nullcontext
-
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import torch.optim as optim
-
-# from losses.loss import (
-#     unified_spectral_geometry_loss,
-#     base_center_overlap_diagnostics,
-#     spectral_shape_discrimination_loss,
-#     geometry_energy_matrix,
-# )
-
-
-
-
-# class BasePhaseTrainer:
-#     # ============================================================
-#     # Config helpers
-#     # ============================================================
-#     def _base_cfg_float(self, name: str, default: float) -> float:
-#         return float(getattr(self, name, getattr(self.args, name, default)))
-
-#     def _base_cfg_int(self, name: str, default: int) -> int:
-#         return int(getattr(self, name, getattr(self.args, name, default)))
-
-#     def _base_cfg_bool(self, name: str, default: bool) -> bool:
-#         v = getattr(self, name, getattr(self.args, name, default))
-#         if isinstance(v, str):
-#             return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-#         return bool(v)
-
-#     def _zero(self, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-#         if isinstance(ref, torch.Tensor):
-#             return ref.sum() * 0.0
-#         return torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
-#     def _enforce_base_contract(self) -> None:
-#         """Force a base-only training contract without poisoning incremental args.
-
-#         The previous version mutated shared ``args`` fields such as
-#         ``use_geometry_transport`` and ``eval_classifier_mode`` during base
-#         training. That is a silent architecture bug: after phase 0, the
-#         incremental trainer receives already-disabled transport/refinement flags.
-
-#         This method now applies only runtime model restrictions for phase 0. It
-#         keeps the command-line/incremental configuration intact, while ensuring
-#         that the base phase trains only backbone/projection + temporary CE head
-#         and builds a clean Low-Rank Geometry Replay + Residual Geometry Adaptation / GeometryBank handoff.
-#         """
-#         # Keep the method coherent: GICS/PGR/SpectralShape are internal parts of
-#         # SRPGR. Do not mutate shared args here. Legacy spectral-GICS knobs are
-#         # ignored by the cleaned base objective and must be controlled by the
-#         # loss-call kwargs, not by rewriting the global runtime configuration.
-
-#         if self._base_cfg_bool("use_mssl_loss", False) and self._base_cfg_float("mssl_weight", 0.0) > 0.0:
-#             if not self._base_cfg_bool("unsafe_ablation_use_mssl_loss", False):
-#                 raise RuntimeError(
-#                     "base trainer uses one coherent objective: CE + SRPGR. "
-#                     "MSSL must be a separate ablation, not mixed into the main method."
-#                 )
-
-#         # Runtime-only base restrictions. Do not mutate shared args here.
-#         for name, value in (
-#             ("use_incremental_adapter", False),
-#             ("use_bicyc_geometry_cycle", False),
-#             ("use_geometry_calibrator", False),
-#             ("use_sglat_transport", False),
-#             ("use_geometry_transport", False),
-#             ("allow_old_model_transport", False),
-#         ):
-#             if hasattr(self.model, name):
-#                 setattr(self.model, name, value)
-
-#         # Base representation learning uses CE + GICS + PGR (+ optional physical
-#         # spectral-shape loss inside losses.loss).  The classifier/certificate
-#         # must judge feature GeometryBank quality only; no spectral scoring
-#         # branch is allowed in the main classifier path.
-#         for attr in (
-#             "default_base_classifier_mode",
-#             "default_incremental_classifier_mode",
-#             "default_eval_classifier_mode",
-#         ):
-#             if hasattr(self.model, attr):
-#                 setattr(self.model, attr, "geometry_only")
-
-#         # Freeze adapters/calibrators for base without destroying the user's
-#         # incremental configuration.  The snapshot/restore guard below restores
-#         # runtime flags after phase 0.
-#         if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-#             self.model.freeze_geometry_plastic_adapter()
-#         elif hasattr(self.model, "disable_incremental_adapter"):
-#             self.model.disable_incremental_adapter()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-
-#         self._assert_mandatory_base_objective_config()
-
-
-#     def _assert_mandatory_base_objective_config(self) -> None:
-#         """Base phase has no optional architecture components.
-
-#         Phase 0 must always optimize the same canonical objective:
-#             balanced CE + GICS + PGR(compact, center, subspace, band, volume)
-#             + physical spectral-shape reserve when raw wavelength spectra exist.
-
-#         Spectral-shape derivatives cannot be forced when only PCA/reduced
-#         components are available. In that case the mandatory HSI reserve is the
-#         band-summary term. All other base terms are hard-required.
-#         """
-#         required_positive = {
-#             "base_ce_weight": self._base_cfg_float("base_ce_weight", 1.0),
-#             "base_srpgr_weight": self._base_cfg_float("base_srpgr_weight", 1.0),
-#             "base_gics_weight": self._base_cfg_float("base_gics_weight", 0.20),
-#             "base_energy_margin_weight": self._base_cfg_float("base_energy_margin_weight", 0.15),
-#             "base_energy_margin": self._base_cfg_float("base_energy_margin", 0.25),
-#             "pgr_weight": self._base_cfg_float("pgr_weight", 0.10),
-#             "pgr_compact_weight": self._base_cfg_float("pgr_compact_weight", 0.15),
-#             "pgr_center_weight": self._base_cfg_float("pgr_center_weight", 0.20),
-#             "pgr_subspace_weight": self._base_cfg_float("pgr_subspace_weight", 0.10),
-#             "pgr_band_weight": self._base_cfg_float("pgr_band_weight", 0.05),
-#             "pgr_volume_weight": self._base_cfg_float("pgr_volume_weight", 0.05),
-#             "base_gics_temperature": self._base_cfg_float("base_gics_temperature", 0.07),
-#             "pgr_center_margin": self._base_cfg_float("pgr_center_margin", 1.05),
-#             "pgr_max_class_variance": self._base_cfg_float("pgr_max_class_variance", 0.75),
-#             "pgr_min_class_variance": self._base_cfg_float("pgr_min_class_variance", 0.015),
-#             "pgr_max_subspace_overlap": self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-#         }
-#         bad = [f"{k}={v}" for k, v in required_positive.items() if float(v) <= 0.0]
-#         if bad:
-#             raise RuntimeError(
-#                 "Base phase has no optional core components. Required base weights/values must be > 0: "
-#                 + ", ".join(bad)
-#             )
-#         if self._base_cfg_int("pgr_subspace_rank", 3) <= 0:
-#             raise RuntimeError("pgr_subspace_rank must be > 0 because subspace reserve is mandatory.")
-#         if self._base_cfg_int("pgr_min_class_samples", 3) < 2:
-#             raise RuntimeError("pgr_min_class_samples must be >= 2 for compact/center reserve.")
-#         if self._base_cfg_int("pgr_subspace_min_samples", 6) < 3:
-#             raise RuntimeError("pgr_subspace_min_samples must be >= 3 for low-rank subspace reserve.")
-#         if not self._base_cfg_bool("base_class_balance", True):
-#             raise RuntimeError("base_class_balance must be true in the main base phase.")
-#         if unified_spectral_geometry_loss is None:
-#             raise RuntimeError("unified_spectral_geometry_loss is required for mandatory CE+GICS+PGR base training.")
-
-#     def _assert_mandatory_base_batch_inputs(
-#         self,
-#         *,
-#         features: torch.Tensor,
-#         labels_local: torch.Tensor,
-#         key_features: Optional[torch.Tensor],
-#         spectral_summary: Optional[torch.Tensor],
-#         band_summary: Optional[torch.Tensor],
-#     ) -> None:
-#         """Fail fast when a required base component cannot be computed."""
-#         if not torch.is_tensor(key_features) or key_features.shape != features.shape:
-#             raise RuntimeError(
-#                 "Mandatory GICS requires detached key_features with the same shape as query features. "
-#                 f"query={tuple(features.shape)}, key={None if key_features is None else tuple(key_features.shape)}"
-#             )
-#         if bool(key_features.requires_grad):
-#             raise RuntimeError("Mandatory GICS key_features must be detached; otherwise GICS becomes a second train path.")
-#         if not torch.is_tensor(spectral_summary) or spectral_summary.dim() != 2 or spectral_summary.size(0) != features.size(0):
-#             raise RuntimeError(
-#                 "Mandatory base HSI reserve requires spectral_summary [B,S] for band/PGR construction. "
-#                 f"got {None if spectral_summary is None else tuple(spectral_summary.shape)}"
-#             )
-#         if not torch.is_tensor(band_summary) or band_summary.dim() != 2 or band_summary.size(0) != features.size(0):
-#             raise RuntimeError(
-#                 "Mandatory PGR band reserve requires band_summary [B,S]. "
-#                 f"got {None if band_summary is None else tuple(band_summary.shape)}"
-#             )
-#         if band_summary.size(1) <= 0:
-#             raise RuntimeError("Mandatory PGR band reserve received zero spectral/band dimension.")
-#         if not torch.isfinite(spectral_summary).all() or not torch.isfinite(band_summary).all():
-#             raise RuntimeError("spectral_summary/band_summary contains NaN/Inf in mandatory base phase.")
-#         if labels_local.numel() != features.size(0):
-#             raise RuntimeError("labels/features batch mismatch in mandatory base objective.")
-#         if int(torch.unique(labels_local).numel()) < 2:
-#             raise RuntimeError(
-#                 "Mandatory GICS/PGR center reserve requires at least two classes in each base batch. "
-#                 "Use a class-balanced base sampler/batch construction."
-#             )
-
-#     def _assert_mandatory_base_loss_parts(self, loss_out: Dict[str, Any], *, spectral_summary_is_physical: bool) -> None:
-#         """Ensure the unified loss exposes every required base component."""
-#         required = (
-#             "total", "base_gics", "base_gics_weighted", "base_gics_anchors", "base_gics_pos",
-#             "base_pgr", "base_pgr_weighted", "base_compact", "base_center", "base_subspace",
-#             "base_band", "base_volume", "base_pgr_valid_class_count", "base_pgr_subspace_pair_count",
-#             "base_pgr_band_pair_count", "base_pgr_volume_factor", "base_spectral_shape_active",
-#             "base_pgr_subspace_max_overlap", "base_pgr_band_max_similarity",
-#             "base_pgr_band_guided_conflict_mean", "base_pgr_band_guided_conflict_max",
-#             "base_energy_margin", "base_energy_margin_weighted",
-#             "base_energy_margin_violation", "base_energy_margin_gap",
-#             "base_spectral_shape_raw", "base_spectral_shape_pair_count",
-#             "base_spectral_shape_guided_conflict_mean", "base_spectral_shape_guided_conflict_max",
-#         )
-#         missing = [k for k in required if k not in loss_out]
-#         if missing:
-#             raise RuntimeError("unified_spectral_geometry_loss did not return mandatory base keys: " + ", ".join(missing))
-#         for k in required:
-#             v = loss_out[k]
-#             if torch.is_tensor(v) and v.numel() > 0 and not torch.isfinite(v).all():
-#                 raise RuntimeError(f"mandatory base loss component {k} contains NaN/Inf.")
-#         if self._scalar(loss_out.get("base_gics_anchors", 0.0)) <= 0.0:
-#             raise RuntimeError("Mandatory GICS has zero valid anchors. Fix base batch construction/key view.")
-#         if self._scalar(loss_out.get("base_pgr_valid_class_count", 0.0)) <= 0.0:
-#             raise RuntimeError("Mandatory PGR has zero valid class groups in this batch.")
-#         if self._base_cfg_bool("base_require_physical_spectral_shape", False) and not bool(spectral_summary_is_physical):
-#             raise RuntimeError(
-#                 "base_require_physical_spectral_shape=true but this batch is not marked physical. "
-#                 "Provide raw wavelength-ordered center spectra or disable this strict raw-spectrum requirement."
-#             )
-
-#     def _assert_mandatory_base_epoch_coverage(self, stats: Dict[str, float]) -> None:
-#         """Check that required base terms were structurally active over the epoch."""
-#         if not self._base_cfg_bool("strict_base_component_coverage", True):
-#             return
-#         failures: List[str] = []
-#         if float(stats.get("gics_anchors", 0.0)) <= 0.0:
-#             failures.append("GICS valid anchors were zero")
-#         if float(stats.get("pgr_valid_class_count", 0.0)) <= 0.0:
-#             failures.append("PGR valid class count was zero")
-#         if float(stats.get("pgr_subspace_pair_count", 0.0)) <= 0.0:
-#             failures.append("PGR subspace pair count was zero; subspace reserve was not exercised")
-#         if float(stats.get("pgr_band_pair_count", 0.0)) <= 0.0:
-#             failures.append("PGR band pair count was zero; band reserve was not exercised")
-#         if float(stats.get("pgr_volume_factor", 0.0)) <= 0.0:
-#             failures.append("PGR volume factor was zero; volume reserve was not exercised")
-#         if self._base_cfg_bool("base_require_physical_spectral_shape", False) and float(stats.get("spectral_active", 0.0)) <= 0.0:
-#             failures.append("physical spectral-shape reserve was required but never active")
-#         if failures:
-#             raise RuntimeError(
-#                 "Mandatory base objective coverage failed. This usually means the base sampler/batch composition "
-#                 "does not provide enough same-class and cross-class evidence. " + "; ".join(failures)
-#             )
-
-#     def _capture_incremental_runtime_flags(self) -> Dict[str, Any]:
-#         """Snapshot args/model fields that base training must not destroy."""
-#         keys = (
-#             "use_sglat_transport",
-#             "use_geometry_transport",
-#             "allow_old_model_transport",
-#             "eval_classifier_mode",
-#             "incremental_classifier_mode",
-#             "base_classifier_mode",
-#             "use_incremental_adapter",
-#             "use_bicyc_geometry_cycle",
-#             "use_geometry_calibrator",
-#             "use_energy_calibrator",
-#             "use_geometry_gated_adapter",
-#             "incremental_update_mode",
-#             "base_gics_spectral_weight",
-#             "base_gics_band_weight",
-#             "base_gics_spectral_temperature",
-#             "base_gics_band_temperature",
-#         )
-#         state: Dict[str, Any] = {"args": {}, "model": {}}
-#         for key in keys:
-#             if hasattr(self.args, key):
-#                 state["args"][key] = getattr(self.args, key)
-#             if hasattr(self.model, key):
-#                 state["model"][key] = getattr(self.model, key)
-#         for key in ("default_eval_classifier_mode", "default_incremental_classifier_mode", "default_base_classifier_mode"):
-#             if hasattr(self.model, key):
-#                 state["model"][key] = getattr(self.model, key)
-#         return state
-
-#     def _restore_incremental_runtime_flags(self, state: Optional[Dict[str, Any]]) -> None:
-#         """Restore user-requested incremental flags after base phase."""
-#         if not isinstance(state, dict):
-#             return
-#         for key, value in state.get("args", {}).items():
-#             try:
-#                 setattr(self.args, key, value)
-#             except Exception:
-#                 pass
-#         for key, value in state.get("model", {}).items():
-#             try:
-#                 setattr(self.model, key, value)
-#             except Exception:
-#                 pass
-#         # NECIL-HSI incremental/replay scoring should remain feature-only unless
-#         # the user explicitly configured otherwise.
-#         if not hasattr(self.args, "incremental_classifier_mode") and hasattr(self.model, "default_incremental_classifier_mode"):
-#             self.model.default_incremental_classifier_mode = "geometry_only"
-#         if not hasattr(self.args, "eval_classifier_mode") and hasattr(self.model, "default_eval_classifier_mode"):
-#             self.model.default_eval_classifier_mode = "geometry_only"
-#         self._assert_runtime_state_restored(state)
-
-#     def _force_base_validation_geometry_only(self) -> Dict[str, Any]:
-#         """Temporarily make validation/certificate measure feature geometry.
-
-#         Base CE/SRPGR can use physical spectra, but the incremental phase consumes
-#         GeometryBank rows mostly through geometry-only replay/admission. A base
-#         certificate based on spectral scoring can hide a dirty feature
-#         geometry field. This guard makes validation honest.
-#         """
-#         state: Dict[str, Any] = {"args_eval": None, "model_eval": None}
-#         if hasattr(self.args, "eval_classifier_mode"):
-#             state["args_eval"] = getattr(self.args, "eval_classifier_mode")
-#             setattr(self.args, "eval_classifier_mode", "geometry_only")
-#         if hasattr(self.model, "default_eval_classifier_mode"):
-#             state["model_eval"] = getattr(self.model, "default_eval_classifier_mode")
-#             self.model.default_eval_classifier_mode = "geometry_only"
-#         return state
-
-#     def _restore_base_validation_mode(self, state: Optional[Dict[str, Any]]) -> None:
-#         if not isinstance(state, dict):
-#             return
-#         if state.get("args_eval", None) is not None and hasattr(self.args, "eval_classifier_mode"):
-#             setattr(self.args, "eval_classifier_mode", state["args_eval"])
-#         if state.get("model_eval", None) is not None and hasattr(self.model, "default_eval_classifier_mode"):
-#             self.model.default_eval_classifier_mode = state["model_eval"]
-
-#     def _set_base_trainability(self, base_head: nn.Module) -> None:
-#         """
-#         Base phase should train representation + temporary CE head only.
-
-#         It must not train geometry classifier/calibrator/adapters. The bank is
-#         rebuilt from z after updates; it is not a trainable memory module.
-#         """
-#         self._enforce_base_contract()
-#         blocked_prefixes = (
-#             "classifier.",
-#             "geometry_bank.",
-#             "geometry_calibrator.",
-#             "geometry_cycle_calibrator.",
-#             "incremental_adapter.",
-#             "geometry_plastic_adapter.",
-#             "base_ce_head.",
-#         )
-#         blocked_keywords = ("bicyc", "transport", "calibrator")
-#         for name, p in self.model.named_parameters():
-#             lname = name.lower()
-#             blocked = name.startswith(blocked_prefixes) or any(k in lname for k in blocked_keywords)
-#             p.requires_grad = not blocked
-
-#         for p in base_head.parameters():
-#             p.requires_grad = True
-
-#         if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-#             self.model.freeze_geometry_plastic_adapter()
-#         elif hasattr(self.model, "disable_incremental_adapter"):
-#             self.model.disable_incremental_adapter()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-
-#     def _base_trainable_parameters(self, base_head: nn.Module) -> list[nn.Parameter]:
-#         params = [p for p in self.model.parameters() if p.requires_grad]
-#         params.extend([p for p in base_head.parameters() if p.requires_grad])
-#         # deduplicate in case a future model stores the same head internally
-#         unique: list[nn.Parameter] = []
-#         seen = set()
-#         for p in params:
-#             pid = id(p)
-#             if pid not in seen:
-#                 unique.append(p)
-#                 seen.add(pid)
-#         if not unique:
-#             raise RuntimeError("No trainable parameters found for base phase.")
-#         return unique
-
-#     # ============================================================
-#     # Label mapping / base head
-#     # ============================================================
-#     def _build_base_label_map(self, phase_class_ids: Iterable[int]) -> Dict[int, int]:
-#         return {int(c): i for i, c in enumerate([int(x) for x in phase_class_ids])}
-
-#     def _labels_to_local(self, labels: torch.Tensor, label_map: Dict[int, int]) -> torch.Tensor:
-#         labels = labels.long().view(-1)
-#         local = torch.full_like(labels, -1)
-#         for global_cls, local_cls in label_map.items():
-#             local[labels == int(global_cls)] = int(local_cls)
-#         if (local < 0).any():
-#             bad = labels[local < 0].detach().cpu().unique().tolist()
-#             raise RuntimeError(f"Base batch contains labels outside phase-0 classes: {bad}")
-#         return local
-
-#     def _extract_feature_dim(self, train_loader) -> int:
-#         was_training = bool(self.model.training)
-#         self.model.eval()
-#         with torch.no_grad():
-#             for batch in train_loader:
-#                 x, _, _, _ = self._unpack_hsi_batch(batch)
-#                 x = x.float().to(self.device, non_blocking=True)
-#                 out = self._call_extract_projected_features(x)
-#                 features = out["features"]
-#                 if features.dim() != 2:
-#                     raise RuntimeError(f"Projected features must be [B,D], got {tuple(features.shape)}")
-#                 if was_training:
-#                     self.model.train()
-#                 return int(features.size(1))
-#         if was_training:
-#             self.model.train()
-#         raise RuntimeError("Cannot infer projected feature dimension: train_loader is empty.")
-
-#     def _make_base_ce_head(self, feature_dim: int, num_base_classes: int) -> nn.Module:
-#         head = nn.Linear(int(feature_dim), int(num_base_classes), bias=True).to(self.device)
-#         nn.init.normal_(head.weight, mean=0.0, std=0.01)
-#         nn.init.zeros_(head.bias)
-#         return head
-
-#     def _batch_balanced_ce(self, logits: torch.Tensor, labels_local: torch.Tensor, num_classes: int) -> torch.Tensor:
-#         label_smoothing = self._base_cfg_float("label_smoothing", 0.0)
-#         use_balance = self._base_cfg_bool("base_class_balance", True)
-#         if not use_balance:
-#             return F.cross_entropy(logits, labels_local, label_smoothing=label_smoothing)
-
-#         counts = torch.bincount(labels_local, minlength=int(num_classes)).float().to(logits.device)
-#         weights = torch.zeros_like(counts)
-#         valid = counts > 0
-#         weights[valid] = 1.0 / counts[valid].sqrt().clamp_min(1.0)
-#         weights = weights / weights[valid].mean().clamp_min(1e-6)
-#         return F.cross_entropy(logits, labels_local, weight=weights, label_smoothing=label_smoothing)
-
-#     # ============================================================
-#     # GICS key view
-#     # ============================================================
-#     def _augment_gics_key_view(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Mild HSI-safe augmentation for the detached key branch.
-
-#         Default is identity. Do not use aggressive band dropping; PCA/band axes
-#         carry material information and corrupting them makes GICS learn nonsense.
-#         """
-#         if x is None or not torch.is_tensor(x) or x.numel() == 0:
-#             return x
-
-#         x_key = x.clone()
-#         noise_std = self._base_cfg_float("base_gics_key_noise_std", 0.0)
-#         scale_jitter = self._base_cfg_float("base_gics_key_scale_jitter", 0.0)
-#         band_drop = self._base_cfg_float("base_gics_key_band_drop", 0.0)
-#         spatial_drop = self._base_cfg_float("base_gics_key_spatial_drop", 0.0)
-
-#         if noise_std > 0.0:
-#             x_key = x_key + torch.randn_like(x_key) * float(noise_std)
-
-#         if scale_jitter > 0.0:
-#             shape = [x_key.size(0)] + [1] * (x_key.dim() - 1)
-#             scale = 1.0 + float(scale_jitter) * torch.randn(shape, device=x_key.device, dtype=x_key.dtype)
-#             x_key = x_key * scale
-
-#         if band_drop > 0.0 and x_key.dim() >= 4 and x_key.size(1) > 1:
-#             keep = (torch.rand(x_key.size(0), x_key.size(1), 1, 1, device=x_key.device) > float(band_drop)).to(x_key.dtype)
-#             all_zero = keep.flatten(1).sum(dim=1) <= 0
-#             if bool(all_zero.any().item()):
-#                 keep[all_zero, 0, 0, 0] = 1.0
-#             x_key = x_key * keep
-
-#         if spatial_drop > 0.0 and x_key.dim() >= 4 and x_key.size(-2) > 1 and x_key.size(-1) > 1:
-#             smask = (torch.rand(x_key.size(0), 1, x_key.size(-2), x_key.size(-1), device=x_key.device) > float(spatial_drop)).to(x_key.dtype)
-#             x_key = x_key * smask
-
-#         return x_key
-
-#     @staticmethod
-#     def _band_summary_from_spectral(spectral_summary: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-#         """Fallback band signature used only when the model did not expose band_summary.
-
-#         The updated NECILModel should normally provide center-pixel band_summary.
-#         This fallback is intentionally conservative: signed/PCA-like vectors are
-#         converted by softmax, non-negative rows are sum-normalized, and degenerate
-#         rows become uniform.  It is a reliability/geometry-conflict signal, not classifier input.
-#         """
-#         if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-#             return None
-#         if spectral_summary.dim() != 2 or spectral_summary.size(1) <= 0:
-#             return None
-#         s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#         if bool((s < 0).any().item()):
-#             return torch.softmax(s, dim=1)
-#         b = s.clamp_min(0.0)
-#         denom = b.sum(dim=1, keepdim=True)
-#         uniform = torch.full_like(b, 1.0 / float(max(int(b.size(1)), 1)))
-#         return torch.where(denom > 1e-8, b / denom.clamp_min(1e-8), uniform)
-
-
-#     def _select_srpgr_band_summary(
-#         self,
-#         *,
-#         spectral_summary: Optional[torch.Tensor],
-#         band_summary: Optional[torch.Tensor],
-#         spectral_summary_is_physical: bool,
-#         x: Optional[torch.Tensor] = None,
-#     ) -> Optional[torch.Tensor]:
-#         """Select the band descriptor used by PGR.
-
-#         In reduced-band experiments, the model input is PCA/reduced channels
-#         while the dataloader may also provide raw wavelength-ordered spectra.
-#         The base GeometryBank certificate checks physical band/spectral overlap,
-#         so the PGR band reserve must operate on the physical spectrum whenever it
-#         is available.  A 30-D PCA vector must not compete with a 200-D physical
-#         descriptor.
-#         """
-#         if (
-#             torch.is_tensor(spectral_summary)
-#             and spectral_summary.dim() == 2
-#             and spectral_summary.numel() > 0
-#             and bool(spectral_summary_is_physical)
-#         ):
-#             return spectral_summary
-
-#         # If band_summary and spectral_summary disagree in dimensionality, prefer
-#         # the one that matches the physical/reliability source.  With PCA input
-#         # this avoids passing a reduced component vector into a physical-band
-#         # reserve by accident.
-#         if (
-#             torch.is_tensor(band_summary)
-#             and torch.is_tensor(spectral_summary)
-#             and band_summary.dim() == 2
-#             and spectral_summary.dim() == 2
-#             and band_summary.size(0) == spectral_summary.size(0)
-#             and band_summary.size(1) != spectral_summary.size(1)
-#         ):
-#             pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-#             uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-#             input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
-#             if uses_reduction and input_channels > 0 and band_summary.size(1) == input_channels:
-#                 return spectral_summary
-
-#         if torch.is_tensor(band_summary) and band_summary.dim() == 2 and band_summary.numel() > 0:
-#             return band_summary
-#         return self._band_summary_from_spectral(spectral_summary)
-
-#     def _base_spectral_summary_is_physical(self, explicit: Optional[bool] = None) -> bool:
-#         """Whether spectral_summary is wavelength-ordered raw HSI, not PCA.
-
-#         Spectral derivatives are physically meaningful only for ordered bands.
-#         If the pipeline uses PCA and no raw center spectra are supplied, this
-#         returns False and the spectral-shape part of SRPGR becomes a safe zero.
-#         """
-#         if explicit is not None:
-#             return bool(explicit)
-#         if hasattr(self.args, "base_spectral_summary_is_physical"):
-#             return self._base_cfg_bool("base_spectral_summary_is_physical", False)
-#         if hasattr(self.args, "spectral_summary_is_physical"):
-#             return self._base_cfg_bool("spectral_summary_is_physical", False)
-#         pca = int(getattr(self.args, "pca_components", 0) or 0)
-#         allow_nonphysical = self._base_cfg_bool("allow_nonphysical_spectral_summary", False)
-#         if pca > 0 and not allow_nonphysical:
-#             return False
-#         return self._base_cfg_bool("assume_input_spectral_order_is_physical", False)
-
-#     def _normalize_external_spectra(self, spectra: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
-#         """Return external spectra as [B,S] when the loader provides raw center spectra."""
-#         if spectra is None or not torch.is_tensor(spectra) or spectra.numel() == 0:
-#             return None
-#         s = spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
-#         if s.dim() == 4:
-#             # [B,S,H,W] raw cube: center pixel only.
-#             s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#         elif s.dim() == 3:
-#             # [B,S,L] raw/reduced spectral metadata: center token only. Flattening
-#             # would mix neighboring pixels into the class spectrum and poison
-#             # spectral-shape regularization.
-#             if s.size(0) == x.size(0) and s.size(1) > 0 and s.size(2) > 1:
-#                 s = s[:, :, s.size(-1) // 2]
-#             elif s.size(0) == x.size(0):
-#                 s = s.reshape(s.size(0), -1)
-#         elif s.dim() == 1:
-#             s = s.view(x.size(0), -1)
-#         elif s.dim() != 2:
-#             s = s.flatten(1)
-#         if s.size(0) != x.size(0):
-#             raise RuntimeError(f"External spectral summary batch mismatch: spectra={tuple(s.shape)}, x={tuple(x.shape)}")
-#         return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-
-#     @staticmethod
-#     def _center_spectrum_from_input(x: torch.Tensor) -> torch.Tensor:
-#         """Fallback center spectrum from model input. Usually PCA, so not physical by default."""
-#         if x.dim() == 4:
-#             return x[:, :, x.size(-2) // 2, x.size(-1) // 2]
-#         if x.dim() == 3:
-#             return x.flatten(1)
-#         if x.dim() == 2:
-#             return x
-#         return x.flatten(1)
-
-#     def _call_extract_projected_features(
-#         self,
-#         x: torch.Tensor,
-#         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Return canonical pre-adapter projected z for base phase.
-
-#         Base GeometryBank rows must be built from the same canonical z-space used
-#         by CE/GICS/PGR.  If NECILModel exposes an explicit canonical extractor,
-#         prefer it so the geometry-plastic adapter can never leak into phase 0.
-#         """
-#         physical = self._base_spectral_summary_is_physical(spectral_summary_is_physical)
-#         if hasattr(self.model, "extract_canonical_projected_features"):
-#             return self.model.extract_canonical_projected_features(
-#                 x,
-#                 spectral_summary=spectral_summary,
-#                 spectral_summary_is_physical=physical,
-#             )
-#         try:
-#             out = self.model.extract_projected_features(
-#                 x,
-#                 spectral_summary=spectral_summary,
-#                 spectral_summary_is_physical=physical,
-#             )
-#         except TypeError:
-#             out = self.model.extract_projected_features(x)
-#         # Backward compatibility with models that return both canonical and
-#         # adapted features: force the canonical tensors into the public keys.
-#         if isinstance(out, dict) and torch.is_tensor(out.get("canonical_projected_features", None)):
-#             out = dict(out)
-#             z = out["canonical_projected_features"]
-#             out["features"] = z
-#             out["projected_features"] = z
-#         elif isinstance(out, dict) and torch.is_tensor(out.get("canonical_features", None)):
-#             out = dict(out)
-#             z = out["canonical_features"]
-#             out["features"] = z
-#             out["projected_features"] = z
-#         return out
-
-#     def _base_spectral_shape_regularizer(
-#         self,
-#         *,
-#         features: torch.Tensor,
-#         labels: torch.Tensor,
-#         spectral_summary: Optional[torch.Tensor],
-#         spectral_summary_is_physical: bool,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Spectral-shape component of SRPGR.
-
-#         This is a safe no-op unless physical raw spectra are available and the
-#         Low-Rank Geometry Replay + Residual Geometry Adaptation loss file exposes spectral_shape_discrimination_loss.
-#         """
-#         if spectral_shape_discrimination_loss is None:
-#             z = self._zero(features)
-#             return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-#         weight = self._base_cfg_float("base_spectral_shape_weight", 0.05)
-#         if weight <= 0.0:
-#             z = self._zero(features)
-#             return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-#         parts = spectral_shape_discrimination_loss(
-#             spectral_summary=spectral_summary,
-#             labels=labels,
-#             features=features,
-#             spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#             require_physical_summary=self._base_cfg_bool("spectral_require_physical_summary", True),
-#             min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#             max_shape_similarity=self._base_cfg_float("base_max_spectral_shape_similarity", 0.75),
-#             risk_center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-#             risk_weight=self._base_cfg_float("base_spectral_shape_risk_weight", 1.0),
-#             return_parts=True,
-#         )
-#         if not isinstance(parts, dict):
-#             parts = {"total": parts, "spectral_shape": parts.detach()}
-#         raw_total = parts.get("total", self._zero(features))
-#         parts["raw_total"] = raw_total.detach()
-#         parts["total"] = float(weight) * raw_total
-#         return parts
-
-#     def _extract_base_views(
-#         self,
-#         x: torch.Tensor,
-#         external_spectra: Optional[torch.Tensor] = None,
-#     ) -> Tuple[
-#         torch.Tensor,
-#         Optional[torch.Tensor],
-#         Optional[torch.Tensor],
-#         torch.Tensor,
-#         Optional[torch.Tensor],
-#         Optional[torch.Tensor],
-#         bool,
-#     ]:
-#         """Return query/key views for CE + unified SRPGR.
-
-#         The spectral summary is physical only when raw wavelength-ordered spectra
-#         are supplied by the dataloader. If the model input is PCA, the fallback
-#         center vector may still be used for band diagnostics, but not for
-#         spectral-shape derivatives.
-#         """
-#         ext_s = self._normalize_external_spectra(external_spectra, x)
-#         if ext_s is not None:
-#             input_s = ext_s
-
-#             # Reduced-band safety rule.  If metadata spectra have the same
-#             # channel count as the model input while PCA/iPCA is active, they are
-#             # reduced components, not physical wavelength-ordered spectra.
-#             # Treat them as non-physical so SRPGR spectral-derivative terms are
-#             # gated off and the model never mixes 30-D band weights with 200-D
-#             # raw spectra.
-#             pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-#             uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-#             input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
-#             spectra_dim = int(input_s.size(1)) if torch.is_tensor(input_s) and input_s.dim() == 2 else 0
-#             reduced_metadata = bool(uses_reduction and input_channels > 0 and spectra_dim == input_channels)
-
-#             if reduced_metadata:
-#                 input_s_is_physical = False
-#             else:
-#                 input_s_is_physical = self._base_spectral_summary_is_physical(
-#                     self._base_cfg_bool("external_spectra_are_physical", True)
-#                 )
-#         else:
-#             input_s = self._center_spectrum_from_input(x)
-#             input_s_is_physical = self._base_spectral_summary_is_physical(None)
-
-#         out_q = self._call_extract_projected_features(
-#             x,
-#             spectral_summary=input_s,
-#             spectral_summary_is_physical=input_s_is_physical,
-#         )
-#         z_q = out_q["features"]
-#         if z_q.dim() != 2 or not torch.isfinite(z_q).all():
-#             raise RuntimeError(f"Invalid projected query features: {tuple(z_q.shape)}")
-#         if "projected_features" in out_q and torch.is_tensor(out_q["projected_features"]):
-#             if not torch.allclose(z_q, out_q["projected_features"], atol=1e-5, rtol=1e-4):
-#                 raise RuntimeError(
-#                     "Base feature-space mismatch: out['features'] and out['projected_features'] differ. "
-#                     "SRPGR/GeometryBank must all use the same canonical projected z-space."
-#                 )
-
-#         s_q = out_q.get("spectral_summary", None)
-#         if not (torch.is_tensor(s_q) and s_q.dim() == 2 and s_q.size(0) == x.size(0)):
-#             s_q = input_s
-#         spectral_flag = out_q.get("spectral_summary_is_physical", input_s_is_physical)
-#         if torch.is_tensor(spectral_flag):
-#             spectral_is_physical = bool(spectral_flag.detach().cpu().item())
-#         else:
-#             spectral_is_physical = bool(spectral_flag)
-#         b_q = out_q.get("band_summary", out_q.get("band_importance", None))
-#         if b_q is None:
-#             b_q = self._band_summary_from_spectral(s_q)
-
-#         x_key = self._augment_gics_key_view(x)
-#         # The key view uses the same spectral summary because physical spectral
-#         # identity belongs to the center pixel/label, not to the mild feature-view
-#         # augmentation. This avoids corrupting spectral-shape targets.
-#         was_training = bool(self.model.training)
-#         self.model.eval()
-#         with torch.no_grad():
-#             out_k = self._call_extract_projected_features(
-#                 x_key,
-#                 spectral_summary=input_s,
-#                 spectral_summary_is_physical=spectral_is_physical,
-#             )
-#         if was_training:
-#             self.model.train()
-
-#         z_k = out_k["features"].detach()
-#         if "projected_features" in out_k and torch.is_tensor(out_k["projected_features"]):
-#             if not torch.allclose(out_k["features"], out_k["projected_features"], atol=1e-5, rtol=1e-4):
-#                 raise RuntimeError("SRPGR key branch is not in canonical projected z-space.")
-#         s_k = out_k.get("spectral_summary", None)
-#         if not (torch.is_tensor(s_k) and s_k.dim() == 2 and s_k.size(0) == x.size(0)):
-#             s_k = s_q
-#         b_k = out_k.get("band_summary", out_k.get("band_importance", None))
-#         if b_k is None:
-#             b_k = self._band_summary_from_spectral(s_k)
-#         if torch.is_tensor(s_k):
-#             s_k = s_k.detach()
-#         if torch.is_tensor(b_k):
-#             b_k = b_k.detach()
-
-#         if z_k.shape != z_q.shape:
-#             raise RuntimeError(f"SRPGR key/query mismatch: query={tuple(z_q.shape)}, key={tuple(z_k.shape)}")
-#         if not torch.isfinite(z_k).all():
-#             raise RuntimeError("Projected key features contain NaN/Inf.")
-#         return z_q, s_q, b_q, z_k, s_k, b_k, spectral_is_physical
-
-#     @torch.no_grad()
-#     def _rebuild_base_geometry_bank_for_validation(
-#         self,
-#         phase: int,
-#         phase_class_ids: Iterable[int],
-#         *,
-#         split: str = "train",
-#     ) -> None:
-#         """Rebuild base GeometryBank rows from canonical z before geometry validation.
-
-#         Base validation uses the geometry-energy classifier, so the bank must be
-#         synchronized with the current representation every epoch. This method
-#         bypasses refresh_before_validation because base geometry validation is
-#         meaningless with stale or unbuilt rows.
-#         """
-#         if not hasattr(self, "_build_class_memory_from_current_phase"):
-#             raise AttributeError("TrainerHelper._build_class_memory_from_current_phase() is required.")
-#         old_training_state = bool(self.model.training)
-#         ctx = self.dataset.memory_build_context(int(phase)) if hasattr(self.dataset, "memory_build_context") else None
-#         if ctx is None:
-#             from contextlib import nullcontext
-#             ctx = nullcontext()
-#         with ctx:
-#             for cls in [int(c) for c in phase_class_ids]:
-#                 self._build_class_memory_from_current_phase(cls, split=split)
-#         self.model.train(old_training_state)
-
-#     # ============================================================
-#     # Diagnostics
-#     # ============================================================
-#     @torch.no_grad()
-#     def _base_geometry_global_metrics(self) -> Dict[str, float]:
-#         """Bank-level diagnostics for checkpoint scoring.
-
-#         Supports both the old bank name ``geometry_diagnostics`` and the cleaned
-#         descriptor bank name ``compute_geometry_diagnostics``.
-#         """
-#         gb = getattr(self.model, "geometry_bank", None)
-#         if gb is None:
-#             return {}
-#         try:
-#             if hasattr(gb, "compute_geometry_diagnostics"):
-#                 diag = gb.compute_geometry_diagnostics()
-#             elif hasattr(gb, "geometry_diagnostics"):
-#                 diag = gb.geometry_diagnostics()
-#             else:
-#                 diag = {}
-#         except Exception:
-#             diag = {}
-#         out: Dict[str, float] = {}
-#         aliases = {
-#             "feature_subspace_overlap": ("feature_subspace_overlap", "mean_subspace_overlap", "subspace_overlap_mean"),
-#             "band_overlap": ("band_overlap", "mean_band_similarity", "band_similarity_mean"),
-#             "spectral_shape_overlap": ("spectral_shape_overlap", "mean_spectral_similarity", "spectral_similarity_mean"),
-#             "spectral_shape_similarity_mean": ("spectral_shape_similarity_mean", "mean_spectral_similarity", "spectral_similarity_mean"),
-#             "spectral_shape_similarity_max": ("spectral_shape_similarity_max", "max_spectral_similarity", "spectral_similarity_max"),
-#             "geometry_conflict_mean": ("geometry_conflict_mean", "mean_geometry_conflict", "conflict_mean"),
-#             "geometry_conflict_max": ("geometry_conflict_max", "max_geometry_conflict", "conflict_max"),
-#             "geometry_reserve_score": ("geometry_reserve_score", "reserve_score"),
-#             "feature_rank_usage": ("feature_rank_usage", "rank_usage"),
-#         }
-#         for public_key, candidates in aliases.items():
-#             for key in candidates:
-#                 value = diag.get(key, None) if isinstance(diag, dict) else None
-#                 if torch.is_tensor(value) and value.numel() == 1:
-#                     out[public_key] = float(value.detach().cpu().item())
-#                     break
-#                 if isinstance(value, (int, float)):
-#                     out[public_key] = float(value)
-#                     break
-#         return out
-
-#     @staticmethod
-#     def _scalar(value: Any, default: float = 0.0) -> float:
-#         if torch.is_tensor(value):
-#             if value.numel() == 0:
-#                 return float(default)
-#             return float(value.detach().float().mean().cpu().item())
-#         if isinstance(value, (int, float)):
-#             return float(value)
-#         return float(default)
-
-#     @torch.no_grad()
-#     def _build_base_geometry_certificate(
-#         self,
-#         phase_class_ids: Iterable[int],
-#         *,
-#         val_stats: Optional[Dict[str, Any]] = None,
-#         train_stats: Optional[Dict[str, Any]] = None,
-#         head_train_acc: Optional[float] = None,
-#     ) -> Dict[str, Any]:
-#         """Create the base-to-incremental Low-Rank Geometry Replay + Residual Geometry Adaptation geometry certificate.
-
-#         Important semantic fix:
-#         raw band/spectral similarity is **not** a hard failure by itself.
-#         In HSI, two classes can be physically similar.  The base handoff is unsafe
-#         only when high physical similarity is accompanied by unsafe learned
-#         feature geometry.  Therefore the hard checks are geometry-energy and
-#         band/spectral-guided geometry conflict, not raw spectral similarity.
-#         """
-#         classes = [int(c) for c in phase_class_ids]
-#         cert: Dict[str, Any] = {
-#             "phase": 0,
-#             "class_ids": classes,
-#             "base_class_ids": classes,
-#             "num_base_classes": len(classes),
-#             "valid": False,
-#             "errors": [],
-#             "warnings": [],
-#         }
-#         if not classes:
-#             cert["errors"].append("no base classes")
-#             return cert
-
-#         try:
-#             self._assert_base_bank_valid(classes)
-#             bank = self._get_valid_base_bank(max(classes))
-#         except Exception as exc:
-#             cert["errors"].append(f"bank_invalid: {exc}")
-#             return cert
-
-#         idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-#         gb = getattr(self.model, "geometry_bank", None)
-#         counts = bank.get("sample_counts")
-#         ranks = bank.get("active_ranks")
-#         rel = bank.get("reliability")
-#         variances = bank.get("variances")
-#         means = bank.get("means")
-
-#         def _take(t: Optional[torch.Tensor], fill: float = 0.0) -> torch.Tensor:
-#             if not torch.is_tensor(t) or t.numel() <= int(idx.max().item()):
-#                 return torch.full((len(classes),), float(fill), device=self.device, dtype=torch.float32)
-#             return t.to(device=self.device).flatten().index_select(0, idx).float()
-
-#         count_v = _take(counts, 0.0)
-#         rank_v = _take(ranks, 0.0)
-#         rel_v = _take(rel, 0.0)
-#         if torch.is_tensor(variances) and variances.dim() == 2 and variances.size(0) > int(idx.max().item()):
-#             res_v = variances.to(device=self.device).index_select(0, idx)[:, -1].float()
-#             eig_v = variances.to(device=self.device).index_select(0, idx)[:, :-1].float()
-#         else:
-#             res_v = torch.zeros((len(classes),), device=self.device)
-#             eig_v = torch.zeros((len(classes), 0), device=self.device)
-
-#         center = self._pairwise_matrix_or_zeros(gb, ("pairwise_center_distance",), idx) if gb is not None else torch.zeros((len(classes), len(classes)), device=self.device)
-#         sub = self._pairwise_matrix_or_zeros(gb, ("pairwise_subspace_overlap",), idx) if gb is not None else torch.zeros_like(center)
-#         band = self._pairwise_matrix_or_zeros(gb, ("pairwise_band_similarity",), idx) if gb is not None else torch.zeros_like(center)
-#         spec = self._pairwise_matrix_or_zeros(gb, ("pairwise_spectral_similarity", "pairwise_spectral_shape_similarity"), idx) if gb is not None else torch.zeros_like(center)
-#         conflict = self._pairwise_matrix_or_zeros(gb, ("geometry_conflict_matrix",), idx) if gb is not None else torch.zeros_like(center)
-
-#         eye = torch.eye(len(classes), device=self.device, dtype=torch.bool)
-
-#         def _pair_mean_max(mat: torch.Tensor) -> Tuple[float, float, int]:
-#             if mat.numel() == 0 or mat.size(0) < 2:
-#                 return 0.0, 0.0, 0
-#             pair = mat[~eye]
-#             pair = pair[torch.isfinite(pair)]
-#             if pair.numel() == 0:
-#                 return 0.0, 0.0, 0
-#             return float(pair.mean().cpu().item()), float(pair.max().cpu().item()), int(pair.numel())
-
-#         center_mean, center_min = 0.0, 0.0
-#         if center.numel() > 0 and center.size(0) >= 2:
-#             pair_center = center[~eye]
-#             if pair_center.numel() > 0:
-#                 center_mean = float(pair_center.mean().cpu().item())
-#                 center_min = float(pair_center.min().cpu().item())
-
-#         sub_mean, sub_max, pair_count = _pair_mean_max(sub)
-#         band_mean, band_max, _ = _pair_mean_max(band)
-#         spec_mean, spec_max, spec_pair_count = _pair_mean_max(spec)
-#         conflict_mean, conflict_max, _ = _pair_mean_max(conflict)
-#         geom = self._base_geometry_global_metrics()
-
-#         # Thresholds.
-#         thr = {
-#             "min_geom_acc": self._base_cfg_float("base_cert_min_geom_acc", 95.0),
-#             "min_reliability": self._base_cfg_float("base_cert_min_reliability", 0.15),
-#             "min_mean_reliability": self._base_cfg_float("base_cert_min_mean_reliability", 0.35),
-
-#             # Strict subspace overlap is diagnostic only.  The handoff fails only
-#             # when overlap exceeds the warning cap or when energy/guided conflict fails.
-#             "max_subspace_overlap": self._base_cfg_float("base_cert_max_subspace_overlap", 0.55),
-#             "subspace_warn_overlap": self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72),
-
-#             "max_geometry_conflict": self._base_cfg_float("base_cert_max_geometry_conflict", 1.35),
-#             "max_band_similarity": self._base_cfg_float("base_cert_max_band_similarity", 0.90),
-#             "max_spectral_shape_similarity": self._base_cfg_float("base_cert_max_spectral_shape_similarity", 0.85),
-#             "max_guided_geometry_conflict": self._base_cfg_float("base_cert_max_guided_geometry_conflict", 0.18),
-#         }
-
-#         def _guided_conflict(raw_sim: torch.Tensor, raw_thr: float) -> torch.Tensor:
-#             """Hard physical-pair × unsafe learned-geometry pressure."""
-#             if raw_sim.numel() == 0:
-#                 return torch.zeros_like(raw_sim)
-#             raw_den = max(1.0 - float(raw_thr), 1e-6)
-#             hard_pair = F.relu(raw_sim.float() - float(raw_thr)) / raw_den
-
-#             sub_den = max(1.0 - float(thr["subspace_warn_overlap"]), 1e-6)
-#             sub_pressure = F.relu(sub.float() - float(thr["subspace_warn_overlap"])) / sub_den
-
-#             conf_den = max(float(thr["max_geometry_conflict"]), 1e-6)
-#             conflict_pressure = F.relu(conflict.float() - float(thr["max_geometry_conflict"])) / conf_den
-
-#             feature_pressure = torch.maximum(sub_pressure, conflict_pressure).clamp_min(0.0)
-#             guided = (hard_pair * feature_pressure).masked_fill(eye, 0.0)
-#             return torch.nan_to_num(guided, nan=0.0, posinf=1e3, neginf=0.0)
-
-#         band_guided = _guided_conflict(band, thr["max_band_similarity"])
-#         spec_guided = _guided_conflict(spec, thr["max_spectral_shape_similarity"])
-#         band_guided_mean, band_guided_max, _ = _pair_mean_max(band_guided)
-#         spec_guided_mean, spec_guided_max, _ = _pair_mean_max(spec_guided)
-
-#         cert.update({
-#             "feature_dim": int(means.size(1)) if torch.is_tensor(means) and means.dim() == 2 else int(getattr(self.model, "d_model", 0)),
-#             "geom_val_acc": float((val_stats or {}).get("acc", 0.0)),
-#             "geom_val_loss": float((val_stats or {}).get("loss", 0.0)),
-#             "geom_train_acc": float((train_stats or {}).get("acc", 0.0)),
-#             "head_train_acc": float(head_train_acc) if head_train_acc is not None else 0.0,
-#             "valid_geometry_rows": classes,
-#             "valid_row_count": int((count_v > 0).sum().detach().cpu().item()),
-#             "sample_counts": {int(c): float(count_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-#             "reliability": {int(c): float(rel_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-#             "active_rank": {int(c): int(rank_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-#             "residual_variance": {int(c): float(res_v[i].detach().cpu().item()) for i, c in enumerate(classes)},
-#             "eigenvalue_mean": {int(c): float(eig_v[i].mean().detach().cpu().item()) if eig_v.numel() else 0.0 for i, c in enumerate(classes)},
-#             "min_sample_count": float(count_v.min().detach().cpu().item()) if count_v.numel() else 0.0,
-#             "mean_sample_count": float(count_v.mean().detach().cpu().item()) if count_v.numel() else 0.0,
-#             "min_reliability": float(rel_v.min().detach().cpu().item()) if rel_v.numel() else 0.0,
-#             "mean_reliability": float(rel_v.mean().detach().cpu().item()) if rel_v.numel() else 0.0,
-#             "mean_active_rank": float(rank_v.mean().detach().cpu().item()) if rank_v.numel() else 0.0,
-#             "max_active_rank": float(rank_v.max().detach().cpu().item()) if rank_v.numel() else 0.0,
-#             "mean_res_var": float(res_v.mean().detach().cpu().item()) if res_v.numel() else 0.0,
-#             "max_res_var": float(res_v.max().detach().cpu().item()) if res_v.numel() else 0.0,
-#             "pair_count": pair_count,
-#             "mean_center_distance": center_mean,
-#             "min_center_distance": center_min,
-#             "mean_subspace_overlap": sub_mean,
-#             "max_subspace_overlap": sub_max,
-#             "mean_band_similarity": band_mean,
-#             "max_band_similarity": band_max,
-#             "mean_spectral_shape_similarity": spec_mean,
-#             "max_spectral_shape_similarity": spec_max,
-#             "spectral_shape_pair_count": spec_pair_count,
-#             "mean_geometry_conflict": conflict_mean,
-#             "max_geometry_conflict": conflict_max,
-#             "mean_band_guided_geometry_conflict": band_guided_mean,
-#             "max_band_guided_geometry_conflict": band_guided_max,
-#             "mean_spectral_guided_geometry_conflict": spec_guided_mean,
-#             "max_spectral_guided_geometry_conflict": spec_guided_max,
-#             "geometry_reserve_score": float(geom.get("geometry_reserve_score", max(0.0, 1.0 - conflict_max - max(band_guided_max, spec_guided_max)))),
-#             "feature_rank_usage": float(geom.get("feature_rank_usage", 0.0)),
-#             "center_distance_matrix": center.detach().cpu().tolist(),
-#             "subspace_overlap_matrix": sub.detach().cpu().tolist(),
-#             "band_similarity_matrix": band.detach().cpu().tolist(),
-#             "spectral_similarity_matrix": spec.detach().cpu().tolist(),
-#             "geometry_conflict_matrix": conflict.detach().cpu().tolist(),
-#             "band_guided_geometry_conflict_matrix": band_guided.detach().cpu().tolist(),
-#             "spectral_guided_geometry_conflict_matrix": spec_guided.detach().cpu().tolist(),
-#             "thresholds": thr,
-#         })
-
-#         # Warnings: raw physical similarity and strict subspace overlap are
-#         # informative hard-pair diagnostics, not automatic failures.
-#         if sub_max > thr["max_subspace_overlap"]:
-#             cert["warnings"].append("strict_subspace_overlap_high_but_energy_guided_gate_used")
-#         if band_max > thr["max_band_similarity"]:
-#             cert["warnings"].append("raw_band_similarity_high_used_as_hard_pair_weight")
-#         if spec_pair_count > 0 and spec_max > thr["max_spectral_shape_similarity"]:
-#             cert["warnings"].append("raw_spectral_shape_similarity_high_used_as_hard_pair_weight")
-
-#         self._compute_pair_risks(cert, center, sub, conflict, band, spec)
-#         self._add_handoff_recommendations(cert)
-
-#         guided_max = max(
-#             float(cert.get("max_band_guided_geometry_conflict", 0.0)),
-#             float(cert.get("max_spectral_guided_geometry_conflict", 0.0)),
-#         )
-#         # Geometry conflict is a bank-level risk score, not an energy accuracy.
-#         # The strict threshold is kept as the preferred operating point, but a
-#         # small soft band is allowed when the actual guided-geometry conflict is
-#         # clean and the base geometry classifier is already highly accurate.
-#         # This prevents meaningless FAILs such as 1.353 vs 1.350 while still
-#         # rejecting truly unsafe geometry.
-#         conflict_soft_cap = self._base_cfg_float(
-#             "base_cert_max_geometry_conflict_soft",
-#             max(float(thr["max_geometry_conflict"]) + 0.05, float(thr["max_geometry_conflict"]) * 1.05),
-#         )
-#         energy_geometry_preferred_ok = cert["max_geometry_conflict"] <= thr["max_geometry_conflict"]
-#         energy_geometry_soft_ok = (
-#             cert["max_geometry_conflict"] <= conflict_soft_cap
-#             and guided_max <= thr["max_guided_geometry_conflict"]
-#             and cert["geom_val_acc"] >= thr["min_geom_acc"]
-#         )
-#         if (not energy_geometry_preferred_ok) and energy_geometry_soft_ok:
-#             cert["warnings"].append(
-#                 "geometry_conflict_slightly_above_strict_threshold_but_guided_energy_safe"
-#             )
-#         cert["max_guided_geometry_conflict"] = guided_max
-#         cert["energy_geometry_preferred_ok"] = bool(energy_geometry_preferred_ok)
-#         cert["energy_geometry_soft_ok"] = bool(energy_geometry_soft_ok)
-
-#         hard_checks = {
-#             "all_base_rows_valid": cert["valid_row_count"] == len(classes),
-#             "sample_counts_positive": cert["min_sample_count"] > 0.0,
-#         }
-#         diagnostic_checks = {
-#             "geom_acc_ok": cert["geom_val_acc"] >= thr["min_geom_acc"],
-#             "min_reliability_ok": cert["min_reliability"] >= thr["min_reliability"],
-#             "mean_reliability_ok": cert["mean_reliability"] >= thr["min_mean_reliability"],
-#             "energy_geometry_ok": bool(energy_geometry_preferred_ok or energy_geometry_soft_ok),
-#             "subspace_warning_gate_ok": cert["max_subspace_overlap"] <= thr["subspace_warn_overlap"],
-#             "band_guided_geometry_ok": cert["max_band_guided_geometry_conflict"] <= thr["max_guided_geometry_conflict"],
-#             "spectral_guided_geometry_ok": (
-#                 int(cert.get("spectral_shape_pair_count", 0)) == 0
-#                 or cert["max_spectral_guided_geometry_conflict"] <= thr["max_guided_geometry_conflict"]
-#             ),
-#         }
-#         cert["checks"] = {**hard_checks, **diagnostic_checks}
-#         cert["hard_checks"] = hard_checks
-#         cert["diagnostic_checks"] = diagnostic_checks
-#         cert["soft_state_report"] = True
-#         cert["valid"] = bool(all(hard_checks.values()) and len(cert["errors"]) == 0)
-#         if not cert["valid"]:
-#             cert["errors"].extend([k for k, ok in hard_checks.items() if not ok])
-#         failed_diag = [k for k, ok in diagnostic_checks.items() if not ok]
-#         if failed_diag:
-#             cert["warnings"].append("diagnostic_geometry_risk_soft_only:" + ",".join(failed_diag))
-#         return cert
-
-#     def _print_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-#         print("[Base Geometry State]")
-#         if not certificate:
-#             print("  unavailable")
-#             return
-#         status = "PASS" if bool(certificate.get("valid", False)) else "WARN/FAIL"
-#         print(f"  status={status} | classes={certificate.get('class_ids', [])}")
-#         print(
-#             "  "
-#             f"GeomValAcc={float(certificate.get('geom_val_acc', 0.0)):.2f}% | "
-#             f"valid_rows={int(certificate.get('valid_row_count', 0))}/{int(certificate.get('num_base_classes', 0))} | "
-#             f"rel(min/mean)={float(certificate.get('min_reliability', 0.0)):.3f}/{float(certificate.get('mean_reliability', 0.0)):.3f} | "
-#             f"subspace(max/mean)={float(certificate.get('max_subspace_overlap', 0.0)):.3f}/{float(certificate.get('mean_subspace_overlap', 0.0)):.3f} | "
-#             f"band(raw max/mean)={float(certificate.get('max_band_similarity', 0.0)):.3f}/{float(certificate.get('mean_band_similarity', 0.0)):.3f} | "
-#             f"spec(raw max/mean)={float(certificate.get('max_spectral_shape_similarity', 0.0)):.3f}/{float(certificate.get('mean_spectral_shape_similarity', 0.0)):.3f} | "
-#             f"conflict(max/mean)={float(certificate.get('max_geometry_conflict', 0.0)):.3f}/{float(certificate.get('mean_geometry_conflict', 0.0)):.3f} | "
-#             f"guided(band/spec)={float(certificate.get('max_band_guided_geometry_conflict', 0.0)):.3f}/{float(certificate.get('max_spectral_guided_geometry_conflict', 0.0)):.3f}"
-#         )
-#         if certificate.get("errors"):
-#             print(f"  failed_checks={certificate.get('errors')}")
-#         if certificate.get("warnings"):
-#             print(f"  warnings={certificate.get('warnings')}")
-
-#     def _enforce_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-#         """Warn by default; optionally hard-stop if the user requests strict gating."""
-#         self._last_base_geometry_certificate = certificate
-#         try:
-#             setattr(self.model, "base_geometry_certificate", certificate)
-#         except Exception:
-#             pass
-#         self._print_base_geometry_certificate(certificate)
-#         if bool(certificate.get("valid", False)):
-#             return
-#         msg = (
-#             "Base geometry state contains invalid compact rows. Incremental training requires valid "
-#             "GeometryBank descriptors. Failed hard checks: "
-#             f"{certificate.get('errors', [])}"
-#         )
-#         # No hard overlap/spectral handoff gate is used. Invalid compact rows are
-#         # still real code errors and are normally caught earlier by bank validation.
-#         print(f"[Base Geometry State WARN] {msg}")
-
-#     def _get_valid_base_bank(self, max_class_id: Optional[int] = None) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self, "_safe_get_subspace_bank"):
-#             raise AttributeError("TrainerHelper._safe_get_subspace_bank() is required.")
-#         bank = self._safe_get_subspace_bank()
-#         required = ("means", "bases", "variances", "sample_counts")
-#         missing = [k for k in required if k not in bank or not torch.is_tensor(bank[k]) or bank[k].numel() == 0]
-#         if missing:
-#             raise RuntimeError(f"Base GeometryBank is not ready; missing/empty keys: {missing}")
-#         if max_class_id is not None and int(max_class_id) >= bank["means"].size(0):
-#             raise RuntimeError(f"Bank has {bank['means'].size(0)} rows but needs class id {int(max_class_id)}")
-#         return bank
-
-#     @torch.no_grad()
-#     def _print_base_geometry_diagnostics(self, phase_class_ids: Iterable[int]) -> None:
-#         if not self.debug and not bool(getattr(self.args, "print_base_geometry_diagnostics", True)):
-#             return
-#         try:
-#             bank = self._get_valid_base_bank()
-#         except Exception as exc:
-#             print(f"[Base Geometry Diagnostics] unavailable: {exc}")
-#             return
-
-#         counts = bank.get("sample_counts", None)
-#         active_ranks = bank.get("active_ranks", None)
-#         reliability = bank.get("reliability", None)
-#         variances = bank.get("variances", None)
-#         means = bank.get("means", None)
-#         bands = bank.get("band_importances", bank.get("band_importance", None))
-#         spec_rel = bank.get("spectral_shape_reliability", None)
-
-#         print("[Base Geometry Diagnostics]")
-#         print("  cls | count | rank | rel  | spec-rel | resvar   | mean_norm | band_entropy")
-#         for cls in [int(c) for c in phase_class_ids]:
-#             count = float(counts[cls].detach().item()) if torch.is_tensor(counts) and counts.numel() > cls else -1.0
-#             rank = int(active_ranks[cls].detach().item()) if torch.is_tensor(active_ranks) and active_ranks.numel() > cls else -1
-#             rel = float(reliability[cls].detach().item()) if torch.is_tensor(reliability) and reliability.numel() > cls else -1.0
-#             srel = float(spec_rel[cls].detach().item()) if torch.is_tensor(spec_rel) and spec_rel.numel() > cls else -1.0
-#             rv = float(variances[cls, -1].detach().item()) if torch.is_tensor(variances) and variances.size(0) > cls else -1.0
-#             mn = float(means[cls].norm().detach().item()) if torch.is_tensor(means) and means.size(0) > cls else -1.0
-#             bent = -1.0
-#             if torch.is_tensor(bands) and bands.dim() == 2 and bands.size(0) > cls:
-#                 b = bands[cls].detach().float().clamp_min(0.0)
-#                 b = b / b.sum().clamp_min(1e-8)
-#                 bent = float((-(b * torch.log(b.clamp_min(1e-8))).sum()).cpu().item())
-#             print(f"  {cls:3d} | {count:5.0f} | {rank:4d} | {rel:4.2f} | {srel:8.3f} | {rv:8.5f} | {mn:9.4f} | {bent:12.4f}")
-
-#         geom = self._base_geometry_global_metrics()
-#         if geom:
-#             print("  " + " | ".join(f"{k}={v:.4f}" for k, v in geom.items()))
-
-#     @torch.no_grad()
-#     def _batch_base_overlap_diagnostics(self, features: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
-#         try:
-#             diag = base_center_overlap_diagnostics(
-#                 features,
-#                 labels,
-#                 normalize=True,
-#                 min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#             )
-#         except Exception:
-#             return {"batch_compact": 0.0, "batch_center_margin": 0.0, "batch_min_center_margin": 0.0}
-#         return {
-#             "batch_compact": float(diag.get("compact", self._zero(features)).detach().cpu().item()),
-#             "batch_center_margin": float(diag.get("mean_center_margin", self._zero(features)).detach().cpu().item()),
-#             "batch_min_center_margin": float(diag.get("min_center_margin", self._zero(features)).detach().cpu().item()),
-#         }
-
-#     # ============================================================
-#     # Clean strict geometry public structure / assertions / handoff
-#     # ============================================================
-#     def configure_base_contract(self, phase: int = 0) -> None:
-#         if int(phase) != 0:
-#             raise ValueError("BasePhaseTrainer.configure_base_contract() is phase-0 only.")
-#         self._enforce_base_contract()
-
-#     def snapshot_runtime_state(self) -> Dict[str, Any]:
-#         return self._capture_incremental_runtime_flags()
-
-#     def restore_runtime_state(self, state: Optional[Dict[str, Any]]) -> None:
-#         self._restore_incremental_runtime_flags(state)
-
-#     def build_base_label_map(self, phase_class_ids: Iterable[int]) -> Dict[int, int]:
-#         return self._build_base_label_map(phase_class_ids)
-
-#     def configure_base_trainability(self, base_head: nn.Module) -> None:
-#         self._set_base_trainability(base_head)
-#         self._assert_forbidden_modules_frozen()
-#     def build_temporary_ce_head(self, feature_dim: int, num_base_classes: int) -> nn.Module:
-#         return self._make_base_ce_head(feature_dim, num_base_classes)
-
-#     def extract_base_features(self, x: torch.Tensor, external_spectra: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-#         z, s, b, zk, sk, bk, physical = self._extract_base_views(x, external_spectra)
-#         self._assert_feature_space_consistency({"features": z, "projected_features": z})
-#         return {
-#             "features": z,
-#             "projected_features": z,
-#             "spectral_summary": s,
-#             "band_summary": b,
-#             "key_features": zk,
-#             "key_spectral_summary": sk,
-#             "key_band_summary": bk,
-#             "spectral_summary_is_physical": bool(physical),
-#         }
-
-#     def train_one_base_epoch(self, *args, **kwargs) -> Tuple[float, float]:
-#         return self._train_epoch_base_geometry(*args, **kwargs)
-
-#     @torch.no_grad()
-#     def rebuild_base_geometry_bank(self, phase: int, phase_class_ids: Iterable[int], *, split: str = "train") -> None:
-#         self._rebuild_base_geometry_bank_for_validation(int(phase), phase_class_ids, split=split)
-#         self._assert_base_bank_valid([int(c) for c in phase_class_ids])
-
-#     @torch.no_grad()
-#     def validate_geometry_only(self, loader, *, old_class_count: int = 0) -> Dict[str, Any]:
-#         state = self._force_base_validation_geometry_only()
-#         try:
-#             return self._validate_split_metrics(loader, old_class_count=int(old_class_count))
-#         finally:
-#             self._restore_base_validation_mode(state)
-
-#     @torch.no_grad()
-#     def compute_base_certificate(self, phase_class_ids: Iterable[int], **kwargs: Any) -> Dict[str, Any]:
-#         return self._build_base_geometry_certificate(phase_class_ids, **kwargs)
-
-#     def compute_checkpoint_score(self, val_stats: Dict[str, Any], geom_stats: Optional[Dict[str, Any]] = None) -> float:
-#         return self._select_base_checkpoint_score(val_stats, geom_stats)
-
-#     def _jsonify(self, value: Any) -> Any:
-#         if torch.is_tensor(value):
-#             if value.numel() == 1:
-#                 return float(value.detach().cpu().item())
-#             return value.detach().cpu().tolist()
-#         if isinstance(value, dict):
-#             return {str(k): self._jsonify(v) for k, v in value.items()}
-#         if isinstance(value, (list, tuple)):
-#             return [self._jsonify(v) for v in value]
-#         if isinstance(value, (int, float, str, bool)) or value is None:
-#             return value
-#         return str(value)
-
-#     def _diagnostic_output_dir(self) -> str:
-#         for name in ("save_dir", "output_dir", "results_dir", "log_dir"):
-#             value = getattr(self.args, name, None)
-#             if value:
-#                 path = os.path.abspath(str(value))
-#                 os.makedirs(path, exist_ok=True)
-#                 return path
-#         path = os.path.abspath("./results")
-#         os.makedirs(path, exist_ok=True)
-#         return path
-
-#     def _assert_runtime_state_restored(self, state: Optional[Dict[str, Any]]) -> None:
-#         if not isinstance(state, dict):
-#             return
-#         failures: List[str] = []
-#         for key, value in state.get("args", {}).items():
-#             if hasattr(self.args, key) and getattr(self.args, key) != value:
-#                 failures.append(f"args.{key}: expected {value!r}, got {getattr(self.args, key)!r}")
-#         for key, value in state.get("model", {}).items():
-#             if hasattr(self.model, key) and getattr(self.model, key) != value:
-#                 failures.append(f"model.{key}: expected {value!r}, got {getattr(self.model, key)!r}")
-#         if failures:
-#             raise RuntimeError("Base phase failed to restore runtime state: " + "; ".join(failures))
-
-#     def _assert_feature_space_consistency(self, out: Dict[str, torch.Tensor]) -> torch.Tensor:
-#         if "features" not in out:
-#             raise RuntimeError("Feature output must contain 'features'.")
-#         features = out["features"]
-#         projected = out.get("projected_features", features)
-#         if not torch.is_tensor(features) or features.dim() != 2:
-#             raise RuntimeError(f"features must be [B,D], got {tuple(features.shape) if torch.is_tensor(features) else type(features)}")
-#         if not torch.is_tensor(projected) or projected.shape != features.shape:
-#             raise RuntimeError("projected_features must exist and match features shape.")
-#         if not torch.allclose(features, projected, atol=1e-5, rtol=1e-4):
-#             raise RuntimeError("features and projected_features are not the same canonical z tensor.")
-#         if not torch.isfinite(features).all():
-#             raise RuntimeError("canonical base features contain NaN/Inf.")
-#         gb = getattr(self.model, "geometry_bank", None)
-#         bank_dim = int(getattr(gb, "feature_dim", getattr(gb, "d_model", features.size(1)))) if gb is not None else features.size(1)
-#         if int(features.size(1)) != int(bank_dim):
-#             raise RuntimeError(f"feature dim {features.size(1)} does not match GeometryBank feature_dim={bank_dim}.")
-#         return features
-
-#     def _assert_base_batch_labels(self, labels_global: torch.Tensor, labels_local: torch.Tensor, phase_class_ids: Iterable[int], num_base: int) -> None:
-#         if labels_global.numel() == 0:
-#             raise RuntimeError("Base batch is empty.")
-#         allowed = {int(c) for c in phase_class_ids}
-#         bad = sorted(set(int(x) for x in labels_global.detach().cpu().view(-1).tolist()).difference(allowed))
-#         if bad:
-#             raise RuntimeError(f"Base batch contains non-base/future/background labels: {bad}; allowed={sorted(allowed)}")
-#         if labels_local.numel() != labels_global.numel():
-#             raise RuntimeError("Local/global label count mismatch.")
-#         if int(labels_local.min().item()) < 0 or int(labels_local.max().item()) >= int(num_base):
-#             raise RuntimeError(f"Local CE labels out of range [0,{int(num_base)-1}].")
-
-#     def _assert_base_ce_logits(self, logits: torch.Tensor, labels_local: torch.Tensor, num_base: int) -> None:
-#         if not torch.is_tensor(logits) or logits.dim() != 2:
-#             raise RuntimeError(f"Base CE logits must be [B,C], got {tuple(logits.shape) if torch.is_tensor(logits) else type(logits)}")
-#         if logits.size(0) != labels_local.numel() or logits.size(1) != int(num_base):
-#             raise RuntimeError(f"Base CE logits shape {tuple(logits.shape)} incompatible with labels={labels_local.numel()} and num_base={num_base}.")
-#         if not torch.isfinite(logits).all():
-#             raise RuntimeError("Base CE logits contain NaN/Inf.")
-
-#     def _assert_finite_loss(self, value: torch.Tensor, name: str) -> None:
-#         if not torch.is_tensor(value) or value.numel() != 1 or not torch.isfinite(value).all():
-#             raise RuntimeError(f"{name} must be a finite scalar tensor.")
-
-#     @torch.no_grad()
-#     def _assert_base_bank_valid(self, phase_class_ids: Iterable[int]) -> None:
-#         classes = [int(c) for c in phase_class_ids]
-#         if not classes:
-#             raise RuntimeError("No base classes for GeometryBank validation.")
-#         gb = getattr(self.model, "geometry_bank", None)
-#         if gb is None:
-#             raise RuntimeError("Model has no GeometryBank.")
-#         if hasattr(gb, "assert_bank_valid"):
-#             gb.assert_bank_valid(seen_classes=classes, strict=True)
-#         bank = self._get_valid_base_bank(max(classes))
-#         idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-#         means = bank["means"].index_select(0, idx)
-#         bases = bank["bases"].index_select(0, idx)
-#         variances = bank["variances"].index_select(0, idx)
-#         counts = bank["sample_counts"].to(device=self.device).flatten().index_select(0, idx)
-#         if not torch.isfinite(means).all():
-#             raise RuntimeError("Base GeometryBank means contain NaN/Inf.")
-#         if not torch.isfinite(bases).all():
-#             raise RuntimeError("Base GeometryBank bases contain NaN/Inf.")
-#         if not torch.isfinite(variances).all():
-#             raise RuntimeError("Base GeometryBank variances contain NaN/Inf.")
-#         if not bool((counts > 0).all().item()):
-#             raise RuntimeError("Every base class must have positive GeometryBank sample_count.")
-#         if bool((variances < -1e-8).any().item()):
-#             raise RuntimeError("GeometryBank eigen/residual variances must be non-negative.")
-#         # Orthonormality check for active columns. Zero-padded inactive columns are allowed.
-#         ranks = bank.get("active_ranks", None)
-#         if torch.is_tensor(ranks):
-#             ranks = ranks.to(device=self.device).long().flatten().index_select(0, idx)
-#         else:
-#             ranks = torch.full((len(classes),), bases.size(2), device=self.device, dtype=torch.long)
-#         eye_cache: Dict[int, torch.Tensor] = {}
-#         for row, r_t in enumerate(ranks):
-#             r = int(r_t.item())
-#             if r <= 0:
-#                 continue
-#             U = bases[row, :, :r]
-#             eye = eye_cache.setdefault(r, torch.eye(r, device=U.device, dtype=U.dtype))
-#             err = (U.t() @ U - eye).abs().max()
-#             if float(err.detach().cpu().item()) > 5e-3:
-#                 raise RuntimeError(f"Base GeometryBank basis for class {classes[row]} is not orthonormal; max_err={float(err):.4e}")
-#         max_cls = max(classes)
-#         counts_full = bank["sample_counts"].to(device=self.device).flatten()
-#         if counts_full.numel() > max_cls + 1:
-#             future_valid = counts_full[max_cls + 1:] > 0
-#             if bool(future_valid.any().item()):
-#                 bad = (torch.nonzero(future_valid, as_tuple=False).flatten() + max_cls + 1).detach().cpu().tolist()
-#                 raise RuntimeError(f"Future/non-base classes have valid geometry after base phase: {bad}")
-
-#     def _assert_forbidden_modules_frozen(self) -> None:
-#         forbidden = ("classifier.", "geometry_bank.", "geometry_calibrator", "calibrator", "adapter", "transport", "cycle")
-#         offenders = []
-#         for name, p in self.model.named_parameters():
-#             lname = name.lower()
-#             if any(tok in lname for tok in forbidden) and p.requires_grad:
-#                 # Backbone/projection names may contain no forbidden token. Classifier/adapters must be frozen.
-#                 offenders.append(name)
-#         if offenders:
-#             raise RuntimeError("Forbidden base-phase modules are trainable: " + ", ".join(offenders[:20]))
-
-#     def _assert_base_ce_head_discarded(self) -> None:
-#         if getattr(self, "_base_ce_head", None) is not None:
-#             raise RuntimeError("Temporary base CE head is still attached to trainer after base finalization.")
-#         if hasattr(self.model, "base_ce_head") and getattr(self.model, "base_ce_head") is not None:
-#             raise RuntimeError("Temporary model base_ce_head was not dropped after base finalization.")
-
-#     def _pairwise_matrix_or_zeros(self, gb: Any, method_names: Iterable[str], idx: torch.Tensor) -> torch.Tensor:
-#         for name in method_names:
-#             if hasattr(gb, name):
-#                 mat = getattr(gb, name)()
-#                 if torch.is_tensor(mat) and mat.dim() == 2 and mat.size(0) > int(idx.max().item()) and mat.size(1) > int(idx.max().item()):
-#                     return mat.to(device=self.device).index_select(0, idx).index_select(1, idx).float()
-#         n = int(idx.numel())
-#         return torch.zeros((n, n), device=self.device, dtype=torch.float32)
-
-#     def _compute_pair_risks(self, cert: Dict[str, Any], center: torch.Tensor, sub: torch.Tensor, conflict: torch.Tensor, band: torch.Tensor, spec: torch.Tensor) -> None:
-#         """Pair-level Low-Rank Geometry Replay + Residual Geometry Adaptation conflict diagnostics.
-
-#         Raw band/spectral similarity is reported as hard-pair context.  A pair is
-#         unsafe only when physical similarity coincides with unsafe learned
-#         geometry or the learned geometry itself violates the energy/subspace gate.
-#         """
-#         classes = [int(c) for c in cert.get("class_ids", [])]
-#         n = len(classes)
-#         thr = cert.get("thresholds", {})
-#         unsafe_pairs = []
-#         hard_pairs = []
-#         conflict_by_class = {int(c): 0.0 for c in classes}
-
-#         band_guided = torch.as_tensor(cert.get("band_guided_geometry_conflict_matrix", []), device=self.device, dtype=torch.float32)
-#         spec_guided = torch.as_tensor(cert.get("spectral_guided_geometry_conflict_matrix", []), device=self.device, dtype=torch.float32)
-#         if band_guided.dim() != 2 or band_guided.size(0) != n:
-#             band_guided = torch.zeros((n, n), device=self.device)
-#         if spec_guided.dim() != 2 or spec_guided.size(0) != n:
-#             spec_guided = torch.zeros((n, n), device=self.device)
-
-#         for i in range(n):
-#             for j in range(i + 1, n):
-#                 reasons: List[str] = []
-#                 context: List[str] = []
-#                 sub_ij = float(max(sub[i, j].item(), sub[j, i].item())) if sub.numel() else 0.0
-#                 conf_ij = float(max(conflict[i, j].item(), conflict[j, i].item())) if conflict.numel() else 0.0
-#                 band_ij = float(max(band[i, j].item(), band[j, i].item())) if band.numel() else 0.0
-#                 spec_ij = float(max(spec[i, j].item(), spec[j, i].item())) if spec.numel() else 0.0
-#                 bguide_ij = float(max(band_guided[i, j].item(), band_guided[j, i].item())) if band_guided.numel() else 0.0
-#                 sguide_ij = float(max(spec_guided[i, j].item(), spec_guided[j, i].item())) if spec_guided.numel() else 0.0
-#                 dist_ij = float(center[i, j].item()) if center.numel() else 0.0
-
-#                 if band_ij > float(thr.get("max_band_similarity", 0.90)):
-#                     context.append("raw_band_hard_pair")
-#                 if spec_ij > float(thr.get("max_spectral_shape_similarity", 0.85)):
-#                     context.append("raw_spectral_hard_pair")
-
-#                 if sub_ij > float(thr.get("subspace_warn_overlap", 0.72)):
-#                     reasons.append("subspace_warning_gate")
-#                 if conf_ij > float(thr.get("max_geometry_conflict", 1.35)):
-#                     reasons.append("energy_geometry")
-#                 if bguide_ij > float(thr.get("max_guided_geometry_conflict", 0.18)):
-#                     reasons.append("band_guided_geometry")
-#                 if sguide_ij > float(thr.get("max_guided_geometry_conflict", 0.18)):
-#                     reasons.append("spectral_guided_geometry")
-
-#                 pair_score = max(
-#                     0.0,
-#                     sub_ij if "subspace_warning_gate" in reasons else 0.0,
-#                     conf_ij if "energy_geometry" in reasons else 0.0,
-#                     bguide_ij,
-#                     sguide_ij,
-#                 )
-
-#                 if context:
-#                     hard_pairs.append({
-#                         "class_i": classes[i],
-#                         "class_j": classes[j],
-#                         "context": context,
-#                         "center_distance": dist_ij,
-#                         "subspace_overlap": sub_ij,
-#                         "geometry_conflict": conf_ij,
-#                         "band_similarity": band_ij,
-#                         "spectral_similarity": spec_ij,
-#                         "band_guided_geometry_conflict": bguide_ij,
-#                         "spectral_guided_geometry_conflict": sguide_ij,
-#                     })
-
-#                 if reasons:
-#                     item = {
-#                         "class_i": classes[i],
-#                         "class_j": classes[j],
-#                         "geometry_conflict_score": float(pair_score),
-#                         "risk": float(pair_score),  # backward-compatible alias
-#                         "reasons": reasons,
-#                         "context": context,
-#                         "center_distance": dist_ij,
-#                         "subspace_overlap": sub_ij,
-#                         "geometry_conflict": conf_ij,
-#                         "band_similarity": band_ij,
-#                         "spectral_similarity": spec_ij,
-#                         "band_guided_geometry_conflict": bguide_ij,
-#                         "spectral_guided_geometry_conflict": sguide_ij,
-#                     }
-#                     unsafe_pairs.append(item)
-#                     conflict_by_class[classes[i]] = max(float(conflict_by_class[classes[i]]), float(pair_score))
-#                     conflict_by_class[classes[j]] = max(float(conflict_by_class[classes[j]]), float(pair_score))
-
-#         unsafe_pairs = sorted(unsafe_pairs, key=lambda x: x["geometry_conflict_score"], reverse=True)
-#         hard_pairs = sorted(hard_pairs, key=lambda x: max(float(x.get("band_similarity", 0.0)), float(x.get("spectral_similarity", 0.0))), reverse=True)
-#         cert["unsafe_class_pairs"] = unsafe_pairs
-#         cert["hard_physical_pairs"] = hard_pairs
-
-#         geometry_conflict_by_class = {int(k): float(v) for k, v in conflict_by_class.items()}
-#         cert["geometry_conflict_by_class"] = geometry_conflict_by_class
-#         cert["risk_by_class"] = geometry_conflict_by_class
-#         cert["high_conflict_old_classes"] = [int(c) for c, v in geometry_conflict_by_class.items() if float(v) > 0.0]
-#         cert["high_risk_old_classes"] = cert["high_conflict_old_classes"]
-
-#     def _add_handoff_recommendations(self, cert: Dict[str, Any]) -> None:
-#         conflict_by_class = {int(k): float(v) for k, v in cert.get("geometry_conflict_by_class", cert.get("risk_by_class", {})).items()}
-#         base_replay = self._base_cfg_int("base_recommend_replay_per_class", 16)
-#         max_replay = self._base_cfg_int("base_recommend_max_replay_per_class", 64)
-#         replay_plan = {}
-#         for cls in cert.get("class_ids", []):
-#             cls_conflict = conflict_by_class.get(int(cls), 0.0)
-#             replay_plan[int(cls)] = int(min(max_replay, max(base_replay, round(base_replay * (1.0 + cls_conflict)))))
-
-#         max_pair_conflict = max(conflict_by_class.values()) if conflict_by_class else 0.0
-#         max_guided = max(
-#             float(cert.get("max_band_guided_geometry_conflict", 0.0)),
-#             float(cert.get("max_spectral_guided_geometry_conflict", 0.0)),
-#         )
-#         max_conflict = max(float(cert.get("max_geometry_conflict", 0.0)), max_pair_conflict, max_guided)
-#         margin_base = self._base_cfg_float("base_recommend_insertion_margin", 1.0)
-
-#         cert["recommended_replay_per_class"] = replay_plan
-#         cert["recommended_insertion_margin"] = float(margin_base * (1.0 + 0.25 * max_conflict))
-
-#         # Main Low-Rank Geometry Replay + Residual Geometry Adaptation path does not use old-row transport.
-#         cert["recommended_transport_activation"] = False
-#         cert["transport_required"] = False
-
-#         cert["recommended_reserved_alignment"] = bool(
-#             max_guided > self._base_cfg_float("base_cert_max_guided_geometry_conflict", 0.18)
-#             or float(cert.get("max_geometry_conflict", 0.0)) > self._base_cfg_float("base_cert_max_geometry_conflict", 1.35)
-#             or float(cert.get("max_subspace_overlap", 0.0)) > self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72)
-#         )
-#         cert["recommended_old_new_energy_margin"] = float(
-#             self._base_cfg_float("base_recommend_old_new_energy_margin", 0.30) * (1.0 + 0.25 * max_conflict)
-#         )
-
-#     @torch.no_grad()
-#     def finalize_base_handoff(self, phase_class_ids: Iterable[int], certificate: Dict[str, Any], history: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-#         classes = [int(c) for c in phase_class_ids]
-#         feature_dim = int(getattr(getattr(self.model, "geometry_bank", None), "feature_dim", getattr(self.model, "d_model", 0)))
-#         handoff = {
-#             "phase": 0,
-#             "base_classes": classes,
-#             "feature_dim": feature_dim,
-#             "geometry_bank_ready": bool(certificate.get("valid_row_count", 0) == len(classes)),
-#             "geometry_certificate": certificate,
-#             "geometry_conflict_by_class": certificate.get("geometry_conflict_by_class", certificate.get("risk_by_class", {})),
-#             "risk_by_class": certificate.get("risk_by_class", {}),  # backward-compatible alias
-#             "unsafe_class_pairs": certificate.get("unsafe_class_pairs", []),
-#             "recommended_replay_per_class": certificate.get("recommended_replay_per_class", {}),
-#             "recommended_insertion_margin": certificate.get("recommended_insertion_margin", 1.0),
-#             "transport_required": False,
-#             "reserved_alignment_required": bool(certificate.get("recommended_reserved_alignment", False)),
-#             "recommended_old_new_energy_margin": certificate.get("recommended_old_new_energy_margin", 0.30),
-#             "high_conflict_old_classes": certificate.get("high_conflict_old_classes", certificate.get("high_risk_old_classes", [])),
-#             "high_risk_old_classes": certificate.get("high_risk_old_classes", []),  # backward-compatible alias
-#         }
-#         out_dir = self._diagnostic_output_dir()
-#         json_path = os.path.join(out_dir, "phase_0_base_handoff.json")
-#         pt_path = os.path.join(out_dir, "phase_0_base_handoff.pt")
-#         cert_path = os.path.join(out_dir, "phase_0_base_geometry_certificate.json")
-#         diag_path = os.path.join(out_dir, "phase_0_base_diagnostics.json")
-#         with open(json_path, "w", encoding="utf-8") as f:
-#             json.dump(self._jsonify(handoff), f, indent=2)
-#         with open(cert_path, "w", encoding="utf-8") as f:
-#             json.dump(self._jsonify(certificate), f, indent=2)
-#         if history is not None:
-#             with open(diag_path, "w", encoding="utf-8") as f:
-#                 json.dump(self._jsonify(history), f, indent=2)
-#         torch.save(self._jsonify(handoff), pt_path)
-#         handoff["handoff_json_path"] = json_path
-#         handoff["handoff_pt_path"] = pt_path
-#         handoff["certificate_json_path"] = cert_path
-#         handoff["diagnostics_json_path"] = diag_path if history is not None else None
-#         try:
-#             setattr(self.model, "base_handoff", handoff)
-#             setattr(self.model, "base_geometry_certificate", certificate)
-#         except Exception:
-#             pass
-#         return handoff
-
-#     # ============================================================
-#     # Base objective: unified_spectral_geometry_loss(phase="base")
-#     # ============================================================
-#     def _train_epoch_base_geometry(
-#         self,
-#         loader,
-#         optimizer,
-#         base_head: nn.Module,
-#         phase_class_ids: Iterable[int],
-#         label_map: Dict[int, int],
-#         trainable_params: list[nn.Parameter],
-#     ) -> Tuple[float, float]:
-#         self._assert_mandatory_base_objective_config()
-#         self.model.train()
-#         base_head.train()
-
-#         num_base = len([int(c) for c in phase_class_ids])
-#         total_loss = 0.0
-#         total_correct = 0
-#         total_count = 0
-#         stat_steps = 0
-#         stat_sums = {
-#             "ce": 0.0,
-#             "srpgr": 0.0,
-#             "compact_sep": 0.0,
-#             "gics": 0.0,
-#             "weighted_gics": 0.0,
-#             "energy_margin": 0.0,
-#             "energy_margin_weighted": 0.0,
-#             "energy_margin_violation": 0.0,
-#             "energy_margin_gap": 0.0,
-#             "gics_anchors": 0.0,
-#             "gics_pos": 0.0,
-#             "pgr": 0.0,
-#             "pgr_unweighted": 0.0,
-#             "pgr_compact": 0.0,
-#             "pgr_center": 0.0,
-#             "pgr_subspace": 0.0,
-#             "pgr_band": 0.0,
-#             "pgr_volume": 0.0,
-#             "pgr_valid_class_count": 0.0,
-#             "pgr_subspace_pair_count": 0.0,
-#             "pgr_band_pair_count": 0.0,
-#             "pgr_volume_factor": 0.0,
-#             "pgr_subspace_max_overlap": 0.0,
-#             "pgr_band_max_similarity": 0.0,
-#             "pgr_band_guided_conflict_mean": 0.0,
-#             "pgr_band_guided_conflict_max": 0.0,
-#             "spectral_shape": 0.0,
-#             "spectral_shape_raw": 0.0,
-#             "spectral_shape_mean_similarity": 0.0,
-#             "spectral_shape_pairs": 0.0,
-#             "spectral_shape_guided_conflict_mean": 0.0,
-#             "spectral_shape_guided_conflict_max": 0.0,
-#             "spectral_active": 0.0,
-#             "batch_compact": 0.0,
-#             "batch_center_margin": 0.0,
-#             "batch_min_center_margin": 0.0,
-#         }
-
-#         for batch in loader:
-#             x, y, spectra, _ = self._unpack_hsi_batch(batch)
-#             x = x.float().to(self.device, non_blocking=True)
-#             y = y.long().to(self.device, non_blocking=True)
-#             y_local = self._labels_to_local(y, label_map)
-#             self._assert_base_batch_labels(y, y_local, phase_class_ids, num_base)
-
-#             optimizer.zero_grad(set_to_none=True)
-
-#             features, spectral_summary, band_summary, key_features, _, _, spectral_summary_is_physical = self._extract_base_views(x, spectra)
-#             self._assert_feature_space_consistency({"features": features, "projected_features": features})
-
-#             # PGR band reserve must use the physical spectrum when raw spectra are
-#             # available.  This is the fix for the previous 200-D raw spectrum vs
-#             # 30-D PCA band-vector mismatch and for weak band/spectral certificates.
-#             band_for_srpgr = self._select_srpgr_band_summary(
-#                 spectral_summary=spectral_summary,
-#                 band_summary=band_summary,
-#                 spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#                 x=x,
-#             )
-
-#             self._assert_mandatory_base_batch_inputs(
-#                 features=features,
-#                 labels_local=y_local,
-#                 key_features=key_features,
-#                 spectral_summary=spectral_summary,
-#                 band_summary=band_for_srpgr,
-#             )
-#             if torch.is_tensor(key_features) and key_features.requires_grad:
-#                 raise RuntimeError("SRPGR/GICS key_features must be detached; otherwise the key branch becomes a second train path.")
-#             logits = base_head(features)
-#             self._assert_base_ce_logits(logits, y_local, num_base)
-
-#             # Architecture fix: base CE must be class-balanced independently of
-#             # SRPGR. Indian Pines style base phases contain tiny classes; plain
-#             # CE can learn a high-accuracy head while leaving minority geometry
-#             # dirty. The unified loss still owns SRPGR; CE is computed here so
-#             # class-balanced CE can be used without changing the public loss API.
-#             loss_out = unified_spectral_geometry_loss(
-#                 phase="base",
-#                 logits=logits,
-#                 features=features,
-#                 labels=y_local,
-#                 key_features=key_features,
-#                 band_summary=band_for_srpgr,
-#                 spectral_summary=spectral_summary,
-#                 spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#                 ce_weight=0.0,
-#                 base_geometry_weight=self._base_cfg_float("base_srpgr_weight", 1.0),
-#                 label_smoothing=self._base_cfg_float("label_smoothing", 0.0),
-#                 gics_weight=self._base_cfg_float("base_gics_weight", 0.20),
-#                 pgr_weight=self._base_cfg_float("pgr_weight", 0.10),
-#                 spectral_shape_weight=self._base_cfg_float("base_spectral_shape_weight", 0.05),
-#                 gics_temperature=self._base_cfg_float("base_gics_temperature", 0.07),
-#                 base_energy_margin_weight=self._base_cfg_float("base_energy_margin_weight", 0.15),
-#                 base_energy_margin=self._base_cfg_float("base_energy_margin", 0.25),
-#                 base_energy_variance_floor=self._base_cfg_float("geom_var_floor", 5e-4),
-#                 pgr_compact_weight=self._base_cfg_float("pgr_compact_weight", 0.15),
-#                 pgr_center_weight=self._base_cfg_float("pgr_center_weight", 0.20),
-#                 pgr_subspace_weight=self._base_cfg_float("pgr_subspace_weight", 0.10),
-#                 pgr_band_weight=self._base_cfg_float("pgr_band_weight", 0.05),
-#                 pgr_volume_weight=self._base_cfg_float("pgr_volume_weight", 0.05),
-#                 pgr_center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-#                 pgr_max_band_similarity=self._base_cfg_float("pgr_band_overlap_max", 0.75),
-#                 pgr_max_class_variance=self._base_cfg_float("pgr_max_class_variance", 0.75),
-#                 pgr_min_class_variance=self._base_cfg_float("pgr_min_class_variance", 0.015),
-#                 pgr_max_subspace_overlap=self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-#                 subspace_overlap_max=self._base_cfg_float("pgr_max_subspace_overlap", self._base_cfg_float("base_cert_max_subspace_overlap", 0.55)),
-#                 subspace_rank=self._base_cfg_int("pgr_subspace_rank", 3),
-#                 min_class_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#                 subspace_min_samples=self._base_cfg_int("pgr_subspace_min_samples", 6),
-#                 max_spectral_shape_similarity=self._base_cfg_float("base_max_spectral_shape_similarity", 0.75),
-#                 spectral_shape_risk_weight=self._base_cfg_float("base_spectral_shape_risk_weight", 1.0),
-#                 require_physical_summary=self._base_cfg_bool("spectral_require_physical_summary", True),
-#                 return_parts=True,
-#             )
-#             if not isinstance(loss_out, dict) or "total" not in loss_out:
-#                 raise RuntimeError("unified_spectral_geometry_loss(phase='base') must return a dict containing 'total'.")
-#             self._assert_mandatory_base_loss_parts(
-#                 loss_out,
-#                 spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#             )
-#             ce = self._batch_balanced_ce(logits, y_local, num_base)
-#             # Important: the cleaned loss returns base_geometry as a detached
-#             # logging value.  The differentiable SRPGR/GICS/PGR graph is in
-#             # loss_out["total"] because ce_weight=0.0 above.
-#             srpgr_total = loss_out.get("total", self._zero(features))
-#             if not torch.is_tensor(srpgr_total):
-#                 srpgr_total = torch.as_tensor(float(srpgr_total), device=features.device, dtype=features.dtype)
-#             loss = self._base_cfg_float("base_ce_weight", 1.0) * ce + srpgr_total
-#             loss_out["ce"] = ce.detach()
-#             loss_out["base_geometry_train"] = srpgr_total.detach()
-#             loss_out["total"] = loss
-#             self._assert_finite_loss(ce, "base_ce")
-#             self._assert_finite_loss(srpgr_total, "base_srpgr")
-#             self._assert_finite_loss(loss, "base_total_loss")
-
-#             loss.backward()
-#             torch.nn.utils.clip_grad_norm_(trainable_params, float(self.grad_clip_base))
-#             optimizer.step()
-
-#             pred = logits.argmax(dim=1)
-#             total_loss += float(loss.detach().item())
-#             total_correct += int((pred == y_local).sum().item())
-#             total_count += int(y_local.numel())
-#             stat_steps += 1
-
-#             batch_diag = self._batch_base_overlap_diagnostics(features.detach(), y.detach())
-
-#             def _lstat(key: str, default: float = 0.0) -> float:
-#                 value = loss_out.get(key, None)
-#                 if torch.is_tensor(value):
-#                     return float(value.detach().float().mean().cpu().item())
-#                 if isinstance(value, (int, float)):
-#                     return float(value)
-#                 return float(default)
-
-#             stat_sums["ce"] += _lstat("ce")
-#             stat_sums["srpgr"] += _lstat("base_geometry_train", _lstat("base_geometry"))
-#             stat_sums["compact_sep"] += _lstat("base_gics")
-#             stat_sums["gics"] += _lstat("base_gics")
-#             stat_sums["weighted_gics"] += _lstat("base_gics_weighted", _lstat("base_gics"))
-#             stat_sums["energy_margin"] += _lstat("base_energy_margin")
-#             stat_sums["energy_margin_weighted"] += _lstat("base_energy_margin_weighted", _lstat("base_energy_margin"))
-#             stat_sums["energy_margin_violation"] += _lstat("base_energy_margin_violation")
-#             stat_sums["energy_margin_gap"] += _lstat("base_energy_margin_gap")
-#             stat_sums["gics_anchors"] += _lstat("base_gics_anchors")
-#             stat_sums["gics_pos"] += _lstat("base_gics_pos")
-#             stat_sums["pgr"] += _lstat("base_pgr_weighted", _lstat("base_pgr"))
-#             stat_sums["pgr_unweighted"] += _lstat("base_pgr")
-#             stat_sums["pgr_compact"] += _lstat("base_compact")
-#             stat_sums["pgr_center"] += _lstat("base_center")
-#             stat_sums["pgr_subspace"] += _lstat("base_subspace")
-#             stat_sums["pgr_band"] += _lstat("base_band")
-#             stat_sums["pgr_volume"] += _lstat("base_volume")
-#             stat_sums["pgr_valid_class_count"] += _lstat("base_pgr_valid_class_count")
-#             stat_sums["pgr_subspace_pair_count"] += _lstat("base_pgr_subspace_pair_count")
-#             stat_sums["pgr_band_pair_count"] += _lstat("base_pgr_band_pair_count")
-#             stat_sums["pgr_volume_factor"] += _lstat("base_pgr_volume_factor")
-#             stat_sums["pgr_subspace_max_overlap"] += _lstat("base_pgr_subspace_max_overlap")
-#             stat_sums["pgr_band_max_similarity"] += _lstat("base_pgr_band_max_similarity")
-#             stat_sums["pgr_band_guided_conflict_mean"] += _lstat("base_pgr_band_guided_conflict_mean")
-#             stat_sums["pgr_band_guided_conflict_max"] += _lstat("base_pgr_band_guided_conflict_max")
-#             stat_sums["spectral_shape"] += _lstat("base_spectral_shape")
-#             stat_sums["spectral_shape_raw"] += _lstat("base_spectral_shape_raw", _lstat("base_spectral_shape"))
-#             stat_sums["spectral_shape_mean_similarity"] += _lstat("base_spectral_shape_mean_similarity")
-#             stat_sums["spectral_shape_pairs"] += _lstat("base_spectral_shape_pair_count")
-#             stat_sums["spectral_shape_guided_conflict_mean"] += _lstat("base_spectral_shape_guided_conflict_mean")
-#             stat_sums["spectral_shape_guided_conflict_max"] += _lstat("base_spectral_shape_guided_conflict_max")
-#             stat_sums["spectral_active"] += _lstat("base_spectral_shape_active", 1.0 if bool(spectral_summary_is_physical) else 0.0)
-#             for k, v in batch_diag.items():
-#                 stat_sums[k] += float(v)
-
-#         self._last_base_stats = {k: v / max(stat_steps, 1) for k, v in stat_sums.items()}
-#         self._assert_mandatory_base_epoch_coverage(self._last_base_stats)
-#         return total_loss / max(stat_steps, 1), 100.0 * total_correct / max(total_count, 1)
-
-#     # backward-compatible alias for trainer.py calls that still use the old name
-#     def _train_epoch_base_gics(self, *args, **kwargs):
-#         return self._train_epoch_base_geometry(*args, **kwargs)
-
-#     # ============================================================
-#     # Checkpoint score
-#     # ============================================================
-#     def _select_base_checkpoint_score(self, val_stats: Dict, geom_stats: Optional[Dict] = None) -> float:
-#         metric = str(getattr(self.args, "best_state_metric", "geometry_score")).lower()
-#         geom_stats = geom_stats or {}
-#         if metric in {"geometry_score", "geo", "reserve"}:
-#             acc = float(val_stats.get("acc", 0.0))
-#             reserve = float(geom_stats.get("geometry_reserve_score", val_stats.get("geometry_score", 0.0)))
-#             conflict_mean = float(geom_stats.get("geometry_conflict_mean", 0.0))
-#             conflict_max = float(val_stats.get("cert_max_geometry_conflict", geom_stats.get("geometry_conflict_max", conflict_mean)))
-#             overlap_mean = float(geom_stats.get("feature_subspace_overlap", 0.0))
-#             overlap_max = float(val_stats.get("cert_max_subspace_overlap", overlap_mean))
-#             overlap_warn = self._base_cfg_float("base_cert_subspace_warn_overlap", 0.72)
-#             overlap_excess = max(0.0, overlap_max - overlap_warn)
-#             guided_band = float(val_stats.get("cert_max_band_guided_geometry_conflict", 0.0))
-#             guided_spec = float(val_stats.get("cert_max_spectral_guided_geometry_conflict", 0.0))
-#             guided_conflict = max(guided_band, guided_spec)
-#             energy_margin_violation = float(val_stats.get("base_energy_margin_violation", 0.0))
-#             energy_margin_gap = float(val_stats.get("base_energy_margin_gap", 0.0))
-#             cert_valid = 1.0 if bool(val_stats.get("cert_valid", False)) else 0.0
-
-#             a = self._base_cfg_float("base_score_reserve_alpha", 8.0)
-#             b_conf_max = self._base_cfg_float("base_score_conflict_max_beta", 7.0)
-#             b_conf_mean = self._base_cfg_float("base_score_conflict_mean_beta", 3.0)
-#             g_overlap_excess = self._base_cfg_float("base_score_overlap_excess_gamma", 8.0)
-#             g_overlap_mean = self._base_cfg_float("base_score_overlap_mean_gamma", 0.5)
-#             d_guided = self._base_cfg_float("base_score_guided_conflict_delta", 6.0)
-#             cert_bonus = self._base_cfg_float("base_score_cert_bonus", 3.0)
-#             e_viol_beta = self._base_cfg_float("base_score_energy_violation_beta", 10.0)
-#             e_gap_alpha = self._base_cfg_float("base_score_energy_gap_alpha", 2.0)
-#             return (
-#                 acc
-#                 + a * reserve
-#                 + e_gap_alpha * max(0.0, energy_margin_gap)
-#                 - e_viol_beta * max(0.0, energy_margin_violation)
-#                 + cert_bonus * cert_valid
-#                 - b_conf_max * conflict_max
-#                 - b_conf_mean * conflict_mean
-#                 - g_overlap_excess * overlap_excess
-#                 - g_overlap_mean * overlap_mean
-#                 - d_guided * guided_conflict
-#             )
-#         if metric in {"acc", "accuracy", "oa", "val_acc"}:
-#             return float(val_stats.get("acc", 0.0))
-#         if metric in {"loss", "val_loss"}:
-#             return -float(val_stats.get("loss", 1e9))
-#         if metric in {"hm", "harmonic"}:
-#             return float(val_stats.get("hm", val_stats.get("acc", 0.0)))
-#         return float(val_stats.get("acc", 0.0))
-
-#     def train_base_phase(self, phase, epochs, batch_size=64, lr=1e-4) -> Dict:
-#         phase = int(phase)
-#         if phase != 0:
-#             raise ValueError("train_base_phase() must only be called for phase 0.")
-
-#         incremental_runtime_state = self.snapshot_runtime_state()
-#         base_eval_state = None
-#         base_head: Optional[nn.Module] = None
-#         history: Dict[str, Any] = {}
-#         phase_class_ids: List[int] = []
-#         try:
-#             base_eval_state = self._force_base_validation_geometry_only()
-#             self.configure_base_contract(phase)
-
-#             print("==== Base Phase Training | Low-Rank Geometry Replay + Residual Geometry Adaptation Preparation ====")
-#             self.dataset.start_phase(phase)
-#             phase_class_ids = [int(c) for c in self.dataset.phase_to_classes[phase]]
-#             if not phase_class_ids:
-#                 raise RuntimeError("Phase 0 has no base classes.")
-#             label_map = self.build_base_label_map(phase_class_ids)
-#             self._set_model_phase_and_old_count(phase, 0)
-
-#             needed_classes = max(phase_class_ids) + 1
-#             if hasattr(self.model, "ensure_class_capacity"):
-#                 self.model.ensure_class_capacity(needed_classes)
-
-#             train_loader = self.dataset.get_phase_dataloader(phase, split="train", batch_size=batch_size, shuffle=True)
-#             val_loader = self.dataset.get_cumulative_dataloader(phase, split="val", batch_size=batch_size, shuffle=False)
-
-#             feature_dim = self._extract_feature_dim(train_loader)
-#             base_head = self.build_temporary_ce_head(feature_dim, len(phase_class_ids))
-#             self._base_ce_head = base_head
-#             self.configure_base_trainability(base_head)
-#             trainable_params = self._base_trainable_parameters(base_head)
-
-#             optimizer = optim.Adam(
-#                 trainable_params,
-#                 lr=float(lr),
-#                 weight_decay=float(getattr(self.args, "weight_decay", 1e-4)),
-#             )
-#             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, int(epochs))
-
-#             history = {
-#                 "train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [],
-#                 "val_old_acc": [], "val_new_acc": [], "val_hm": [], "checkpoint_score": [],
-#                 "base_ce": [], "base_srpgr": [], "base_compact_sep": [], "base_gics": [], "base_weighted_gics": [],
-#                 "base_energy_margin": [], "base_energy_margin_weighted": [],
-#                 "base_energy_margin_violation": [], "base_energy_margin_gap": [],
-#                 "base_gics_anchors": [], "base_gics_pos": [],
-#                 "base_pgr": [], "base_pgr_unweighted": [], "base_pgr_compact": [],
-#                 "base_pgr_center": [], "base_pgr_subspace": [], "base_pgr_band": [], "base_pgr_volume": [],
-#                 "base_pgr_valid_class_count": [], "base_pgr_subspace_pair_count": [], "base_pgr_band_pair_count": [], "base_pgr_volume_factor": [],
-#                 "base_pgr_subspace_max_overlap": [], "base_pgr_band_max_similarity": [],
-#                 "base_pgr_band_guided_conflict_mean": [], "base_pgr_band_guided_conflict_max": [],
-#                 "base_spectral_shape": [], "base_spectral_shape_raw": [], "base_spectral_shape_mean_similarity": [],
-#                 "base_spectral_shape_pairs": [], "base_spectral_shape_guided_conflict_mean": [],
-#                 "base_spectral_shape_guided_conflict_max": [], "base_spectral_active": [],
-#                 "batch_compact": [], "batch_center_margin": [], "batch_min_center_margin": [],
-#                 "feature_subspace_overlap": [], "band_overlap": [], "spectral_shape_overlap": [],
-#                 "spectral_shape_similarity_mean": [], "spectral_shape_similarity_max": [],
-#                 "geometry_conflict_mean": [], "geometry_conflict_max": [], "geometry_reserve_score": [],
-#                 "base_cert_geom_acc": [], "base_cert_min_reliability": [],
-#                 "base_cert_max_subspace_overlap": [], "base_cert_max_band_similarity": [], "base_cert_max_spectral_shape_similarity": [],
-#                 "base_cert_max_geometry_conflict": [], "base_cert_max_band_guided_geometry_conflict": [],
-#                 "base_cert_max_spectral_guided_geometry_conflict": [], "base_cert_valid": [],
-#             }
-
-#             best_score = -1e18
-#             best_key = (-1, -1e18)  # (certificate_valid_priority, checkpoint_score)
-#             best_state = None
-#             best_epoch_cert: Optional[Dict[str, Any]] = None
-#             no_improve = 0
-#             epochs = int(epochs)
-
-#             if hasattr(self, "_print_trainable_summary"):
-#                 self._print_trainable_summary(phase)
-#             print(f"[Base] Temporary CE head: feature_dim={feature_dim}, classes={len(phase_class_ids)}. It will be discarded after geometry handoff.")
-#             print("[Base Objective] MANDATORY: balanced CE + GICS + PGR(compact, center, subspace, band, volume) + base geometry-energy margin on canonical projected z-space.")
-
-#             for epoch in range(epochs):
-#                 self._base_epoch = int(epoch)
-#                 self._set_model_phase_and_old_count(phase, 0)
-
-#                 tr_loss, head_train_acc = self.train_one_base_epoch(
-#                     train_loader,
-#                     optimizer,
-#                     base_head,
-#                     phase_class_ids,
-#                     label_map,
-#                     trainable_params,
-#                 )
-
-#                 self.rebuild_base_geometry_bank(phase, phase_class_ids, split="train")
-
-#                 train_eval_stats = self.validate_geometry_only(train_loader, old_class_count=0)
-#                 val_stats = self.validate_geometry_only(val_loader, old_class_count=0)
-#                 scheduler.step()
-
-#                 base_stats = getattr(self, "_last_base_stats", {})
-#                 geom_stats = self._base_geometry_global_metrics()
-#                 epoch_cert = self.compute_base_certificate(
-#                     phase_class_ids,
-#                     val_stats=val_stats,
-#                     train_stats=train_eval_stats,
-#                     head_train_acc=head_train_acc,
-#                 )
-
-#                 history["train_loss"].append(float(tr_loss))
-#                 history["train_acc"].append(float(train_eval_stats["acc"]))
-#                 history["val_loss"].append(float(val_stats["loss"]))
-#                 history["val_acc"].append(float(val_stats["acc"]))
-#                 history["val_old_acc"].append(float(val_stats.get("old_acc", 0.0)))
-#                 history["val_new_acc"].append(float(val_stats.get("new_acc", 0.0)))
-#                 history["val_hm"].append(float(val_stats.get("hm", 0.0)))
-
-#                 for k in (
-#                     "ce", "srpgr", "compact_sep", "gics", "weighted_gics",
-#                     "energy_margin", "energy_margin_weighted", "energy_margin_violation", "energy_margin_gap",
-#                     "gics_anchors", "gics_pos", "pgr", "pgr_unweighted",
-#                     "pgr_compact", "pgr_center", "pgr_subspace", "pgr_band", "pgr_volume",
-#                     "pgr_valid_class_count", "pgr_subspace_pair_count", "pgr_band_pair_count", "pgr_volume_factor",
-#                     "pgr_subspace_max_overlap", "pgr_band_max_similarity", "pgr_band_guided_conflict_mean", "pgr_band_guided_conflict_max",
-#                     "spectral_shape", "spectral_shape_raw", "spectral_shape_mean_similarity", "spectral_shape_pairs",
-#                     "spectral_shape_guided_conflict_mean", "spectral_shape_guided_conflict_max", "spectral_active",
-#                     "batch_compact", "batch_center_margin", "batch_min_center_margin",
-#                 ):
-#                     history_key = f"base_{k}" if k not in {"batch_compact", "batch_center_margin", "batch_min_center_margin"} else k
-#                     if history_key in history:
-#                         history[history_key].append(float(base_stats.get(k, 0.0)))
-
-#                 for k in ("feature_subspace_overlap", "band_overlap", "spectral_shape_overlap", "spectral_shape_similarity_mean", "spectral_shape_similarity_max", "geometry_conflict_mean", "geometry_conflict_max", "geometry_reserve_score"):
-#                     history[k].append(float(geom_stats.get(k, 0.0)))
-
-#                 history["base_cert_geom_acc"].append(float(epoch_cert.get("geom_val_acc", 0.0)))
-#                 history["base_cert_min_reliability"].append(float(epoch_cert.get("min_reliability", 0.0)))
-#                 history["base_cert_max_subspace_overlap"].append(float(epoch_cert.get("max_subspace_overlap", 0.0)))
-#                 history["base_cert_max_band_similarity"].append(float(epoch_cert.get("max_band_similarity", 0.0)))
-#                 history["base_cert_max_spectral_shape_similarity"].append(float(epoch_cert.get("max_spectral_shape_similarity", 0.0)))
-#                 history["base_cert_max_geometry_conflict"].append(float(epoch_cert.get("max_geometry_conflict", 0.0)))
-#                 history["base_cert_max_band_guided_geometry_conflict"].append(float(epoch_cert.get("max_band_guided_geometry_conflict", 0.0)))
-#                 history["base_cert_max_spectral_guided_geometry_conflict"].append(float(epoch_cert.get("max_spectral_guided_geometry_conflict", 0.0)))
-#                 history["base_cert_valid"].append(1.0 if bool(epoch_cert.get("valid", False)) else 0.0)
-
-#                 score_stats = dict(val_stats)
-#                 score_stats.update(geom_stats)
-#                 score_stats.update({f"cert_{k}": v for k, v in epoch_cert.items() if isinstance(v, (int, float, bool))})
-#                 score_stats["geometry_score"] = float(geom_stats.get("geometry_reserve_score", 0.0))
-#                 score_stats["base_energy_margin_violation"] = float(base_stats.get("energy_margin_violation", 0.0))
-#                 score_stats["base_energy_margin_gap"] = float(base_stats.get("energy_margin_gap", 0.0))
-#                 score = self.compute_checkpoint_score(score_stats, geom_stats)
-#                 history["checkpoint_score"].append(float(score))
-
-#                 print(
-#                     f"[Base Prep] Epoch {epoch + 1:03d}/{epochs} | "
-#                     f"Loss={tr_loss:.4f} | HeadAcc={head_train_acc:.2f}% | "
-#                     f"GeomTrain={train_eval_stats['acc']:.2f}% | GeomVal={val_stats['acc']:.2f}% | "
-#                     f"CE={float(base_stats.get('ce', 0.0)):.4f} | "
-#                     f"EnergyMargin={float(base_stats.get('energy_margin_weighted', 0.0)):.4f} | "
-#                     f"EViol={float(base_stats.get('energy_margin_violation', 0.0)):.3f} | "
-#                     f"EGap={float(base_stats.get('energy_margin_gap', 0.0)):.4f} | "
-#                     f"Compact={float(base_stats.get('pgr_compact', 0.0)):.4f} | "
-#                     f"Sep={float(base_stats.get('pgr_center', 0.0)):.4f} | "
-#                     f"Subspace={float(base_stats.get('pgr_subspace', 0.0)):.4f} | "
-#                     f"Band={float(base_stats.get('pgr_band', 0.0)):.4f} | "
-#                     f"Volume={float(base_stats.get('pgr_volume', 0.0)):.4f} | "
-#                     f"SpecShape={float(base_stats.get('spectral_shape', 0.0)):.4f} | "
-#                     f"PGRSubMax={float(base_stats.get('pgr_subspace_max_overlap', 0.0)):.4f} | "
-#                     f"PGRBandMax={float(base_stats.get('pgr_band_max_similarity', 0.0)):.4f} | "
-#                     f"PGRBandGuide={float(base_stats.get('pgr_band_guided_conflict_max', 0.0)):.4f} | "
-#                     f"SpecGuide={float(base_stats.get('spectral_shape_guided_conflict_max', 0.0)):.4f} | "
-#                     f"OverlapMax={float(epoch_cert.get('max_subspace_overlap', 0.0)):.4f} | "
-#                     f"ConflictMax={float(epoch_cert.get('max_geometry_conflict', 0.0)):.4f} | "
-#                     f"GuidedMax={max(float(epoch_cert.get('max_band_guided_geometry_conflict', 0.0)), float(epoch_cert.get('max_spectral_guided_geometry_conflict', 0.0))):.4f} | "
-#                     f"Reserve={float(epoch_cert.get('geometry_reserve_score', 0.0)):.4f} | "
-#                     f"Score={float(score):.4f} | State={'PASS' if bool(epoch_cert.get('valid', False)) else 'CONFLICT'}"
-#                 )
-
-#                 # Checkpoint selection must be state-aware.  A tiny
-#                 # score increase from a CONFLICT epoch must not replace an
-#                 # earlier PASS epoch, because the final state is consumed by
-#                 # the incremental phase.
-#                 cert_priority = 1 if bool(epoch_cert.get("valid", False)) else 0
-#                 candidate_key = (cert_priority, float(score))
-#                 if candidate_key > best_key:
-#                     best_key = candidate_key
-#                     best_score = float(score)
-#                     best_state = self._capture_state()
-#                     best_epoch_cert = dict(epoch_cert)
-#                     no_improve = 0
-#                 else:
-#                     no_improve += 1
-
-#                 if self.early_stop_patience > 0 and no_improve >= self.early_stop_patience:
-#                     print(f"[EarlyStop] Base phase: no improvement for {no_improve} epochs.")
-#                     break
-
-#             if best_state is not None:
-#                 self.model.load_state_dict(best_state)
-#                 self._set_model_phase_and_old_count(phase, 0)
-#                 if isinstance(best_epoch_cert, dict):
-#                     self._best_base_epoch_certificate = best_epoch_cert
-#                     print(
-#                         "[Base] Restored state-aware best state | "
-#                         f"State={'PASS' if bool(best_epoch_cert.get('valid', False)) else 'CONFLICT'} | "
-#                         f"Score={best_score:.4f}"
-#                     )
-
-#             print("[Base] Final GeometryBank rebuild from restored best canonical z-space.")
-#             self._finalize_phase_memory(phase, split="train")
-#             self._set_model_phase_and_old_count(phase, len(phase_class_ids))
-#             self._assert_base_bank_valid(phase_class_ids)
-
-#             # Freeze only after final rebuild and make the base handoff contract
-#             # explicit: base rows valid, future rows invalid, base rows frozen.
-#             if hasattr(self.model, "assert_base_handoff_ready"):
-#                 self.model.assert_base_handoff_ready(phase_class_ids, freeze=True, strict=True)
-#             elif hasattr(self.model, "geometry_bank"):
-#                 gb = self.model.geometry_bank
-#                 if hasattr(gb, "assert_phase0_base_handoff_ready"):
-#                     gb.assert_phase0_base_handoff_ready(phase_class_ids, freeze=True, strict=True)
-#                 elif hasattr(gb, "freeze_classes"):
-#                     gb.freeze_classes(phase_class_ids)
-#                 elif hasattr(gb, "freeze_classes_up_to"):
-#                     gb.freeze_classes_up_to(len(phase_class_ids))
-#             self._assert_base_bank_valid(phase_class_ids)
-#             self._print_base_geometry_diagnostics(phase_class_ids)
-
-#             final_train_stats = self.validate_geometry_only(train_loader, old_class_count=0)
-#             final_val_stats = self.validate_geometry_only(val_loader, old_class_count=0)
-#             final_cert = self.compute_base_certificate(
-#                 phase_class_ids,
-#                 val_stats=final_val_stats,
-#                 train_stats=final_train_stats,
-#                 head_train_acc=history["train_acc"][-1] if history.get("train_acc") else None,
-#             )
-#             history["base_geometry_certificate"] = final_cert
-#             self._enforce_base_geometry_certificate(final_cert)
-#             base_handoff = self.finalize_base_handoff(phase_class_ids, final_cert, history)
-#             history["base_handoff"] = base_handoff
-
-#             if hasattr(self, "diagnose_full_base_geometry"):
-#                 try:
-#                     self._last_base_geometry_diagnostics = self.diagnose_full_base_geometry(
-#                         loader=val_loader,
-#                         phase_class_ids=phase_class_ids,
-#                         anchors_per_class=int(getattr(self.args, "geometry_diag_anchors_per_class", 64)),
-#                         topk_pairs=int(getattr(self.args, "geometry_diag_topk_pairs", 20)),
-#                         topk_bands=int(getattr(self.args, "geometry_diag_topk_bands", 5)),
-#                     )
-#                     if hasattr(self, "_print_geometry_diagnostics_summary"):
-#                         self._print_geometry_diagnostics_summary(self._last_base_geometry_diagnostics)
-#                     if hasattr(self, "_save_geometry_diagnostics_to_files"):
-#                         saved_paths = self._save_geometry_diagnostics_to_files(self._last_base_geometry_diagnostics, phase=phase)
-#                         print(f"[Geometry Health] saved diagnostics: {saved_paths.get('json', '')}")
-#                 except Exception as exc:
-#                     print(f"[Geometry Health WARN] could not create persistent diagnostics: {exc}")
-
-#             self._base_ce_head = None
-#             if hasattr(self.model, "drop_base_ce_head"):
-#                 self.model.drop_base_ce_head()
-#             self._assert_base_ce_head_discarded()
-#             if hasattr(self, "save_checkpoint"):
-#                 self.save_checkpoint(phase, history)
-#             print(
-#                 f"[Base Handoff] saved: {base_handoff.get('handoff_json_path')} | "
-#                 f"reserved_alignment_required={base_handoff.get('reserved_alignment_required')} | "
-#                 f"recommended_margin={float(base_handoff.get('recommended_insertion_margin', 0.0)):.3f}"
-#             )
-#             return history
-#         finally:
-#             if base_eval_state is not None:
-#                 self._restore_base_validation_mode(base_eval_state)
-#             self.restore_runtime_state(incremental_runtime_state)
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# from typing import Any, Dict, Iterable, Optional, Tuple
-
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# import torch.optim as optim
-
-# from losses.loss import (
-#     base_geometry_involved_contrastive_loss,
-#     prospective_geometry_reserve_loss,
-#     base_center_overlap_diagnostics,
-# )
-
-# try:
-#     from losses.loss import spectral_shape_discrimination_loss
-# except Exception:  # pragma: no cover - backward compatibility with older loss files
-#     spectral_shape_discrimination_loss = None
-
-
-# class BasePhaseTrainer:
-#     # ============================================================
-#     # Config helpers
-#     # ============================================================
-#     def _base_cfg_float(self, name: str, default: float) -> float:
-#         return float(getattr(self, name, getattr(self.args, name, default)))
-
-#     def _base_cfg_int(self, name: str, default: int) -> int:
-#         return int(getattr(self, name, getattr(self.args, name, default)))
-
-#     def _base_cfg_bool(self, name: str, default: bool) -> bool:
-#         v = getattr(self, name, getattr(self.args, name, default))
-#         if isinstance(v, str):
-#             return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-#         return bool(v)
-
-#     def _zero(self, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-#         if isinstance(ref, torch.Tensor):
-#             return ref.sum() * 0.0
-#         return torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
-#     def _enforce_base_contract(self) -> None:
-#         """Force the base phase to the SRGP geometry-construction path.
-
-#         Base training is allowed to update the backbone/projection and a
-#         temporary CE head. It is not allowed to train incremental adapters,
-#         geometry transport modules, or calibration modules. Unlike the previous
-#         cleaned trainer, this method does NOT disable spectral geometry. The
-#         base phase must prepare the exact SRGP memory consumed later by the
-#         incremental phase.
-#         """
-#         forced_false = (
-#             "use_incremental_adapter",
-#             "use_geometry_transport",
-#             "use_geometry_calibrator",
-#             "use_bicyc_geometry_cycle",
-#             "use_descriptor_refinement",
-#             "use_measured_energy_calibration",
-#             "allow_incremental_projection_training",
-#         )
-#         for key in forced_false:
-#             if hasattr(self.args, key):
-#                 setattr(self.args, key, False)
-
-#         # Keep the method coherent: GICS/PGR/SpectralShape are internal parts of
-#         # SRPGR. Do not expose legacy spectral-GICS knobs as independent losses.
-#         for key in (
-#             "base_gics_spectral_weight",
-#             "base_gics_band_weight",
-#             "base_gics_spectral_temperature",
-#             "base_gics_band_temperature",
-#         ):
-#             if hasattr(self.args, key):
-#                 setattr(self.args, key, 0.0)
-
-#         if hasattr(self.args, "use_spectral_geometry"):
-#             setattr(self.args, "use_spectral_geometry", True)
-#         if hasattr(self.args, "base_classifier_mode"):
-#             setattr(self.args, "base_classifier_mode", "srgp")
-#         if hasattr(self.args, "eval_classifier_mode"):
-#             setattr(self.args, "eval_classifier_mode", "srgp")
-
-#         if self._base_cfg_bool("use_mssl_loss", False) and self._base_cfg_float("mssl_weight", 0.0) > 0.0:
-#             if not self._base_cfg_bool("unsafe_ablation_use_mssl_loss", False):
-#                 raise RuntimeError(
-#                     "SRGP base trainer uses one coherent objective: CE + SRPGR. "
-#                     "MSSL must be a separate ablation, not mixed into the main method."
-#                 )
-
-#         if hasattr(self.model, "use_incremental_adapter"):
-#             self.model.use_incremental_adapter = False
-#         if hasattr(self.model, "use_bicyc_geometry_cycle"):
-#             self.model.use_bicyc_geometry_cycle = False
-#         if hasattr(self.model, "use_geometry_calibrator"):
-#             self.model.use_geometry_calibrator = False
-#         if hasattr(self.model, "use_spectral_geometry"):
-#             self.model.use_spectral_geometry = True
-#         if hasattr(self.model, "disable_incremental_adapter"):
-#             self.model.disable_incremental_adapter()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-
-#     # ============================================================
-#     # Trainability
-#     # ============================================================
-#     def _set_base_trainability(self, base_head: nn.Module) -> None:
-#         """
-#         Base phase should train representation + temporary CE head only.
-
-#         It must not train geometry classifier/calibrator/adapters. The bank is
-#         rebuilt from z after updates; it is not a trainable memory module.
-#         """
-#         self._enforce_base_contract()
-#         blocked_prefixes = (
-#             "classifier.",
-#             "geometry_bank.",
-#             "geometry_calibrator.",
-#             "geometry_cycle_calibrator.",
-#             "incremental_adapter.",
-#             "geometry_plastic_adapter.",
-#             "base_ce_head.",
-#         )
-#         blocked_keywords = ("bicyc", "transport", "calibrator")
-#         for name, p in self.model.named_parameters():
-#             lname = name.lower()
-#             blocked = name.startswith(blocked_prefixes) or any(k in lname for k in blocked_keywords)
-#             p.requires_grad = not blocked
-
-#         for p in base_head.parameters():
-#             p.requires_grad = True
-
-#         if hasattr(self.model, "disable_incremental_adapter"):
-#             self.model.disable_incremental_adapter()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-
-#     def _base_trainable_parameters(self, base_head: nn.Module) -> list[nn.Parameter]:
-#         params = [p for p in self.model.parameters() if p.requires_grad]
-#         params.extend([p for p in base_head.parameters() if p.requires_grad])
-#         # deduplicate in case a future model stores the same head internally
-#         unique: list[nn.Parameter] = []
-#         seen = set()
-#         for p in params:
-#             pid = id(p)
-#             if pid not in seen:
-#                 unique.append(p)
-#                 seen.add(pid)
-#         if not unique:
-#             raise RuntimeError("No trainable parameters found for base phase.")
-#         return unique
-
-#     # ============================================================
-#     # Label mapping / base head
-#     # ============================================================
-#     def _build_base_label_map(self, phase_class_ids: Iterable[int]) -> Dict[int, int]:
-#         return {int(c): i for i, c in enumerate([int(x) for x in phase_class_ids])}
-
-#     def _labels_to_local(self, labels: torch.Tensor, label_map: Dict[int, int]) -> torch.Tensor:
-#         labels = labels.long().view(-1)
-#         local = torch.full_like(labels, -1)
-#         for global_cls, local_cls in label_map.items():
-#             local[labels == int(global_cls)] = int(local_cls)
-#         if (local < 0).any():
-#             bad = labels[local < 0].detach().cpu().unique().tolist()
-#             raise RuntimeError(f"Base batch contains labels outside phase-0 classes: {bad}")
-#         return local
-
-#     def _extract_feature_dim(self, train_loader) -> int:
-#         was_training = bool(self.model.training)
-#         self.model.eval()
-#         with torch.no_grad():
-#             for batch in train_loader:
-#                 x, _, _, _ = self._unpack_hsi_batch(batch)
-#                 x = x.float().to(self.device, non_blocking=True)
-#                 out = self.model.extract_projected_features(x)
-#                 features = out["features"]
-#                 if features.dim() != 2:
-#                     raise RuntimeError(f"Projected features must be [B,D], got {tuple(features.shape)}")
-#                 if was_training:
-#                     self.model.train()
-#                 return int(features.size(1))
-#         if was_training:
-#             self.model.train()
-#         raise RuntimeError("Cannot infer projected feature dimension: train_loader is empty.")
-
-#     def _make_base_ce_head(self, feature_dim: int, num_base_classes: int) -> nn.Module:
-#         head = nn.Linear(int(feature_dim), int(num_base_classes), bias=True).to(self.device)
-#         nn.init.normal_(head.weight, mean=0.0, std=0.01)
-#         nn.init.zeros_(head.bias)
-#         return head
-
-#     def _batch_balanced_ce(self, logits: torch.Tensor, labels_local: torch.Tensor, num_classes: int) -> torch.Tensor:
-#         label_smoothing = self._base_cfg_float("label_smoothing", 0.0)
-#         use_balance = self._base_cfg_bool("base_class_balance", False)
-#         if not use_balance:
-#             return F.cross_entropy(logits, labels_local, label_smoothing=label_smoothing)
-
-#         counts = torch.bincount(labels_local, minlength=int(num_classes)).float().to(logits.device)
-#         weights = torch.zeros_like(counts)
-#         valid = counts > 0
-#         weights[valid] = 1.0 / counts[valid].sqrt().clamp_min(1.0)
-#         weights = weights / weights[valid].mean().clamp_min(1e-6)
-#         return F.cross_entropy(logits, labels_local, weight=weights, label_smoothing=label_smoothing)
-
-#     # ============================================================
-#     # GICS key view
-#     # ============================================================
-#     def _augment_gics_key_view(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         Mild HSI-safe augmentation for the detached key branch.
-
-#         Default is identity. Do not use aggressive band dropping; PCA/band axes
-#         carry material information and corrupting them makes GICS learn nonsense.
-#         """
-#         if x is None or not torch.is_tensor(x) or x.numel() == 0:
-#             return x
-
-#         x_key = x.clone()
-#         noise_std = self._base_cfg_float("base_gics_key_noise_std", 0.0)
-#         scale_jitter = self._base_cfg_float("base_gics_key_scale_jitter", 0.0)
-#         band_drop = self._base_cfg_float("base_gics_key_band_drop", 0.0)
-#         spatial_drop = self._base_cfg_float("base_gics_key_spatial_drop", 0.0)
-
-#         if noise_std > 0.0:
-#             x_key = x_key + torch.randn_like(x_key) * float(noise_std)
-
-#         if scale_jitter > 0.0:
-#             shape = [x_key.size(0)] + [1] * (x_key.dim() - 1)
-#             scale = 1.0 + float(scale_jitter) * torch.randn(shape, device=x_key.device, dtype=x_key.dtype)
-#             x_key = x_key * scale
-
-#         if band_drop > 0.0 and x_key.dim() >= 4 and x_key.size(1) > 1:
-#             keep = (torch.rand(x_key.size(0), x_key.size(1), 1, 1, device=x_key.device) > float(band_drop)).to(x_key.dtype)
-#             all_zero = keep.flatten(1).sum(dim=1) <= 0
-#             if bool(all_zero.any().item()):
-#                 keep[all_zero, 0, 0, 0] = 1.0
-#             x_key = x_key * keep
-
-#         if spatial_drop > 0.0 and x_key.dim() >= 4 and x_key.size(-2) > 1 and x_key.size(-1) > 1:
-#             smask = (torch.rand(x_key.size(0), 1, x_key.size(-2), x_key.size(-1), device=x_key.device) > float(spatial_drop)).to(x_key.dtype)
-#             x_key = x_key * smask
-
-#         return x_key
-
-#     @staticmethod
-#     def _band_summary_from_spectral(spectral_summary: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-#         """Fallback band signature used only when the model did not expose band_summary.
-
-#         The updated NECILModel should normally provide center-pixel band_summary.
-#         This fallback is intentionally conservative: signed/PCA-like vectors are
-#         converted by softmax, non-negative rows are sum-normalized, and degenerate
-#         rows become uniform.  It is a reliability/risk signal, not classifier input.
-#         """
-#         if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-#             return None
-#         if spectral_summary.dim() != 2 or spectral_summary.size(1) <= 0:
-#             return None
-#         s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#         if bool((s < 0).any().item()):
-#             return torch.softmax(s, dim=1)
-#         b = s.clamp_min(0.0)
-#         denom = b.sum(dim=1, keepdim=True)
-#         uniform = torch.full_like(b, 1.0 / float(max(int(b.size(1)), 1)))
-#         return torch.where(denom > 1e-8, b / denom.clamp_min(1e-8), uniform)
-
-#     def _base_spectral_summary_is_physical(self, explicit: Optional[bool] = None) -> bool:
-#         """Whether spectral_summary is wavelength-ordered raw HSI, not PCA.
-
-#         Spectral derivatives are physically meaningful only for ordered bands.
-#         If the pipeline uses PCA and no raw center spectra are supplied, this
-#         returns False and the spectral-shape part of SRPGR becomes a safe zero.
-#         """
-#         if explicit is not None:
-#             return bool(explicit)
-#         if hasattr(self.args, "base_spectral_summary_is_physical"):
-#             return self._base_cfg_bool("base_spectral_summary_is_physical", False)
-#         if hasattr(self.args, "spectral_summary_is_physical"):
-#             return self._base_cfg_bool("spectral_summary_is_physical", False)
-#         pca = int(getattr(self.args, "pca_components", 0) or 0)
-#         allow_nonphysical = self._base_cfg_bool("allow_nonphysical_spectral_summary", False)
-#         if pca > 0 and not allow_nonphysical:
-#             return False
-#         return self._base_cfg_bool("assume_input_spectral_order_is_physical", False)
-
-#     def _normalize_external_spectra(self, spectra: Optional[torch.Tensor], x: torch.Tensor) -> Optional[torch.Tensor]:
-#         """Return external spectra as [B,S] when the loader provides raw center spectra."""
-#         if spectra is None or not torch.is_tensor(spectra) or spectra.numel() == 0:
-#             return None
-#         s = spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
-#         if s.dim() == 4:
-#             # [B,S,H,W] raw cube: center pixel only.
-#             s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#         elif s.dim() == 3:
-#             # [B,S,L] or [B,H,W]-like metadata: keep spectral-like axis conservative.
-#             if s.size(0) == x.size(0):
-#                 s = s.flatten(1)
-#         elif s.dim() == 1:
-#             s = s.view(x.size(0), -1)
-#         elif s.dim() != 2:
-#             s = s.flatten(1)
-#         if s.size(0) != x.size(0):
-#             raise RuntimeError(f"External spectral summary batch mismatch: spectra={tuple(s.shape)}, x={tuple(x.shape)}")
-#         return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-
-#     @staticmethod
-#     def _center_spectrum_from_input(x: torch.Tensor) -> torch.Tensor:
-#         """Fallback center spectrum from model input. Usually PCA, so not physical by default."""
-#         if x.dim() == 4:
-#             return x[:, :, x.size(-2) // 2, x.size(-1) // 2]
-#         if x.dim() == 3:
-#             return x.flatten(1)
-#         if x.dim() == 2:
-#             return x
-#         return x.flatten(1)
-
-#     def _call_extract_projected_features(
-#         self,
-#         x: torch.Tensor,
-#         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Call updated NECILModel when available, with backward compatibility."""
-#         try:
-#             return self.model.extract_projected_features(
-#                 x,
-#                 spectral_summary=spectral_summary,
-#                 spectral_summary_is_physical=self._base_spectral_summary_is_physical(spectral_summary_is_physical),
-#             )
-#         except TypeError:
-#             return self.model.extract_projected_features(x)
-
-#     def _base_spectral_shape_regularizer(
-#         self,
-#         *,
-#         features: torch.Tensor,
-#         labels: torch.Tensor,
-#         spectral_summary: Optional[torch.Tensor],
-#         spectral_summary_is_physical: bool,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Spectral-shape component of SRPGR.
-
-#         This is a safe no-op unless physical raw spectra are available and the
-#         SRGP loss file exposes spectral_shape_discrimination_loss.
-#         """
-#         if spectral_shape_discrimination_loss is None:
-#             z = self._zero(features)
-#             return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-#         weight = self._base_cfg_float("base_spectral_shape_weight", 0.05)
-#         if weight <= 0.0:
-#             z = self._zero(features)
-#             return {"total": z, "spectral_shape": z, "mean_similarity": z, "pair_count": z, "valid_class_count": z}
-#         parts = spectral_shape_discrimination_loss(
-#             spectral_summary=spectral_summary,
-#             labels=labels,
-#             features=features,
-#             spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#             require_physical_summary=self._base_cfg_bool("spectral_require_physical_summary", True),
-#             min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#             max_shape_similarity=self._base_cfg_float("base_max_spectral_shape_similarity", 0.75),
-#             risk_center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-#             risk_weight=self._base_cfg_float("base_spectral_shape_risk_weight", 1.0),
-#             return_parts=True,
-#         )
-#         if not isinstance(parts, dict):
-#             parts = {"total": parts, "spectral_shape": parts.detach()}
-#         raw_total = parts.get("total", self._zero(features))
-#         parts["raw_total"] = raw_total.detach()
-#         parts["total"] = float(weight) * raw_total
-#         return parts
-
-#     def _extract_base_views(
-#         self,
-#         x: torch.Tensor,
-#         external_spectra: Optional[torch.Tensor] = None,
-#     ) -> Tuple[
-#         torch.Tensor,
-#         Optional[torch.Tensor],
-#         Optional[torch.Tensor],
-#         torch.Tensor,
-#         Optional[torch.Tensor],
-#         Optional[torch.Tensor],
-#         bool,
-#     ]:
-#         """Return query/key views for CE + unified SRPGR.
-
-#         The spectral summary is physical only when raw wavelength-ordered spectra
-#         are supplied by the dataloader. If the model input is PCA, the fallback
-#         center vector may still be used for band diagnostics, but not for
-#         spectral-shape derivatives.
-#         """
-#         ext_s = self._normalize_external_spectra(external_spectra, x)
-#         if ext_s is not None:
-#             input_s = ext_s
-
-#             # Reduced-band safety rule.  If metadata spectra have the same
-#             # channel count as the model input while PCA/iPCA is active, they are
-#             # reduced components, not physical wavelength-ordered spectra.
-#             # Treat them as non-physical so SRPGR spectral-derivative terms are
-#             # gated off and the model never mixes 30-D band weights with 200-D
-#             # raw spectra.
-#             pca_components = int(getattr(self.args, "pca_components", 0) or 0)
-#             uses_reduction = pca_components > 0 and not bool(getattr(self.args, "no_pca", False))
-#             input_channels = int(x.size(1)) if torch.is_tensor(x) and x.dim() >= 2 else 0
-#             spectra_dim = int(input_s.size(1)) if torch.is_tensor(input_s) and input_s.dim() == 2 else 0
-#             reduced_metadata = bool(uses_reduction and input_channels > 0 and spectra_dim == input_channels)
-
-#             if reduced_metadata:
-#                 input_s_is_physical = False
-#             else:
-#                 input_s_is_physical = self._base_spectral_summary_is_physical(
-#                     self._base_cfg_bool("external_spectra_are_physical", True)
-#                 )
-#         else:
-#             input_s = self._center_spectrum_from_input(x)
-#             input_s_is_physical = self._base_spectral_summary_is_physical(None)
-
-#         out_q = self._call_extract_projected_features(
-#             x,
-#             spectral_summary=input_s,
-#             spectral_summary_is_physical=input_s_is_physical,
-#         )
-#         z_q = out_q["features"]
-#         if z_q.dim() != 2 or not torch.isfinite(z_q).all():
-#             raise RuntimeError(f"Invalid projected query features: {tuple(z_q.shape)}")
-#         if "projected_features" in out_q and torch.is_tensor(out_q["projected_features"]):
-#             if not torch.allclose(z_q, out_q["projected_features"], atol=1e-5, rtol=1e-4):
-#                 raise RuntimeError(
-#                     "Base feature-space mismatch: out['features'] and out['projected_features'] differ. "
-#                     "SRPGR/GeometryBank must all use the same canonical projected z-space."
-#                 )
-
-#         s_q = out_q.get("spectral_summary", None)
-#         if not (torch.is_tensor(s_q) and s_q.dim() == 2 and s_q.size(0) == x.size(0)):
-#             s_q = input_s
-#         spectral_is_physical = bool(out_q.get("spectral_summary_is_physical", input_s_is_physical))
-#         b_q = out_q.get("band_summary", out_q.get("band_importance", None))
-#         if b_q is None:
-#             b_q = self._band_summary_from_spectral(s_q)
-
-#         x_key = self._augment_gics_key_view(x)
-#         # The key view uses the same spectral summary because physical spectral
-#         # identity belongs to the center pixel/label, not to the mild feature-view
-#         # augmentation. This avoids corrupting spectral-shape targets.
-#         was_training = bool(self.model.training)
-#         self.model.eval()
-#         with torch.no_grad():
-#             out_k = self._call_extract_projected_features(
-#                 x_key,
-#                 spectral_summary=input_s,
-#                 spectral_summary_is_physical=spectral_is_physical,
-#             )
-#         if was_training:
-#             self.model.train()
-
-#         z_k = out_k["features"].detach()
-#         if "projected_features" in out_k and torch.is_tensor(out_k["projected_features"]):
-#             if not torch.allclose(out_k["features"], out_k["projected_features"], atol=1e-5, rtol=1e-4):
-#                 raise RuntimeError("SRPGR key branch is not in canonical projected z-space.")
-#         s_k = out_k.get("spectral_summary", None)
-#         if not (torch.is_tensor(s_k) and s_k.dim() == 2 and s_k.size(0) == x.size(0)):
-#             s_k = s_q
-#         b_k = out_k.get("band_summary", out_k.get("band_importance", None))
-#         if b_k is None:
-#             b_k = self._band_summary_from_spectral(s_k)
-#         if torch.is_tensor(s_k):
-#             s_k = s_k.detach()
-#         if torch.is_tensor(b_k):
-#             b_k = b_k.detach()
-
-#         if z_k.shape != z_q.shape:
-#             raise RuntimeError(f"SRPGR key/query mismatch: query={tuple(z_q.shape)}, key={tuple(z_k.shape)}")
-#         if not torch.isfinite(z_k).all():
-#             raise RuntimeError("Projected key features contain NaN/Inf.")
-#         return z_q, s_q, b_q, z_k, s_k, b_k, spectral_is_physical
-
-#     @torch.no_grad()
-#     def _rebuild_base_geometry_bank_for_validation(
-#         self,
-#         phase: int,
-#         phase_class_ids: Iterable[int],
-#         *,
-#         split: str = "train",
-#     ) -> None:
-#         """Rebuild base GeometryBank rows from canonical z before geometry validation.
-
-#         Base validation uses the geometry-energy classifier, so the bank must be
-#         synchronized with the current representation every epoch. This method
-#         bypasses refresh_before_validation because base geometry validation is
-#         meaningless with stale or unbuilt rows.
-#         """
-#         if not hasattr(self, "_build_class_memory_from_current_phase"):
-#             raise AttributeError("TrainerHelper._build_class_memory_from_current_phase() is required.")
-#         old_training_state = bool(self.model.training)
-#         ctx = self.dataset.memory_build_context(int(phase)) if hasattr(self.dataset, "memory_build_context") else None
-#         if ctx is None:
-#             from contextlib import nullcontext
-#             ctx = nullcontext()
-#         with ctx:
-#             for cls in [int(c) for c in phase_class_ids]:
-#                 self._build_class_memory_from_current_phase(cls, split=split)
-#         self.model.train(old_training_state)
-
-#     # ============================================================
-#     # Diagnostics
-#     # ============================================================
-#     @torch.no_grad()
-#     def _base_geometry_global_metrics(self) -> Dict[str, float]:
-#         """Diagnostics compatible with the cleaned bank only."""
-#         if not hasattr(self.model, "geometry_bank") or not hasattr(self.model.geometry_bank, "geometry_diagnostics"):
-#             return {}
-#         try:
-#             diag = self.model.geometry_bank.geometry_diagnostics()
-#         except Exception:
-#             return {}
-#         out: Dict[str, float] = {}
-#         for key in (
-#             "feature_subspace_overlap",
-#             "band_overlap",
-#             "spectral_shape_overlap",
-#             "spectral_shape_similarity_mean",
-#             "spectral_shape_similarity_max",
-#             "geometry_conflict_mean",
-#             "geometry_conflict_max",
-#             "geometry_reserve_score",
-#             "feature_rank_usage",
-#         ):
-#             value = diag.get(key, None) if isinstance(diag, dict) else None
-#             if torch.is_tensor(value) and value.numel() == 1:
-#                 out[key] = float(value.detach().cpu().item())
-#             elif isinstance(value, (int, float)):
-#                 out[key] = float(value)
-#         return out
-
-#     @staticmethod
-#     def _scalar(value: Any, default: float = 0.0) -> float:
-#         if torch.is_tensor(value):
-#             if value.numel() == 0:
-#                 return float(default)
-#             return float(value.detach().float().mean().cpu().item())
-#         if isinstance(value, (int, float)):
-#             return float(value)
-#         return float(default)
-
-#     @torch.no_grad()
-#     def _build_base_geometry_certificate(
-#         self,
-#         phase_class_ids: Iterable[int],
-#         *,
-#         val_stats: Optional[Dict[str, Any]] = None,
-#         train_stats: Optional[Dict[str, Any]] = None,
-#         head_train_acc: Optional[float] = None,
-#     ) -> Dict[str, Any]:
-#         """Create the base-to-incremental geometry certificate.
-
-#         This is the explicit PRL-style handoff: base phase prepares a canonical
-#         geometry field; incremental phase should consume this certificate to
-#         decide risk-aware replay, descriptor admission, and old/new margins.
-#         """
-#         classes = [int(c) for c in phase_class_ids]
-#         cert: Dict[str, Any] = {
-#             "phase": 0,
-#             "class_ids": classes,
-#             "num_base_classes": len(classes),
-#             "valid": False,
-#             "errors": [],
-#             "warnings": [],
-#         }
-#         if not classes:
-#             cert["errors"].append("no base classes")
-#             return cert
-
-#         try:
-#             bank = self._get_valid_base_bank(max(classes))
-#         except Exception as exc:
-#             cert["errors"].append(f"bank_unavailable: {exc}")
-#             return cert
-
-#         idx = torch.as_tensor(classes, device=self.device, dtype=torch.long)
-#         counts = bank.get("sample_counts")
-#         ranks = bank.get("active_ranks")
-#         rel = bank.get("reliability")
-#         feat_rel = bank.get("feature_reliability", rel)
-#         band_rel = bank.get("band_reliability", None)
-#         variances = bank.get("variances")
-#         valid_mask = bank.get("valid_mask", None)
-#         if valid_mask is None or not torch.is_tensor(valid_mask) or valid_mask.numel() <= int(idx.max().item()):
-#             valid_mask = counts.flatten() > 0 if torch.is_tensor(counts) else torch.zeros(max(classes) + 1, device=self.device, dtype=torch.bool)
-#         valid_base = valid_mask.to(device=self.device).bool().index_select(0, idx)
-
-#         def _take(t: Optional[torch.Tensor], fill: float = 0.0) -> torch.Tensor:
-#             if not torch.is_tensor(t) or t.numel() <= int(idx.max().item()):
-#                 return torch.full((len(classes),), float(fill), device=self.device, dtype=torch.float32)
-#             return t.to(device=self.device).flatten().index_select(0, idx).float()
-
-#         count_v = _take(counts, 0.0)
-#         rank_v = _take(ranks, 0.0)
-#         rel_v = _take(rel, 0.0)
-#         feat_rel_v = _take(feat_rel, 0.0)
-#         band_rel_v = _take(band_rel, 0.0) if torch.is_tensor(band_rel) else torch.full_like(rel_v, 0.0)
-#         if torch.is_tensor(variances) and variances.dim() == 2 and variances.size(0) > int(idx.max().item()):
-#             res_v = variances.to(device=self.device).index_select(0, idx)[:, -1].float()
-#         else:
-#             res_v = torch.full((len(classes),), 0.0, device=self.device)
-
-#         sub_mean = sub_max = 0.0
-#         band_mean = band_max = 0.0
-#         spectral_mean = spectral_max = 0.0
-#         spectral_pair_count = 0
-#         conflict_mean = conflict_max = 0.0
-#         pair_count = 0
-#         gb = getattr(self.model, "geometry_bank", None)
-#         if gb is not None:
-#             try:
-#                 sub = gb.pairwise_subspace_overlap().to(device=self.device).index_select(0, idx).index_select(1, idx)
-#                 eye = torch.eye(sub.size(0), device=sub.device, dtype=torch.bool)
-#                 pair = sub[~eye]
-#                 if pair.numel() > 0:
-#                     sub_mean = float(pair.mean().detach().cpu().item())
-#                     sub_max = float(pair.max().detach().cpu().item())
-#                     pair_count = int(pair.numel())
-#             except Exception as exc:
-#                 cert["warnings"].append(f"subspace_pairwise_unavailable: {exc}")
-#             try:
-#                 band = gb.pairwise_band_similarity().to(device=self.device).index_select(0, idx).index_select(1, idx)
-#                 eye = torch.eye(band.size(0), device=band.device, dtype=torch.bool)
-#                 pair = band[~eye]
-#                 if pair.numel() > 0:
-#                     band_mean = float(pair.mean().detach().cpu().item())
-#                     band_max = float(pair.max().detach().cpu().item())
-#             except Exception as exc:
-#                 cert["warnings"].append(f"band_pairwise_unavailable: {exc}")
-#             try:
-#                 if hasattr(gb, "pairwise_spectral_shape_similarity"):
-#                     spec = gb.pairwise_spectral_shape_similarity().to(device=self.device).index_select(0, idx).index_select(1, idx)
-#                     eye = torch.eye(spec.size(0), device=spec.device, dtype=torch.bool)
-#                     pair = spec[~eye]
-#                     pair = pair[torch.isfinite(pair)]
-#                     if pair.numel() > 0:
-#                         spectral_mean = float(pair.mean().detach().cpu().item())
-#                         spectral_max = float(pair.max().detach().cpu().item())
-#                         spectral_pair_count = int(pair.numel())
-#             except Exception as exc:
-#                 cert["warnings"].append(f"spectral_shape_pairwise_unavailable: {exc}")
-#             try:
-#                 conflict = gb.geometry_conflict_matrix().to(device=self.device).index_select(0, idx).index_select(1, idx)
-#                 eye = torch.eye(conflict.size(0), device=conflict.device, dtype=torch.bool)
-#                 pair = conflict[~eye]
-#                 if pair.numel() > 0:
-#                     conflict_mean = float(pair.mean().detach().cpu().item())
-#                     conflict_max = float(pair.max().detach().cpu().item())
-#             except Exception as exc:
-#                 cert["warnings"].append(f"conflict_matrix_unavailable: {exc}")
-
-#         geom = self._base_geometry_global_metrics()
-#         cert.update({
-#             "geom_val_acc": float((val_stats or {}).get("acc", 0.0)),
-#             "geom_val_loss": float((val_stats or {}).get("loss", 0.0)),
-#             "geom_train_acc": float((train_stats or {}).get("acc", 0.0)),
-#             "head_train_acc": float(head_train_acc) if head_train_acc is not None else 0.0,
-#             "valid_row_count": int(valid_base.sum().detach().cpu().item()),
-#             "min_sample_count": float(count_v.min().detach().cpu().item()) if count_v.numel() else 0.0,
-#             "mean_sample_count": float(count_v.mean().detach().cpu().item()) if count_v.numel() else 0.0,
-#             "min_reliability": float(rel_v.min().detach().cpu().item()) if rel_v.numel() else 0.0,
-#             "mean_reliability": float(rel_v.mean().detach().cpu().item()) if rel_v.numel() else 0.0,
-#             "min_feature_reliability": float(feat_rel_v.min().detach().cpu().item()) if feat_rel_v.numel() else 0.0,
-#             "mean_feature_reliability": float(feat_rel_v.mean().detach().cpu().item()) if feat_rel_v.numel() else 0.0,
-#             "min_band_reliability": float(band_rel_v.min().detach().cpu().item()) if band_rel_v.numel() else 0.0,
-#             "mean_band_reliability": float(band_rel_v.mean().detach().cpu().item()) if band_rel_v.numel() else 0.0,
-#             "mean_active_rank": float(rank_v.mean().detach().cpu().item()) if rank_v.numel() else 0.0,
-#             "max_active_rank": float(rank_v.max().detach().cpu().item()) if rank_v.numel() else 0.0,
-#             "mean_res_var": float(res_v.mean().detach().cpu().item()) if res_v.numel() else 0.0,
-#             "max_res_var": float(res_v.max().detach().cpu().item()) if res_v.numel() else 0.0,
-#             "pair_count": pair_count,
-#             "mean_subspace_overlap": sub_mean,
-#             "max_subspace_overlap": sub_max,
-#             "mean_band_similarity": band_mean,
-#             "max_band_similarity": band_max,
-#             "mean_spectral_shape_similarity": spectral_mean,
-#             "max_spectral_shape_similarity": spectral_max,
-#             "spectral_shape_pair_count": spectral_pair_count,
-#             "mean_geometry_conflict": conflict_mean,
-#             "max_geometry_conflict": conflict_max,
-#             "geometry_reserve_score": float(geom.get("geometry_reserve_score", 0.0)),
-#             "feature_rank_usage": float(geom.get("feature_rank_usage", 0.0)),
-#         })
-
-#         thr = {
-#             "min_geom_acc": self._base_cfg_float("base_cert_min_geom_acc", 90.0),
-#             "min_reliability": self._base_cfg_float("base_cert_min_reliability", 0.15),
-#             "min_mean_reliability": self._base_cfg_float("base_cert_min_mean_reliability", 0.35),
-#             "max_subspace_overlap": self._base_cfg_float("base_cert_max_subspace_overlap", 0.65),
-#             "max_geometry_conflict": self._base_cfg_float("base_cert_max_geometry_conflict", 2.0),
-#             "max_band_similarity": self._base_cfg_float("base_cert_max_band_similarity", 0.98),
-#             "max_spectral_shape_similarity": self._base_cfg_float("base_cert_max_spectral_shape_similarity", 0.90),
-#         }
-#         cert["thresholds"] = thr
-#         checks = {
-#             "all_base_rows_valid": cert["valid_row_count"] == len(classes),
-#             "geom_acc_ok": cert["geom_val_acc"] >= thr["min_geom_acc"],
-#             "min_reliability_ok": cert["min_reliability"] >= thr["min_reliability"],
-#             "mean_reliability_ok": cert["mean_reliability"] >= thr["min_mean_reliability"],
-#             "subspace_overlap_ok": cert["max_subspace_overlap"] <= thr["max_subspace_overlap"],
-#             "geometry_conflict_ok": cert["max_geometry_conflict"] <= thr["max_geometry_conflict"],
-#             "band_similarity_ok": cert["max_band_similarity"] <= thr["max_band_similarity"],
-#             "spectral_shape_similarity_ok": (
-#                 int(cert.get("spectral_shape_pair_count", 0)) == 0
-#                 or cert["max_spectral_shape_similarity"] <= thr["max_spectral_shape_similarity"]
-#             ),
-#         }
-#         cert["checks"] = checks
-#         cert["valid"] = bool(all(checks.values()) and len(cert["errors"]) == 0)
-#         if not cert["valid"]:
-#             failed = [k for k, ok in checks.items() if not ok]
-#             cert["errors"].extend(failed)
-#         return cert
-
-#     def _print_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-#         print("[Base Geometry Certificate]")
-#         if not certificate:
-#             print("  unavailable")
-#             return
-#         status = "PASS" if bool(certificate.get("valid", False)) else "WARN/FAIL"
-#         print(f"  status={status} | classes={certificate.get('class_ids', [])}")
-#         print(
-#             "  "
-#             f"GeomValAcc={float(certificate.get('geom_val_acc', 0.0)):.2f}% | "
-#             f"valid_rows={int(certificate.get('valid_row_count', 0))}/{int(certificate.get('num_base_classes', 0))} | "
-#             f"rel(min/mean)={float(certificate.get('min_reliability', 0.0)):.3f}/{float(certificate.get('mean_reliability', 0.0)):.3f} | "
-#             f"subspace(max/mean)={float(certificate.get('max_subspace_overlap', 0.0)):.3f}/{float(certificate.get('mean_subspace_overlap', 0.0)):.3f} | "
-#             f"band(max/mean)={float(certificate.get('max_band_similarity', 0.0)):.3f}/{float(certificate.get('mean_band_similarity', 0.0)):.3f} | "
-#             f"spec(max/mean)={float(certificate.get('max_spectral_shape_similarity', 0.0)):.3f}/{float(certificate.get('mean_spectral_shape_similarity', 0.0)):.3f} | "
-#             f"conflict(max/mean)={float(certificate.get('max_geometry_conflict', 0.0)):.3f}/{float(certificate.get('mean_geometry_conflict', 0.0)):.3f}"
-#         )
-#         if certificate.get("errors"):
-#             print(f"  failed_checks={certificate.get('errors')}")
-#         if certificate.get("warnings") and self.debug:
-#             print(f"  warnings={certificate.get('warnings')}")
-
-#     def _enforce_base_geometry_certificate(self, certificate: Dict[str, Any]) -> None:
-#         """Warn by default; optionally hard-stop if the user requests strict gating."""
-#         self._last_base_geometry_certificate = certificate
-#         try:
-#             setattr(self.model, "base_geometry_certificate", certificate)
-#         except Exception:
-#             pass
-#         self._print_base_geometry_certificate(certificate)
-#         if bool(certificate.get("valid", False)):
-#             return
-#         msg = (
-#             "Base geometry certificate failed. Incremental training will be high-risk because "
-#             "base geometry is not clean enough for descriptor insertion. Failed checks: "
-#             f"{certificate.get('errors', [])}"
-#         )
-#         if self._base_cfg_bool("enforce_base_geometry_certificate", False):
-#             raise RuntimeError(msg)
-#         print(f"[Base Geometry Certificate WARN] {msg}")
-
-#     def _get_valid_base_bank(self, max_class_id: Optional[int] = None) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self, "_safe_get_subspace_bank"):
-#             raise AttributeError("TrainerHelper._safe_get_subspace_bank() is required.")
-#         bank = self._safe_get_subspace_bank()
-#         required = ("means", "bases", "variances", "sample_counts")
-#         missing = [k for k in required if k not in bank or not torch.is_tensor(bank[k]) or bank[k].numel() == 0]
-#         if missing:
-#             raise RuntimeError(f"Base GeometryBank is not ready; missing/empty keys: {missing}")
-#         if max_class_id is not None and int(max_class_id) >= bank["means"].size(0):
-#             raise RuntimeError(f"Bank has {bank['means'].size(0)} rows but needs class id {int(max_class_id)}")
-#         return bank
-
-#     @torch.no_grad()
-#     def _print_base_geometry_diagnostics(self, phase_class_ids: Iterable[int]) -> None:
-#         if not self.debug and not bool(getattr(self.args, "print_base_geometry_diagnostics", True)):
-#             return
-#         try:
-#             bank = self._get_valid_base_bank()
-#         except Exception as exc:
-#             print(f"[Base Geometry Diagnostics] unavailable: {exc}")
-#             return
-
-#         counts = bank.get("sample_counts", None)
-#         active_ranks = bank.get("active_ranks", None)
-#         reliability = bank.get("reliability", None)
-#         variances = bank.get("variances", None)
-#         means = bank.get("means", None)
-#         bands = bank.get("band_importances", bank.get("band_importance", None))
-#         spec_rel = bank.get("spectral_shape_reliability", None)
-
-#         print("[Base Geometry Diagnostics]")
-#         print("  cls | count | rank | rel  | spec-rel | resvar   | mean_norm | band_entropy")
-#         for cls in [int(c) for c in phase_class_ids]:
-#             count = float(counts[cls].detach().item()) if torch.is_tensor(counts) and counts.numel() > cls else -1.0
-#             rank = int(active_ranks[cls].detach().item()) if torch.is_tensor(active_ranks) and active_ranks.numel() > cls else -1
-#             rel = float(reliability[cls].detach().item()) if torch.is_tensor(reliability) and reliability.numel() > cls else -1.0
-#             srel = float(spec_rel[cls].detach().item()) if torch.is_tensor(spec_rel) and spec_rel.numel() > cls else -1.0
-#             rv = float(variances[cls, -1].detach().item()) if torch.is_tensor(variances) and variances.size(0) > cls else -1.0
-#             mn = float(means[cls].norm().detach().item()) if torch.is_tensor(means) and means.size(0) > cls else -1.0
-#             bent = -1.0
-#             if torch.is_tensor(bands) and bands.dim() == 2 and bands.size(0) > cls:
-#                 b = bands[cls].detach().float().clamp_min(0.0)
-#                 b = b / b.sum().clamp_min(1e-8)
-#                 bent = float((-(b * torch.log(b.clamp_min(1e-8))).sum()).cpu().item())
-#             print(f"  {cls:3d} | {count:5.0f} | {rank:4d} | {rel:4.2f} | {srel:8.3f} | {rv:8.5f} | {mn:9.4f} | {bent:12.4f}")
-
-#         geom = self._base_geometry_global_metrics()
-#         if geom:
-#             print("  " + " | ".join(f"{k}={v:.4f}" for k, v in geom.items()))
-
-#     @torch.no_grad()
-#     def _batch_base_overlap_diagnostics(self, features: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
-#         try:
-#             diag = base_center_overlap_diagnostics(
-#                 features,
-#                 labels,
-#                 normalize=True,
-#                 min_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#             )
-#         except Exception:
-#             return {"batch_compact": 0.0, "batch_center_margin": 0.0, "batch_min_center_margin": 0.0}
-#         return {
-#             "batch_compact": float(diag.get("compact", self._zero(features)).detach().cpu().item()),
-#             "batch_center_margin": float(diag.get("mean_center_margin", self._zero(features)).detach().cpu().item()),
-#             "batch_min_center_margin": float(diag.get("min_center_margin", self._zero(features)).detach().cpu().item()),
-#         }
-
-#     # ============================================================
-#     # Base objective: CE + GICS + PGR
-#     # ============================================================
-#     def _train_epoch_base_geometry(
-#         self,
-#         loader,
-#         optimizer,
-#         base_head: nn.Module,
-#         phase_class_ids: Iterable[int],
-#         label_map: Dict[int, int],
-#         trainable_params: list[nn.Parameter],
-#     ) -> Tuple[float, float]:
-#         self.model.train()
-#         base_head.train()
-
-#         num_base = len([int(c) for c in phase_class_ids])
-#         total_loss = 0.0
-#         total_correct = 0
-#         total_count = 0
-#         stat_steps = 0
-#         stat_sums = {
-#             "ce": 0.0,
-#             "srpgr": 0.0,
-#             "compact_sep": 0.0,
-#             "gics": 0.0,
-#             "weighted_gics": 0.0,
-#             "gics_anchors": 0.0,
-#             "gics_pos": 0.0,
-#             "pgr": 0.0,
-#             "pgr_unweighted": 0.0,
-#             "pgr_compact": 0.0,
-#             "pgr_center": 0.0,
-#             "pgr_subspace": 0.0,
-#             "pgr_band": 0.0,
-#             "pgr_volume": 0.0,
-#             "spectral_shape": 0.0,
-#             "spectral_shape_raw": 0.0,
-#             "spectral_shape_mean_similarity": 0.0,
-#             "spectral_shape_pairs": 0.0,
-#             "spectral_active": 0.0,
-#             "batch_compact": 0.0,
-#             "batch_center_margin": 0.0,
-#             "batch_min_center_margin": 0.0,
-#         }
-
-#         for batch in loader:
-#             x, y, spectra, _ = self._unpack_hsi_batch(batch)
-#             x = x.float().to(self.device, non_blocking=True)
-#             y = y.long().to(self.device, non_blocking=True)
-#             y_local = self._labels_to_local(y, label_map)
-
-#             optimizer.zero_grad(set_to_none=True)
-
-#             features, spectral_summary, band_summary, key_features, _, _, spectral_summary_is_physical = self._extract_base_views(x, spectra)
-#             logits = base_head(features)
-#             ce = self._batch_balanced_ce(logits, y_local, num_base)
-
-#             gics = base_geometry_involved_contrastive_loss(
-#                 features,
-#                 y,
-#                 key_features=key_features,
-#                 weight=self._base_cfg_float("base_gics_weight", 0.20),
-#                 temperature=self._base_cfg_float("base_gics_temperature", 0.07),
-#                 same_class_positive=self._base_cfg_bool("base_gics_same_class_positive", True),
-#                 class_balanced=self._base_cfg_bool("base_gics_class_balanced", True),
-#                 detach_key=True,
-#                 normalize=self._base_cfg_bool("base_gics_normalize", True),
-#                 return_parts=True,
-#             )
-
-#             pgr = prospective_geometry_reserve_loss(
-#                 features,
-#                 y,
-#                 band_summary=band_summary,
-#                 weight=self._base_cfg_float("pgr_weight", 0.10),
-#                 compact_weight=self._base_cfg_float("pgr_compact_weight", 0.15),
-#                 center_weight=self._base_cfg_float("pgr_center_weight", 0.20),
-#                 subspace_weight=self._base_cfg_float("pgr_subspace_weight", 0.10),
-#                 band_weight=self._base_cfg_float("pgr_band_weight", 0.05),
-#                 volume_weight=self._base_cfg_float("pgr_volume_weight", 0.05),
-#                 center_margin=self._base_cfg_float("pgr_center_margin", 1.05),
-#                 min_class_samples=self._base_cfg_int("pgr_min_class_samples", 3),
-#                 subspace_min_samples=self._base_cfg_int("pgr_subspace_min_samples", 6),
-#                 subspace_rank=self._base_cfg_int("pgr_subspace_rank", 3),
-#                 max_band_similarity=self._base_cfg_float("pgr_band_overlap_max", 0.75),
-#                 max_class_variance=self._base_cfg_float("pgr_max_class_variance", 0.75),
-#                 normalize_features=self._base_cfg_bool("pgr_normalize_features", True),
-#                 return_parts=True,
-#             )
-
-#             spectral_shape = self._base_spectral_shape_regularizer(
-#                 features=features,
-#                 labels=y,
-#                 spectral_summary=spectral_summary,
-#                 spectral_summary_is_physical=spectral_summary_is_physical,
-#             )
-
-#             srpgr_total = (
-#                 gics["total"]
-#                 + pgr["total"]
-#                 + spectral_shape["total"]
-#             )
-#             loss = (
-#                 self._base_cfg_float("base_ce_weight", 1.0) * ce
-#                 + self._base_cfg_float("base_srpgr_weight", 1.0) * srpgr_total
-#             )
-#             if not torch.isfinite(loss):
-#                 if self.debug:
-#                     print("[WARN] Non-finite base loss skipped.")
-#                 continue
-
-#             loss.backward()
-#             torch.nn.utils.clip_grad_norm_(trainable_params, float(self.grad_clip_base))
-#             optimizer.step()
-
-#             pred = logits.argmax(dim=1)
-#             total_loss += float(loss.detach().item())
-#             total_correct += int((pred == y_local).sum().item())
-#             total_count += int(y_local.numel())
-#             stat_steps += 1
-
-#             batch_diag = self._batch_base_overlap_diagnostics(features.detach(), y.detach())
-#             stat_sums["ce"] += float(ce.detach().item())
-#             stat_sums["srpgr"] += float(srpgr_total.detach().item())
-#             stat_sums["compact_sep"] += float(gics["total"].detach().item())
-#             stat_sums["gics"] += float(gics.get("loss", gics.get("gics", self._zero(features))).detach().item())
-#             stat_sums["weighted_gics"] += float(gics["total"].detach().item())
-#             stat_sums["gics_anchors"] += float(gics.get("num_anchors", self._zero(features)).detach().item())
-#             stat_sums["gics_pos"] += float(gics.get("mean_positive_count", self._zero(features)).detach().item())
-#             stat_sums["pgr"] += float(pgr["total"].detach().item())
-#             stat_sums["pgr_unweighted"] += float(pgr.get("pgr", self._zero(features)).detach().item())
-#             stat_sums["pgr_compact"] += float(pgr["compact"].detach().item())
-#             stat_sums["pgr_center"] += float(pgr["center"].detach().item())
-#             stat_sums["pgr_subspace"] += float(pgr["subspace"].detach().item())
-#             stat_sums["pgr_band"] += float(pgr["band"].detach().item())
-#             stat_sums["pgr_volume"] += float(pgr["volume"].detach().item())
-#             stat_sums["spectral_shape"] += float(spectral_shape["total"].detach().item())
-#             stat_sums["spectral_shape_raw"] += float(spectral_shape.get("raw_total", self._zero(features)).detach().item())
-#             stat_sums["spectral_shape_mean_similarity"] += float(spectral_shape.get("mean_similarity", self._zero(features)).detach().item())
-#             stat_sums["spectral_shape_pairs"] += float(spectral_shape.get("pair_count", self._zero(features)).detach().item())
-#             stat_sums["spectral_active"] += 1.0 if bool(spectral_summary_is_physical) else 0.0
-#             for k, v in batch_diag.items():
-#                 stat_sums[k] += float(v)
-
-#         self._last_base_stats = {k: v / max(stat_steps, 1) for k, v in stat_sums.items()}
-#         return total_loss / max(stat_steps, 1), 100.0 * total_correct / max(total_count, 1)
-
-#     # backward-compatible alias for trainer.py calls that still use the old name
-#     def _train_epoch_base_gics(self, *args, **kwargs):
-#         return self._train_epoch_base_geometry(*args, **kwargs)
-
-#     # ============================================================
-#     # Checkpoint score
-#     # ============================================================
-#     def _select_base_checkpoint_score(self, val_stats: Dict, geom_stats: Optional[Dict] = None) -> float:
-#         metric = str(getattr(self.args, "best_state_metric", "geometry_score")).lower()
-#         geom_stats = geom_stats or {}
-#         if metric in {"geometry_score", "geo", "reserve"}:
-#             # Accuracy is necessary, but base feature geometry must also be clean.
-#             acc = float(val_stats.get("acc", 0.0))
-#             reserve = float(geom_stats.get("geometry_reserve_score", val_stats.get("geometry_score", 0.0)))
-#             conflict = float(geom_stats.get("geometry_conflict_mean", 0.0))
-#             overlap = float(geom_stats.get("feature_subspace_overlap", 0.0))
-#             spec_overlap = float(geom_stats.get("spectral_shape_similarity_max", geom_stats.get("spectral_shape_overlap", 0.0)))
-#             return acc + 10.0 * reserve - 5.0 * conflict - 2.0 * overlap - 1.0 * spec_overlap
-#         if metric in {"acc", "accuracy", "oa", "val_acc"}:
-#             return float(val_stats.get("acc", 0.0))
-#         if metric in {"loss", "val_loss"}:
-#             return -float(val_stats.get("loss", 1e9))
-#         if metric in {"hm", "harmonic"}:
-#             return float(val_stats.get("hm", val_stats.get("acc", 0.0)))
-#         return float(val_stats.get("acc", 0.0))
-
-#     # ============================================================
-#     # Main base phase
-#     # ============================================================
-#     def train_base_phase(self, phase, epochs, batch_size=64, lr=1e-4) -> Dict:
-#         phase = int(phase)
-#         if phase != 0:
-#             raise ValueError("train_base_phase() must only be called for phase 0.")
-
-#         self._enforce_base_contract()
-
-#         print("==== Base Phase Training | CE + SRPGR | Spectral-Residual GeometryBank ====")
-#         self.dataset.start_phase(phase)
-#         phase_class_ids = [int(c) for c in self.dataset.phase_to_classes[phase]]
-#         label_map = self._build_base_label_map(phase_class_ids)
-#         self._set_model_phase_and_old_count(phase, 0)
-
-#         needed_classes = max(phase_class_ids) + 1
-#         if hasattr(self.model, "ensure_class_capacity"):
-#             self.model.ensure_class_capacity(needed_classes)
-
-#         train_loader = self.dataset.get_phase_dataloader(phase, split="train", batch_size=batch_size, shuffle=True)
-#         val_loader = self.dataset.get_cumulative_dataloader(phase, split="val", batch_size=batch_size, shuffle=False)
-
-#         feature_dim = self._extract_feature_dim(train_loader)
-#         base_head = self._make_base_ce_head(feature_dim, len(phase_class_ids))
-#         self._base_ce_head = base_head
-#         self._set_base_trainability(base_head)
-#         trainable_params = self._base_trainable_parameters(base_head)
-
-#         optimizer = optim.Adam(
-#             trainable_params,
-#             lr=float(lr),
-#             weight_decay=float(getattr(self.args, "weight_decay", 1e-4)),
-#         )
-#         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, int(epochs))
-
-#         history = {
-#             "train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [],
-#             "val_old_acc": [], "val_new_acc": [], "val_hm": [],
-#             "base_ce": [], "base_srpgr": [], "base_compact_sep": [], "base_gics": [], "base_weighted_gics": [],
-#             "base_gics_anchors": [], "base_gics_pos": [],
-#             "base_pgr": [], "base_pgr_unweighted": [], "base_pgr_compact": [],
-#             "base_pgr_center": [], "base_pgr_subspace": [], "base_pgr_band": [], "base_pgr_volume": [],
-#             "base_spectral_shape": [], "base_spectral_shape_raw": [], "base_spectral_shape_mean_similarity": [],
-#             "base_spectral_shape_pairs": [], "base_spectral_active": [],
-#             "batch_compact": [], "batch_center_margin": [], "batch_min_center_margin": [],
-#             "feature_subspace_overlap": [], "band_overlap": [], "spectral_shape_overlap": [],
-#             "spectral_shape_similarity_mean": [], "spectral_shape_similarity_max": [],
-#             "geometry_conflict_mean": [], "geometry_conflict_max": [], "geometry_reserve_score": [],
-#             "base_cert_geom_acc": [], "base_cert_min_reliability": [],
-#             "base_cert_max_subspace_overlap": [], "base_cert_max_band_similarity": [], "base_cert_max_spectral_shape_similarity": [],
-#             "base_cert_max_geometry_conflict": [], "base_cert_valid": [],
-#         }
-
-#         best_score = -1e18
-#         best_state = None
-#         no_improve = 0
-#         epochs = int(epochs)
-
-#         if hasattr(self, "_print_trainable_summary"):
-#             self._print_trainable_summary(phase)
-#         print(f"[Base] Temporary CE head: feature_dim={feature_dim}, classes={len(phase_class_ids)}. Discarded after base training.")
-#         print("[Base Objective] CE + SRPGR. SRPGR = compact-sep + subspace reserve + volume control + spectral-shape reserve.")
-
-#         for epoch in range(epochs):
-#             self._base_epoch = int(epoch)
-#             self._set_model_phase_and_old_count(phase, 0)
-
-#             tr_loss, head_train_acc = self._train_epoch_base_geometry(
-#                 train_loader,
-#                 optimizer,
-#                 base_head,
-#                 phase_class_ids,
-#                 label_map,
-#                 trainable_params,
-#             )
-
-#             self._rebuild_base_geometry_bank_for_validation(phase, phase_class_ids, split="train")
-
-#             train_eval_stats = self._validate_split_metrics(train_loader, old_class_count=0)
-#             val_stats = self._validate_split_metrics(val_loader, old_class_count=0)
-#             scheduler.step()
-
-#             base_stats = getattr(self, "_last_base_stats", {})
-#             geom_stats = self._base_geometry_global_metrics()
-#             epoch_cert = self._build_base_geometry_certificate(
-#                 phase_class_ids,
-#                 val_stats=val_stats,
-#                 train_stats=train_eval_stats,
-#                 head_train_acc=head_train_acc,
-#             )
-
-#             history["train_loss"].append(float(tr_loss))
-#             history["train_acc"].append(float(train_eval_stats["acc"]))
-#             history["val_loss"].append(float(val_stats["loss"]))
-#             history["val_acc"].append(float(val_stats["acc"]))
-#             history["val_old_acc"].append(float(val_stats.get("old_acc", 0.0)))
-#             history["val_new_acc"].append(float(val_stats.get("new_acc", 0.0)))
-#             history["val_hm"].append(float(val_stats.get("hm", 0.0)))
-
-#             for k in (
-#                 "ce", "srpgr", "compact_sep", "gics", "weighted_gics", "gics_anchors", "gics_pos", "pgr", "pgr_unweighted",
-#                 "pgr_compact", "pgr_center", "pgr_subspace", "pgr_band", "pgr_volume",
-#                 "spectral_shape", "spectral_shape_raw", "spectral_shape_mean_similarity", "spectral_shape_pairs", "spectral_active",
-#                 "batch_compact", "batch_center_margin", "batch_min_center_margin",
-#             ):
-#                 history_key = f"base_{k}" if k not in {"batch_compact", "batch_center_margin", "batch_min_center_margin"} else k
-#                 if history_key in history:
-#                     history[history_key].append(float(base_stats.get(k, 0.0)))
-
-#             for k in ("feature_subspace_overlap", "band_overlap", "spectral_shape_overlap", "spectral_shape_similarity_mean", "spectral_shape_similarity_max", "geometry_conflict_mean", "geometry_conflict_max", "geometry_reserve_score"):
-#                 history[k].append(float(geom_stats.get(k, 0.0)))
-
-#             history["base_cert_geom_acc"].append(float(epoch_cert.get("geom_val_acc", 0.0)))
-#             history["base_cert_min_reliability"].append(float(epoch_cert.get("min_reliability", 0.0)))
-#             history["base_cert_max_subspace_overlap"].append(float(epoch_cert.get("max_subspace_overlap", 0.0)))
-#             history["base_cert_max_band_similarity"].append(float(epoch_cert.get("max_band_similarity", 0.0)))
-#             history["base_cert_max_spectral_shape_similarity"].append(float(epoch_cert.get("max_spectral_shape_similarity", 0.0)))
-#             history["base_cert_max_geometry_conflict"].append(float(epoch_cert.get("max_geometry_conflict", 0.0)))
-#             history["base_cert_valid"].append(1.0 if bool(epoch_cert.get("valid", False)) else 0.0)
-
-#             print(
-#                 f"[Base CE+SRPGR] Epoch {epoch + 1:03d}/{epochs} | "
-#                 f"Loss: {tr_loss:.4f} | HeadAcc: {head_train_acc:.2f}% | "
-#                 f"GeomTrainAcc: {train_eval_stats['acc']:.2f}% | "
-#                 f"GeomValAcc: {val_stats['acc']:.2f}% | GeomValLoss: {val_stats['loss']:.4f} | "
-#                 f"CE: {float(base_stats.get('ce', 0.0)):.4f} | "
-#                 f"SRPGR: {float(base_stats.get('srpgr', 0.0)):.4f} | "
-#                 f"CompactSep: {float(base_stats.get('compact_sep', 0.0)):.4f} | "
-#                 f"Reserve: {float(base_stats.get('pgr', 0.0)):.4f} | "
-#                 f"Compact: {float(base_stats.get('pgr_compact', 0.0)):.4f} | "
-#                 f"Subspace: {float(base_stats.get('pgr_subspace', 0.0)):.4f} | "
-#                 f"Band: {float(base_stats.get('pgr_band', 0.0)):.4f} | "
-#                 f"SpecShape: {float(base_stats.get('spectral_shape', 0.0)):.4f} | "
-#                 f"Overlap: {float(geom_stats.get('feature_subspace_overlap', 0.0)):.4f} | "
-#                 f"ConflictMax: {float(epoch_cert.get('max_geometry_conflict', 0.0)):.4f} | "
-#                 f"GeoReserve: {float(geom_stats.get('geometry_reserve_score', 0.0)):.4f} | "
-#                 f"Cert: {'OK' if bool(epoch_cert.get('valid', False)) else 'RISK'}"
-#             )
-
-#             score_stats = dict(val_stats)
-#             score_stats.update(geom_stats)
-#             score_stats.update({f"cert_{k}": v for k, v in epoch_cert.items() if isinstance(v, (int, float, bool))})
-#             score_stats["geometry_score"] = float(geom_stats.get("geometry_reserve_score", 0.0))
-#             score = self._select_base_checkpoint_score(score_stats, geom_stats)
-#             if score > best_score:
-#                 best_score = score
-#                 best_state = self._capture_state()
-#                 no_improve = 0
-#             else:
-#                 no_improve += 1
-
-#             if self.early_stop_patience > 0 and no_improve >= self.early_stop_patience:
-#                 print(f"[EarlyStop] Base phase: no improvement for {no_improve} epochs.")
-#                 break
-
-#         if best_state is not None:
-#             self.model.load_state_dict(best_state)
-#             self._set_model_phase_and_old_count(phase, 0)
-
-#         print("[Base] Final SRGP GeometryBank rebuild from CE+SRPGR projected features.")
-#         self._finalize_phase_memory(phase, split="train")
-#         self._set_model_phase_and_old_count(phase, len(phase_class_ids))
-#         self._print_base_geometry_diagnostics(phase_class_ids)
-
-#         final_train_stats = self._validate_split_metrics(train_loader, old_class_count=0)
-#         final_val_stats = self._validate_split_metrics(val_loader, old_class_count=0)
-#         final_cert = self._build_base_geometry_certificate(
-#             phase_class_ids,
-#             val_stats=final_val_stats,
-#             train_stats=final_train_stats,
-#             head_train_acc=history["train_acc"][-1] if history.get("train_acc") else None,
-#         )
-#         history["base_geometry_certificate"] = final_cert
-#         self._enforce_base_geometry_certificate(final_cert)
-
-#         if hasattr(self, "diagnose_full_base_geometry"):
-#             try:
-#                 self._last_base_geometry_diagnostics = self.diagnose_full_base_geometry(
-#                     loader=val_loader,
-#                     phase_class_ids=phase_class_ids,
-#                     anchors_per_class=int(getattr(self.args, "geometry_diag_anchors_per_class", 64)),
-#                     topk_pairs=int(getattr(self.args, "geometry_diag_topk_pairs", 20)),
-#                     topk_bands=int(getattr(self.args, "geometry_diag_topk_bands", 5)),
-#                 )
-#                 if hasattr(self, "_print_geometry_diagnostics_summary"):
-#                     self._print_geometry_diagnostics_summary(self._last_base_geometry_diagnostics)
-#                 if hasattr(self, "_save_geometry_diagnostics_to_files"):
-#                     saved_paths = self._save_geometry_diagnostics_to_files(self._last_base_geometry_diagnostics, phase=phase)
-#                     print(f"[Geometry Health] saved diagnostics: {saved_paths.get('json', '')}")
-#             except Exception as exc:
-#                 print(f"[Geometry Health WARN] could not create persistent diagnostics: {exc}")
-
-#         self._base_ce_head = None
-#         if hasattr(self.model, "drop_base_ce_head"):
-#             self.model.drop_base_ce_head()
-#         if hasattr(self, "save_checkpoint"):
-#             self.save_checkpoint(phase, history)
-#         return history
-
+            validation_metrics = (
+                self._score_with_rows(
+                    val_payload,
+                    phase_class_ids,
+                    rows,
+                )
+            )
+            best_accuracy = float(
+                validation_metrics["accuracy"]
+            )
+            best_q05 = float(
+                validation_metrics["q05_gap"]
+            )
+            best_min_class = float(
+                validation_metrics[
+                    "minimum_per_class_accuracy"
+                ]
+            )
+            best_epoch = epochs - 1
+            best_state = copy.deepcopy(
+                self.model.state_dict()
+            )
+
+        if best_state is None:
+            raise RuntimeError(
+                "base training produced no geometry-selected checkpoint"
+            )
+        if bool(
+            self.model.geometry_bank
+            .valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "persistent rows appeared before final handoff"
+            )
+
+        self.model.load_state_dict(
+            best_state,
+            strict=True,
+        )
+        self.model.set_base_mode()
+        history["best_epoch"] = best_epoch + 1
+        history[
+            "best_validation_accuracy"
+        ] = best_accuracy
+        history[
+            "best_validation_q05_gap"
+        ] = best_q05
+
+        final_train_payload = (
+            self._collect_payload(
+                train_eval_loader
+            )
+        )
+        final_oof = (
+            self._evaluate_out_of_fold(
+                final_train_payload,
+                phase_class_ids,
+            )
+        )
+
+        model_handoff = (
+            self.model.finalize_base_geometry(
+                base_class_ids=
+                    phase_class_ids,
+                features=final_train_payload[
+                    "joint_feature"
+                ],
+                raw_center_spectra=
+                    final_train_payload[
+                        "raw_center_spectrum"
+                    ],
+                labels=final_train_payload[
+                    "labels"
+                ],
+                sample_weights=None,
+                update_statistics=True,
+                # Temperatures were fitted before geometry shaping and
+                # restored with the selected checkpoint.
+                fit_overlap_temperatures=False,
+                drop_ce_head=True,
+            )
+        )
+
+        final_val_payload = (
+            self._collect_payload(
+                val_loader
+            )
+        )
+        final_train_metrics = (
+            self._score_committed_payload(
+                final_train_payload,
+                phase_class_ids,
+            )
+        )
+        final_val_metrics = (
+            self._score_committed_payload(
+                final_val_payload,
+                phase_class_ids,
+            )
+        )
+        sampling_metrics = (
+            self._evaluate_sampling_diagnostic(
+                phase_class_ids
+            )
+        )
+
+        final_report = (
+            self._build_final_report(
+                phase_class_ids,
+                train_metrics=
+                    final_train_metrics,
+                validation_metrics=
+                    final_val_metrics,
+                oof_metrics=final_oof,
+                sampling_metrics=
+                    sampling_metrics,
+                model_handoff=
+                    model_handoff,
+                history=history,
+            )
+        )
+
+        if not bool(
+            final_report[
+                "geometry_admission"
+            ].get("ok", False)
+        ):
+            raise RuntimeError(
+                "final base GeometryBank is structurally invalid: "
+                + "; ".join(
+                    final_report[
+                        "geometry_admission"
+                    ].get("errors", [])
+                )
+            )
+        if (
+            self._cfg_bool(
+                "base_admission_enforce",
+                default=False,
+            )
+            and not bool(
+                final_report[
+                    "admission_passed"
+                ]
+            )
+        ):
+            raise RuntimeError(
+                "final base admission failed: "
+                f"{final_report['admission_failures']}"
+            )
+
+        history[
+            "final_train_metrics"
+        ] = final_train_metrics
+        history[
+            "final_validation_metrics"
+        ] = final_val_metrics
+        history[
+            "final_oof_metrics"
+        ] = final_oof
+        history[
+            "sampling_diagnostic"
+        ] = sampling_metrics
+        history[
+            "base_geometry_report"
+        ] = final_report
+
+        pre_finalize_hook = getattr(
+            self,
+            "pre_finalize_base_hook",
+            None,
+        )
+        if callable(pre_finalize_hook):
+            hook_result = pre_finalize_hook(
+                phase=0,
+                model=self.model,
+                dataset=self.dataset,
+                report=final_report,
+                history=history,
+            )
+            if hook_result is not None:
+                history[
+                    "pre_finalize_artifacts"
+                ] = hook_result
+
+        if hasattr(
+            self.dataset,
+            "finalize_phase",
+        ):
+            self.dataset.finalize_phase(phase)
+
+        handoff = self.finalize_base_handoff(
+            phase_class_ids,
+            final_report,
+            history,
+        )
+        history["base_handoff"] = handoff
+
+        if hasattr(self, "save_checkpoint"):
+            self.save_checkpoint(
+                phase,
+                history,
+            )
+
+        factor_oof = final_oof[
+            "factor_geometry"
+        ]
+        print(
+            "[Base handoff] "
+            f"BestEpoch={best_epoch + 1} | "
+            f"Val={final_val_metrics['accuracy']:.2f}% | "
+            f"OOF={factor_oof['accuracy']:.2f}% | "
+            f"Prototype={final_oof['prototype']['accuracy']:.2f}% | "
+            f"Diagonal={final_oof['diagonal_geometry']['accuracy']:.2f}% | "
+            f"MinClass={factor_oof['minimum_per_class_accuracy']:.2f}% | "
+            f"Q05Gap={factor_oof['q05_gap']:.3f} | "
+            f"Rows={int(self.model.geometry_bank.valid_mask().sum().item())} | "
+            f"Bound={self.model.classifier.require_bound_contract}"
+        )
+        return history

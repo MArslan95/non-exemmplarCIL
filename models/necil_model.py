@@ -1,1202 +1,2145 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+"""Integrated NECIL model for transport-verified HSI factor geometry.
 
-import inspect
+Persistent class memory
+-----------------------
+    p(z | c) = N(mu_c, L_c L_c^T + Psi_c)
+
+where
+    z = [z_s ; z_p]
+    Psi_c = diag(psi_c,s I_Ds, psi_c,p I_Dp).
+
+The raw ordered-spectrum relation p(h | c) is stored only for class-pair risk.
+It never becomes a second inference classifier.
+
+Incremental representation evolution
+------------------------------------
+The backbone may use either:
+
+1. a frozen incremental baseline; or
+2. controlled late-layer plasticity.
+
+For controlled plasticity, a temporary frozen phase-start observer is applied
+only to current-phase samples. A branchwise similarity transform is fitted
+analytically on support pairs, validated on disjoint current pairs, and then
+used to transport aggregate old rows exactly. There is no trainable transport
+network and no old-feature replay objective.
+"""
+
+import copy
+import hashlib
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from models.backbone import SSMBackbone
-from models.geometry_bank import GeometryBank
 from models.classifier import GeometryEnergyClassifier
+from models.geometry_bank import ( BranchSimilarityTransform, GeometryBank, )
 
 
-def _to_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return bool(default)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in {"1", "true", "yes", "y", "on"}:
-            return True
-        if v in {"0", "false", "no", "n", "off", "none", "null", ""}:
-            return False
-    return bool(value)
+Tensor = torch.Tensor
+Row = Dict[str, Tensor]
 
 
-def _filter_supported_kwargs(cls_or_fn: Any, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-    try:
-        sig = inspect.signature(cls_or_fn)
-    except (TypeError, ValueError):
-        return dict(kwargs)
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return dict(kwargs)
-    allowed = set(sig.parameters)
-    allowed.discard("self")
-    return {k: v for k, v in kwargs.items() if k in allowed}
+# =============================================================================
+# Shared validation
+# =============================================================================
 
 
-def _ordered_unique_ints(values: Iterable[int]) -> List[int]:
-    out: List[int] = []
-    seen = set()
+def _unique_ids(
+    values: Iterable[int],
+    *,
+    name: str,
+    allow_empty: bool = False,
+) -> List[int]:
+    output: List[int] = []
+    observed: set[int] = set()
     for value in values:
-        c = int(value)
-        if c < 0:
-            raise ValueError(f"Class ids must be non-negative, got {c}.")
-        if c not in seen:
-            out.append(c)
-            seen.add(c)
-    return out
+        class_id = int(value)
+        if class_id < 0:
+            raise ValueError(f"{name} contains negative class ID {class_id}")
+        if class_id in observed:
+            raise ValueError(f"{name} contains duplicate class ID {class_id}")
+        observed.add(class_id)
+        output.append(class_id)
+    if not output and not allow_empty:
+        raise ValueError(f"{name} is empty")
+    return output
 
 
-def _normalize_classifier_mode(mode: Optional[str], default: str = "geometry") -> str:
-    m = str(default if mode is None else mode).lower().strip()
-    aliases = {
-        "": "geometry",
-        "none": "geometry",
-        "geo": "geometry",
-        "geometry": "geometry",
-        "geometry_only": "geometry",
-        "geometry-only": "geometry",
-        "feature_geometry": "geometry",
-        "low_rank_geometry": "geometry",
-        "spectral_geometry": "geometry",
-        "spectral_coupled_geometry": "geometry",
-        "calibrated": "geometry",
-        "calibrated_geometry": "geometry",
-        "base_ce": "base_ce",
-    }
-    out = aliases.get(m, m)
-    if out not in {"geometry", "base_ce"}:
-        raise ValueError(f"Unsupported classifier mode {mode!r}. Use geometry_only/geometry or base_ce.")
-    return out
-
-
-def _normalize_incremental_update_mode(mode: Optional[str]) -> str:
-    """Return the only legal incremental architecture identity.
-
-    Feature adapters, transport, and score calibration are not aliases for the
-    method. They are different architectures and therefore fail loudly.
-    """
-    m = str(mode or "spectral_coupled_geometry_replay").lower().strip()
-    aliases = {
-        "": "spectral_coupled_geometry_replay",
-        "none": "spectral_coupled_geometry_replay",
-        "clean": "spectral_coupled_geometry_replay",
-        "main": "spectral_coupled_geometry_replay",
-        "descriptor": "spectral_coupled_geometry_replay",
-        "descriptor_only": "spectral_coupled_geometry_replay",
-        "descriptor_refinement": "spectral_coupled_geometry_replay",
-        "scbgr": "spectral_coupled_geometry_replay",
-        "scb-gr": "spectral_coupled_geometry_replay",
-        "sctgr": "spectral_coupled_geometry_replay",
-        "sctgr_rga": "spectral_coupled_geometry_replay",
-        "spectral_coupled": "spectral_coupled_geometry_replay",
-        "spectral_coupled_replay": "spectral_coupled_geometry_replay",
-        "spectral_coupled_geometry_replay": "spectral_coupled_geometry_replay",
-    }
-    forbidden = {
-        "geometry_gated_adapter", "geometry_adapter", "gated_adapter", "adapter",
-        "g2rpa", "g2-rpa", "transport", "geometry_transport",
-    }
-    if m in forbidden:
+def _feature_matrix(
+    value: Tensor,
+    *,
+    expected_dim: int,
+    name: str,
+) -> Tensor:
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a tensor")
+    if value.dim() != 2 or value.size(1) != int(expected_dim):
         raise ValueError(
-            f"incremental_update_mode={mode!r} selects a forbidden architecture. "
-            "Use spectral_coupled_geometry_replay."
+            f"{name} must be [N,{int(expected_dim)}], "
+            f"got {tuple(value.shape)}"
         )
-    out = aliases.get(m, m)
-    if out != "spectral_coupled_geometry_replay":
-        raise ValueError(f"Unsupported incremental_update_mode={mode!r}.")
-    return out
+    if value.size(0) == 0:
+        raise ValueError(f"{name} is empty")
+    if not torch.is_floating_point(value):
+        raise TypeError(f"{name} must use a floating dtype")
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f"{name} contains NaN/Inf")
+    return value
+
+
+def _weights(
+    value: Optional[Tensor],
+    *,
+    sample_count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if value is None:
+        return torch.ones(sample_count, device=device, dtype=dtype)
+    result = torch.as_tensor(
+        value,
+        device=device,
+        dtype=dtype,
+    ).flatten()
+    if result.numel() != sample_count:
+        raise ValueError(
+            f"sample_weights has {result.numel()} entries; "
+            f"expected {sample_count}"
+        )
+    if not torch.isfinite(result).all():
+        raise RuntimeError("sample_weights contains NaN/Inf")
+    if bool(result.lt(0.0).any()):
+        raise ValueError("sample_weights must be non-negative")
+    if float(result.sum().item()) <= 0.0:
+        raise ValueError("sample_weights sums to zero")
+    return result
+
+
+def _relative_improvement(
+    reference: float,
+    candidate: float,
+) -> float:
+    return (reference - candidate) / max(reference, 1e-12)
+
+
+# =============================================================================
+# Temporary phase context
+# =============================================================================
+
+
+@dataclass
+class IncrementalPhaseContext:
+    """Temporary, explicitly managed state for one incremental phase.
+
+    This object is not registered inside ``NECILModel`` and therefore is not
+    silently persisted as exemplar memory. A trainer may checkpoint
+    ``export_state()`` separately to resume an interrupted phase.
+    """
+
+    phase: int
+    old_class_ids: List[int]
+    new_class_ids: List[int]
+    old_rows_digest: str
+    bank_contract_digest: str
+    observer: SSMBackbone
+    parameter_snapshot: Dict[str, Tensor]
+    controlled_plasticity: bool
+
+    def export_state(self) -> Dict[str, Any]:
+        return {
+            "phase": int(self.phase),
+            "old_class_ids": list(self.old_class_ids),
+            "new_class_ids": list(self.new_class_ids),
+            "old_rows_digest": str(self.old_rows_digest),
+            "bank_contract_digest": str(self.bank_contract_digest),
+            "observer_state_dict": {
+                name: value.detach().cpu().clone()
+                for name, value in self.observer.state_dict().items()
+            },
+            "parameter_snapshot": {
+                name: value.detach().cpu().clone()
+                for name, value in self.parameter_snapshot.items()
+            },
+            "controlled_plasticity": bool(self.controlled_plasticity),
+        }
+
+
+# =============================================================================
+# Evidence-gated analytical branch transport
+# =============================================================================
+
+
+class EvidenceGatedSimilarityEstimator:
+    """Fit and validate branchwise Level-0/1/2 similarity transforms.
+
+    Hierarchy
+    ---------
+    Level 0:
+        identity or translation.
+
+    Level 1:
+        positive isotropic scale + translation.
+
+    Level 2:
+        positive isotropic scale + proper orthogonal rotation + translation.
+
+    Candidates are fitted on support pairs and selected using disjoint
+    validation pairs. More complex levels are accepted only when identifiable
+    and when they improve normalized held-out RMSE by a configured amount.
+    """
+
+    def __init__(
+        self,
+        *,
+        spectral_dim: int,
+        spatial_dim: int,
+        minimum_scale_samples: int = 8,
+        minimum_rotation_samples: Optional[int] = None,
+        minimum_rotation_rank_fraction: float = 0.50,
+        rank_tolerance: float = 1e-4,
+        minimum_relative_improvement: float = 0.02,
+        maximum_normalized_rmse: float = 1.50,
+        minimum_scale: float = 0.70,
+        maximum_scale: float = 1.30,
+    ) -> None:
+        self.spectral_dim = int(spectral_dim)
+        self.spatial_dim = int(spatial_dim)
+        if self.spectral_dim <= 0 or self.spatial_dim <= 0:
+            raise ValueError("branch dimensions must be positive")
+
+        self.minimum_scale_samples = int(max(minimum_scale_samples, 3))
+        self.minimum_rotation_samples = (
+            None
+            if minimum_rotation_samples is None
+            else int(max(minimum_rotation_samples, 3))
+        )
+        self.minimum_rotation_rank_fraction = float(
+            min(max(minimum_rotation_rank_fraction, 0.0), 1.0)
+        )
+        self.rank_tolerance = float(max(rank_tolerance, 1e-12))
+        self.minimum_relative_improvement = float(
+            max(minimum_relative_improvement, 0.0)
+        )
+        self.maximum_normalized_rmse = float(
+            max(maximum_normalized_rmse, 0.0)
+        )
+        self.minimum_scale = float(max(minimum_scale, 1e-4))
+        self.maximum_scale = float(maximum_scale)
+        if self.maximum_scale < self.minimum_scale:
+            raise ValueError("maximum_scale must be >= minimum_scale")
+
+    @staticmethod
+    def _weighted_center(
+        value: Tensor,
+        weights: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        normalized = weights / weights.sum().clamp_min(1e-12)
+        mean = (normalized[:, None] * value).sum(dim=0)
+        return mean, value - mean
+
+    def _effective_rank(
+        self,
+        centered: Tensor,
+        weights: Tensor,
+    ) -> int:
+        weighted = centered * weights.sqrt().unsqueeze(1)
+        singular = torch.linalg.svdvals(weighted)
+        if singular.numel() == 0:
+            return 0
+        threshold = singular.max().clamp_min(1e-12) * self.rank_tolerance
+        return int(singular.gt(threshold).sum().item())
+
+    @staticmethod
+    def _apply(
+        value: Tensor,
+        *,
+        rotation: Tensor,
+        scale: float,
+        bias: Tensor,
+    ) -> Tensor:
+        return (
+            value
+            @ (float(scale) * rotation).transpose(0, 1)
+            + bias.view(1, -1)
+        )
+
+    @staticmethod
+    def _normalized_rmse(
+        predicted: Tensor,
+        target: Tensor,
+        weights: Tensor,
+    ) -> float:
+        normalized = weights / weights.sum().clamp_min(1e-12)
+        squared_error = (
+            predicted - target
+        ).square().mean(dim=1)
+        mse = (normalized * squared_error).sum()
+        target_mean = (
+            normalized[:, None] * target
+        ).sum(dim=0)
+        variance = (
+            normalized[:, None]
+            * (target - target_mean).square()
+        ).sum(dim=0).mean().clamp_min(1e-8)
+        return float((mse / variance).sqrt().item())
+
+    @staticmethod
+    def _identity_candidate(
+        dimension: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, Any]:
+        return {
+            "rotation": torch.eye(
+                dimension,
+                device=device,
+                dtype=dtype,
+            ),
+            "scale": 1.0,
+            "bias": torch.zeros(
+                dimension,
+                device=device,
+                dtype=dtype,
+            ),
+            "level": 0,
+            "level0_mode": "identity",
+        }
+
+    def _translation_candidate(
+        self,
+        source: Tensor,
+        target: Tensor,
+        weights: Tensor,
+    ) -> Dict[str, Any]:
+        source_mean, _ = self._weighted_center(source, weights)
+        target_mean, _ = self._weighted_center(target, weights)
+        candidate = self._identity_candidate(
+            source.size(1),
+            device=source.device,
+            dtype=source.dtype,
+        )
+        candidate["bias"] = target_mean - source_mean
+        candidate["level0_mode"] = "translation"
+        return candidate
+
+    def _scale_candidate(
+        self,
+        source: Tensor,
+        target: Tensor,
+        weights: Tensor,
+    ) -> Optional[Dict[str, Any]]:
+        if source.size(0) < self.minimum_scale_samples:
+            return None
+
+        source_mean, source_centered = self._weighted_center(
+            source,
+            weights,
+        )
+        target_mean, target_centered = self._weighted_center(
+            target,
+            weights,
+        )
+        denominator = (
+            weights[:, None] * source_centered.square()
+        ).sum().clamp_min(1e-12)
+        numerator = (
+            weights[:, None]
+            * source_centered
+            * target_centered
+        ).sum()
+        scale = float(
+            (numerator / denominator)
+            .clamp(self.minimum_scale, self.maximum_scale)
+            .item()
+        )
+        rotation = torch.eye(
+            source.size(1),
+            device=source.device,
+            dtype=source.dtype,
+        )
+        bias = target_mean - scale * source_mean
+        return {
+            "rotation": rotation,
+            "scale": scale,
+            "bias": bias,
+            "level": 1,
+            "level0_mode": "not_applicable",
+        }
+
+    def _rotation_candidate(
+        self,
+        source: Tensor,
+        target: Tensor,
+        weights: Tensor,
+    ) -> Tuple[Optional[Dict[str, Any]], int]:
+        dimension = source.size(1)
+        minimum_samples = (
+            max(2 * dimension, dimension + 2)
+            if self.minimum_rotation_samples is None
+            else max(self.minimum_rotation_samples, dimension + 2)
+        )
+        source_mean, source_centered = self._weighted_center(
+            source,
+            weights,
+        )
+        target_mean, target_centered = self._weighted_center(
+            target,
+            weights,
+        )
+        effective_rank = self._effective_rank(
+            source_centered,
+            weights,
+        )
+        required_rank = max(
+            2,
+            int(math.ceil(
+                self.minimum_rotation_rank_fraction * dimension
+            )),
+        )
+        if (
+            source.size(0) < minimum_samples
+            or effective_rank < required_rank
+        ):
+            return None, effective_rank
+
+        weighted_source = source_centered * weights.sqrt().unsqueeze(1)
+        weighted_target = target_centered * weights.sqrt().unsqueeze(1)
+        cross = weighted_source.transpose(0, 1) @ weighted_target
+
+        u, singular, vh = torch.linalg.svd(
+            cross,
+            full_matrices=False,
+        )
+        q = u @ vh
+        # Proper orthogonal Procrustes: reject a reflection.
+        if float(torch.linalg.det(q).item()) < 0.0:
+            u = u.clone()
+            u[:, -1] *= -1.0
+            q = u @ vh
+
+        denominator = weighted_source.square().sum().clamp_min(1e-12)
+        aligned = source_centered @ q
+        numerator = (
+            weights[:, None] * aligned * target_centered
+        ).sum()
+        scale = float(
+            (numerator / denominator)
+            .clamp(self.minimum_scale, self.maximum_scale)
+            .item()
+        )
+
+        # BranchSimilarityTransform uses y = x @ (scale * R).T + b.
+        rotation = q.transpose(0, 1).contiguous()
+        bias = (
+            target_mean
+            - source_mean
+            @ (scale * rotation).transpose(0, 1)
+        )
+        return {
+            "rotation": rotation,
+            "scale": scale,
+            "bias": bias,
+            "level": 2,
+            "level0_mode": "not_applicable",
+            "singular_value_sum": float(singular.sum().item()),
+        }, effective_rank
+
+    def _fit_branch(
+        self,
+        support_source: Tensor,
+        support_target: Tensor,
+        validation_source: Tensor,
+        validation_target: Tensor,
+        *,
+        support_weights: Tensor,
+        validation_weights: Tensor,
+        branch_name: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        dimension = support_source.size(1)
+        identity = self._identity_candidate(
+            dimension,
+            device=support_source.device,
+            dtype=support_source.dtype,
+        )
+        translation = self._translation_candidate(
+            support_source,
+            support_target,
+            support_weights,
+        )
+        scale = self._scale_candidate(
+            support_source,
+            support_target,
+            support_weights,
+        )
+        rotation, effective_rank = self._rotation_candidate(
+            support_source,
+            support_target,
+            support_weights,
+        )
+
+        candidates: Dict[str, Optional[Dict[str, Any]]] = {
+            "identity": identity,
+            "translation": translation,
+            "scale_translation": scale,
+            "scale_rotation_translation": rotation,
+        }
+        rmse: Dict[str, float] = {}
+        for name, candidate in candidates.items():
+            if candidate is None:
+                rmse[name] = float("inf")
+                continue
+            predicted = self._apply(
+                validation_source,
+                rotation=candidate["rotation"],
+                scale=candidate["scale"],
+                bias=candidate["bias"],
+            )
+            rmse[name] = self._normalized_rmse(
+                predicted,
+                validation_target,
+                validation_weights,
+            )
+
+        selected = identity
+        selected_name = "identity"
+        selected_rmse = rmse[selected_name]
+
+        if _relative_improvement(
+            selected_rmse,
+            rmse["translation"],
+        ) >= self.minimum_relative_improvement:
+            selected = translation
+            selected_name = "translation"
+            selected_rmse = rmse[selected_name]
+
+        if (
+            scale is not None
+            and _relative_improvement(
+                selected_rmse,
+                rmse["scale_translation"],
+            ) >= self.minimum_relative_improvement
+        ):
+            selected = scale
+            selected_name = "scale_translation"
+            selected_rmse = rmse[selected_name]
+
+        if (
+            rotation is not None
+            and _relative_improvement(
+                selected_rmse,
+                rmse["scale_rotation_translation"],
+            ) >= self.minimum_relative_improvement
+        ):
+            selected = rotation
+            selected_name = "scale_rotation_translation"
+            selected_rmse = rmse[selected_name]
+
+        rejected_for_error = False
+        if (
+            self.maximum_normalized_rmse > 0.0
+            and selected_rmse > self.maximum_normalized_rmse
+        ):
+            selected = identity
+            selected_name = "identity"
+            selected_rmse = rmse["identity"]
+            rejected_for_error = True
+
+        report = {
+            "branch": branch_name,
+            "selected_candidate": selected_name,
+            "selected_level": int(selected["level"]),
+            "level0_mode": selected["level0_mode"],
+            "selected_normalized_rmse": float(selected_rmse),
+            "candidate_normalized_rmse": dict(rmse),
+            "support_samples": int(support_source.size(0)),
+            "validation_samples": int(validation_source.size(0)),
+            "support_effective_rank": int(effective_rank),
+            "rotation_candidate_available": rotation is not None,
+            "scale_candidate_available": scale is not None,
+            "rejected_for_excessive_error": rejected_for_error,
+        }
+        return selected, report
+
+    def fit(
+        self,
+        support_previous: Tensor,
+        support_current: Tensor,
+        validation_previous: Tensor,
+        validation_current: Tensor,
+        *,
+        support_weights: Optional[Tensor] = None,
+        validation_weights: Optional[Tensor] = None,
+    ) -> Tuple[BranchSimilarityTransform, Dict[str, Any]]:
+        feature_dim = self.spectral_dim + self.spatial_dim
+        support_previous = _feature_matrix(
+            support_previous,
+            expected_dim=feature_dim,
+            name="support_previous",
+        )
+        support_current = _feature_matrix(
+            support_current,
+            expected_dim=feature_dim,
+            name="support_current",
+        )
+        validation_previous = _feature_matrix(
+            validation_previous,
+            expected_dim=feature_dim,
+            name="validation_previous",
+        )
+        validation_current = _feature_matrix(
+            validation_current,
+            expected_dim=feature_dim,
+            name="validation_current",
+        )
+        if support_previous.shape != support_current.shape:
+            raise ValueError("support feature pairs are not aligned")
+        if validation_previous.shape != validation_current.shape:
+            raise ValueError("validation feature pairs are not aligned")
+        if support_previous.device != support_current.device:
+            raise RuntimeError("support feature pairs must share one device")
+        if validation_previous.device != validation_current.device:
+            raise RuntimeError("validation feature pairs must share one device")
+        if validation_previous.device != support_previous.device:
+            raise RuntimeError("support and validation pairs must share one device")
+
+        support_weight = _weights(
+            support_weights,
+            sample_count=support_previous.size(0),
+            device=support_previous.device,
+            dtype=support_previous.dtype,
+        )
+        validation_weight = _weights(
+            validation_weights,
+            sample_count=validation_previous.size(0),
+            device=validation_previous.device,
+            dtype=validation_previous.dtype,
+        )
+
+        ds = self.spectral_dim
+        spectral, spectral_report = self._fit_branch(
+            support_previous[:, :ds],
+            support_current[:, :ds],
+            validation_previous[:, :ds],
+            validation_current[:, :ds],
+            support_weights=support_weight,
+            validation_weights=validation_weight,
+            branch_name="spectral",
+        )
+        spatial, spatial_report = self._fit_branch(
+            support_previous[:, ds:],
+            support_current[:, ds:],
+            validation_previous[:, ds:],
+            validation_current[:, ds:],
+            support_weights=support_weight,
+            validation_weights=validation_weight,
+            branch_name="spatial",
+        )
+
+        transform = BranchSimilarityTransform(
+            spectral_rotation=spectral["rotation"].detach(),
+            spatial_rotation=spatial["rotation"].detach(),
+            spectral_scale=float(spectral["scale"]),
+            spatial_scale=float(spatial["scale"]),
+            spectral_bias=spectral["bias"].detach(),
+            spatial_bias=spatial["bias"].detach(),
+            spectral_level=int(spectral["level"]),
+            spatial_level=int(spatial["level"]),
+        )
+        return transform, {
+            "spectral": spectral_report,
+            "spatial": spatial_report,
+            "support_validation_disjoint_required": True,
+            "analytical_fit": True,
+            "trainable_transport_parameters": False,
+        }
+
+
+# =============================================================================
+# Integrated model
+# =============================================================================
 
 
 class NECILModel(nn.Module):
-    """NECIL-HSI model with one canonical feature space and one geometry memory.
+    """Transport-verified factor-geometry NECIL architecture."""
 
-    Architectural contract
-    ----------------------
-    * Base and incremental samples use the same canonical projected feature z.
-    * GeometryBank is the only old-class memory.
-    * Physical spectra are used to build spectral tangent/coupling descriptors,
-      never as a second inference classifier.
-    * Incremental backbone, projection, norm, and classifier are frozen.
-    * Only temporary new-row descriptor residuals are optimized by the trainer.
-    * No feature adapter, transport, calibration, teacher, or prototype branch.
-    """
+    ARCHITECTURE_VERSION = 2
+    METHOD_NAME = "Transport-verified spectral-spatial factor geometry"
+
+    FEATURE_MODE = "features"
+    BASE_CE_MODE = "base_ce"
+    GEOMETRY_MODE = "geometry"
 
     def __init__(self, args: Any) -> None:
         super().__init__()
         self.args = args
-        self.device = torch.device(getattr(args, "device", "cpu"))
-        self.d_model = int(getattr(args, "d_model", 128))
-        self.subspace_rank = int(getattr(args, "subspace_rank", getattr(args, "rank", 5)))
-        if self.d_model <= 0:
-            raise ValueError("d_model must be positive.")
-        if self.subspace_rank < 0:
-            raise ValueError("subspace_rank must be non-negative.")
-
-        self.current_phase = 0
-        self.old_class_count = 0
-        self.old_classes: List[int] = []
-        self.current_num_classes = 0
-        self.seen_classes: List[int] = []
-        self.base_mode_active = True
-        self.incremental_mode_active = False
-        self._incremental_frozen_modules: List[str] = []
-
-        self.incremental_update_mode = _normalize_incremental_update_mode(
-            getattr(args, "incremental_update_mode", None)
+        self.device = torch.device(
+            getattr(args, "device", "cpu")
         )
-        try:
-            setattr(args, "incremental_update_mode", self.incremental_update_mode)
-        except Exception:
-            pass
-
-        # One exact energy is used by GeometryBank replay admission, classifier
-        # scoring, base margin training, incremental losses, and evaluation.
-        # Normalize it before constructing the classifier so stale command-line
-        # or checkpoint-era arguments cannot reactivate a different score.
-        self._install_strict_energy_contract(args)
-
-        # Runtime identity flags used by trainers. All alternative mechanisms are
-        # hard-disabled rather than merely left unused.
-        self.use_incremental_adapter = False
-        self.use_geometry_gated_adapter = False
-        self.use_geometry_calibrator = False
-        self.use_energy_calibrator = False
-        self.use_adaptive_boundary = False
-        self.use_bicyc_geometry_cycle = False
-        self.use_geometry_transport = False
-        self.use_sglat_transport = False
-        self.use_spectral_geometry = False
-        self.geometry_plastic_adapter: Optional[nn.Module] = None
-        self.semantic_encoder: Optional[nn.Module] = None
-        self.concept_encoder: Optional[nn.Module] = None
-        self.default_eval_classifier_mode = "geometry_only"
-        self.default_incremental_classifier_mode = "geometry_only"
 
         self.backbone = SSMBackbone(args)
-        projection_dropout = float(getattr(args, "projection_dropout", 0.0))
-        self.projection = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
-            nn.GELU(),
-            nn.Dropout(projection_dropout),
-            nn.Linear(self.d_model, self.d_model),
+        self.spectral_dim = int(
+            self.backbone.spectral_feature_dim
         )
-        self.norm = nn.LayerNorm(self.d_model)
+        self.spatial_dim = int(
+            self.backbone.spatial_feature_dim
+        )
+        self.feature_dim = int(self.backbone.feature_dim)
+        self.maximum_rank = int(
+            getattr(
+                args,
+                "subspace_rank",
+                getattr(args, "rank", 4),
+            )
+        )
 
-        self.normalize_geometry_features = _to_bool(
-            getattr(args, "normalize_geometry_features", True), True
+        self.geometry_bank = GeometryBank(
+            spectral_dim=self.spectral_dim,
+            spatial_dim=self.spatial_dim,
+            maximum_rank=self.maximum_rank,
+            raw_spectral_dim=int(
+                self.backbone.raw_num_bands
+            ),
+            spectral_resample_length=int(
+                getattr(args, "spectral_resample_length", 32)
+            ),
+            spectral_derivative_weight=float(
+                getattr(
+                    args,
+                    "spectral_derivative_weight",
+                    0.50,
+                )
+            ),
+            device=self.device,
+            variance_floor_absolute=float(
+                getattr(args, "geom_var_floor", 1e-4)
+            ),
+            variance_floor_relative=float(
+                getattr(
+                    args,
+                    "geometry_variance_floor_relative",
+                    1e-3,
+                )
+            ),
+            minimum_variance_shrinkage=float(
+                getattr(
+                    args,
+                    "geometry_minimum_variance_shrinkage",
+                    0.10,
+                )
+            ),
+            extra_rare_class_shrinkage=float(
+                getattr(
+                    args,
+                    "geometry_extra_rare_class_shrinkage",
+                    0.35,
+                )
+            ),
+            shrinkage_sample_strength=float(
+                getattr(
+                    args,
+                    "geometry_shrinkage_tau",
+                    20.0,
+                )
+            ),
+            factor_fit_iterations=int(
+                getattr(args, "factor_fit_iterations", 3)
+            ),
+            whitened_eigen_excess_threshold=float(
+                getattr(
+                    args,
+                    "whitened_eigen_excess_threshold",
+                    0.50,
+                )
+            ),
+            rank_energy_threshold=float(
+                getattr(
+                    args,
+                    "rank_energy_threshold",
+                    0.95,
+                )
+            ),
+            rank_eigen_ratio_threshold=float(
+                getattr(
+                    args,
+                    "rank_eigen_ratio_threshold",
+                    1e-3,
+                )
+            ),
+            volume_weight=float(
+                getattr(
+                    args,
+                    "geometry_volume_weight",
+                    getattr(args, "energy_logdet_weight", 0.50),
+                )
+            ),
+            robust_iterations=int(
+                getattr(
+                    args,
+                    "robust_geometry_iterations",
+                    3,
+                )
+            ),
+            robust_huber_delta=float(
+                getattr(
+                    args,
+                    "robust_geometry_huber_delta",
+                    2.5,
+                )
+            ),
+            spatial_purity_power=float(
+                getattr(args, "spatial_purity_power", 1.0)
+            ),
+            reliability_sample_strength=float(
+                getattr(
+                    args,
+                    "geometry_reliability_sample_strength",
+                    20.0,
+                )
+            ),
         )
-        raw_scale = float(getattr(args, "geometry_feature_scale", 0.0) or 0.0)
-        self.geometry_feature_scale = raw_scale if raw_scale > 0 else math.sqrt(float(self.d_model))
-        self.geometry_feature_clamp = float(getattr(args, "geometry_feature_clamp", 0.0) or 0.0)
-        self.spectral_summary_mode = str(getattr(args, "spectral_summary_mode", "center")).lower().strip()
-        if self.spectral_summary_mode not in {"center", "mean"}:
-            raise ValueError("spectral_summary_mode must be 'center' or 'mean'.")
-        pca_components = int(getattr(args, "pca_components", 0) or 0)
-        self.default_spectral_physical = _to_bool(
-            getattr(args, "spectral_summary_is_physical", pca_components <= 0),
-            pca_components <= 0,
-        )
-        self.min_band_mass = float(getattr(args, "min_band_mass", 1e-8))
 
-        bank_kwargs = _filter_supported_kwargs(
-            GeometryBank.__init__,
-            {
-                "device": self.device,
-                "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-                "variance_shrinkage": float(getattr(args, "geometry_variance_shrinkage", 0.10)),
-                "max_variance_ratio": float(getattr(args, "geometry_max_variance_ratio", 50.0)),
-                "min_reliability": float(getattr(args, "geometry_min_reliability", 0.05)),
-                "reliability_sample_alpha": float(getattr(args, "reliability_sample_alpha", 20.0)),
-                "rank_energy_threshold": float(getattr(args, "rank_energy_threshold", 0.95)),
-                "rank_eigen_ratio_threshold": float(getattr(args, "rank_eigen_ratio_threshold", 1e-3)),
-                "min_active_rank": int(getattr(args, "min_active_rank", 1)),
-                "small_class_rank_threshold_1": int(getattr(args, "small_class_rank_threshold_1", 30)),
-                "small_class_rank_threshold_2": int(getattr(args, "small_class_rank_threshold_2", 80)),
-                "small_class_rank_threshold_3": int(getattr(args, "small_class_rank_threshold_3", 150)),
-                "small_class_rank_cap_1": int(getattr(args, "small_class_rank_cap_1", 1)),
-                "small_class_rank_cap_2": int(getattr(args, "small_class_rank_cap_2", 3)),
-                "small_class_rank_cap_3": int(getattr(args, "small_class_rank_cap_3", 4)),
-                "small_class_extra_shrinkage": float(getattr(args, "small_class_extra_shrinkage", 0.35)),
-                "spectral_rank": int(getattr(args, "spectral_geometry_rank", getattr(args, "spectral_rank", 6))),
-                "spectral_rank_energy_threshold": float(getattr(args, "spectral_rank_energy_threshold", 0.95)),
-                "spectral_rank_eigen_ratio_threshold": float(getattr(args, "spectral_rank_eigen_ratio_threshold", 1e-3)),
-                "spectral_variance_floor": float(getattr(args, "spectral_variance_floor", 1e-6)),
-                "coupling_ridge": float(getattr(args, "coupling_ridge", 1e-3)),
-                "coupling_min_reliability": float(getattr(args, "coupling_min_reliability", 0.20)),
-                "spectral_tangent_clip": float(getattr(args, "spectral_tangent_clip", 2.5)),
-                "replay_candidate_multiplier": int(getattr(args, "replay_candidate_multiplier", 4)),
-            },
+        self.classifier = GeometryEnergyClassifier(
+            feature_dim=self.feature_dim,
+            temperature=float(
+                getattr(args, "energy_temperature", 1.0)
+            ),
+            expected_spectral_dim=self.spectral_dim,
+            expected_spatial_dim=self.spatial_dim,
+            expected_bank_schema_version=int(
+                self.geometry_bank.SCHEMA_VERSION
+            ),
+            require_bound_contract=False,
         )
-        self.geometry_bank = GeometryBank(self.d_model, self.subspace_rank, **bank_kwargs)
 
-        clf_kwargs = _filter_supported_kwargs(
-            GeometryEnergyClassifier.__init__,
-            {
-                "initial_classes": 0,
-                "d_model": self.d_model,
-                "logit_scale": float(getattr(args, "loss_scale", getattr(args, "logit_scale", 8.0))),
-                "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-                "residual_variance_scale": 1.0,
-                "normalize_energy_by_dim": True,
-                "energy_normalize_by_dim": True,
-                "use_logdet_energy": False,
-                "logdet_energy_weight": 0.0,
-                "logdet_normalize_by_dim": False,
-                "center_logdet_energy": False,
-                "use_reliability_penalty": False,
-                "reliability_energy_weight": 0.0,
-                "center_reliability_energy": False,
-                "use_old_new_calibration": False,
-                "invalid_class_energy": float(getattr(args, "invalid_class_energy", 1e6)),
-                "logit_clip": float(getattr(args, "geometry_logit_clip", 0.0)),
-            },
+        self.transport_estimator = (
+            EvidenceGatedSimilarityEstimator(
+                spectral_dim=self.spectral_dim,
+                spatial_dim=self.spatial_dim,
+                minimum_scale_samples=int(
+                    getattr(
+                        args,
+                        "transport_minimum_scale_samples",
+                        8,
+                    )
+                ),
+                minimum_rotation_samples=getattr(
+                    args,
+                    "transport_minimum_rotation_samples",
+                    None,
+                ),
+                minimum_rotation_rank_fraction=float(
+                    getattr(
+                        args,
+                        "transport_minimum_rank_fraction",
+                        0.50,
+                    )
+                ),
+                rank_tolerance=float(
+                    getattr(
+                        args,
+                        "transport_rank_tolerance",
+                        1e-4,
+                    )
+                ),
+                minimum_relative_improvement=float(
+                    getattr(
+                        args,
+                        "transport_minimum_relative_improvement",
+                        0.02,
+                    )
+                ),
+                maximum_normalized_rmse=float(
+                    getattr(
+                        args,
+                        "transport_maximum_normalized_rmse",
+                        1.50,
+                    )
+                ),
+                minimum_scale=float(
+                    getattr(args, "transport_minimum_scale", 0.70)
+                ),
+                maximum_scale=float(
+                    getattr(args, "transport_maximum_scale", 1.30)
+                ),
+            )
         )
-        self.classifier = GeometryEnergyClassifier(**clf_kwargs)
-        self._assert_strict_energy_contract()
 
         self.base_ce_head: Optional[nn.Linear] = None
-        self.base_ce_num_classes = 0
+        self.base_ce_class_ids: List[int] = []
+
+        self.current_phase = 0
+        self.phase_mode = "base"
+        self.seen_classes: List[int] = []
+        self.old_classes: List[int] = []
+        self.new_classes: List[int] = []
+        self.phase_old_digest: Optional[str] = None
+        self.base_handoff: Optional[Dict[str, Any]] = None
+
         self.to(self.device)
+        self.assert_architecture_contract()
 
-    def _install_strict_energy_contract(self, args: Any) -> None:
-        """Install the single SCTGR geometry-energy contract.
+    # ------------------------------------------------------------------
+    # Architecture and checkpoint contract
+    # ------------------------------------------------------------------
 
-        Reliability and spectral coupling control replay allocation, trust, and
-        candidate generation only. They must never modify classifier logits.
-        """
-        contract = {
-            "residual_variance_scale": 1.0,
-            "energy_normalize_by_dim": True,
-            "use_logdet_energy": False,
-            "logdet_energy_weight": 0.0,
-            "logdet_normalize_by_dim": False,
-            "center_logdet_energy": False,
-            "use_reliability_penalty": False,
-            "reliability_energy_weight": 0.0,
-            "center_reliability_energy": False,
-            "use_spectral_geometry": False,
-            "spectral_energy_weight": 0.0,
-            "band_energy_weight": 0.0,
+    def architecture_summary(self) -> Dict[str, Any]:
+        return {
+            "architecture_version":
+                self.ARCHITECTURE_VERSION,
+            "method": self.METHOD_NAME,
+            "classification_factorization": "p(z|c)",
+            "spectral_relation_factorization": "p(h|c)",
+            "joint_feature": "direct_[z_s;z_p]",
+            "feature_dim": self.feature_dim,
+            "spectral_dim": self.spectral_dim,
+            "spatial_dim": self.spatial_dim,
+            "maximum_factor_rank": self.maximum_rank,
+            "phase_observer": (
+                "temporary_external_frozen_encoder"
+            ),
+            "phase_transport": (
+                "analytical_evidence_gated_branch_similarity"
+            ),
+            "trainable_transport_network": False,
+            "old_rows_evolve": True,
+            "uses_geometry_replay_for_training": False,
+            "stores_exemplars": False,
+            "stores_old_features": False,
+            "stores_old_spectra": False,
+            "uses_knowledge_distillation": False,
+            "uses_task_adapters": False,
+            "classifier": (
+                "parameter_free_equal_prior_factor_energy"
+            ),
         }
-        for name, value in contract.items():
-            try:
-                setattr(args, name, value)
-            except Exception:
-                pass
-            setattr(self, name, value)
 
-    def _assert_strict_energy_contract(self) -> None:
-        expected = {
-            "residual_variance_scale": 1.0,
-            "energy_normalize_by_dim": True,
-            "use_logdet_energy": False,
-            "logdet_energy_weight": 0.0,
-            "center_logdet_energy": False,
-            "use_reliability_penalty": False,
-            "reliability_energy_weight": 0.0,
-            "use_spectral_geometry": False,
-            "spectral_energy_weight": 0.0,
-            "band_energy_weight": 0.0,
-        }
-        errors: List[str] = []
-        for name, wanted in expected.items():
-            actual = getattr(self, name, None)
-            if isinstance(wanted, bool):
-                if bool(actual) != wanted:
-                    errors.append(f"model.{name}={actual!r}, expected {wanted!r}")
-            else:
-                try:
-                    if abs(float(actual) - float(wanted)) > 1e-8:
-                        errors.append(f"model.{name}={actual!r}, expected {wanted!r}")
-                except Exception:
-                    errors.append(f"model.{name}={actual!r}, expected {wanted!r}")
+    def architecture_digest(self) -> str:
+        payload = (
+            self.architecture_summary(),
+            self.backbone.backbone_contract(),
+            self.classifier.classifier_contract(),
+        )
+        return hashlib.sha256(
+            repr(payload).encode("utf-8")
+        ).hexdigest()
 
-        clf = getattr(self, "classifier", None)
-        if clf is not None:
-            classifier_expected = {
-                "residual_variance_scale": 1.0,
-                "normalize_energy_by_dim": True,
-                "use_logdet_energy": False,
-                "logdet_energy_weight": 0.0,
-                "center_logdet_energy": False,
-                "use_reliability_penalty": False,
-                "reliability_energy_weight": 0.0,
-            }
-            for name, wanted in classifier_expected.items():
-                if not hasattr(clf, name):
-                    continue
-                actual = getattr(clf, name)
-                if isinstance(wanted, bool):
-                    if bool(actual) != wanted:
-                        errors.append(f"classifier.{name}={actual!r}, expected {wanted!r}")
-                elif abs(float(actual) - float(wanted)) > 1e-8:
-                    errors.append(f"classifier.{name}={actual!r}, expected {wanted!r}")
-
-        if errors:
+    def assert_architecture_contract(self) -> None:
+        if self.feature_dim != (
+            self.spectral_dim + self.spatial_dim
+        ):
             raise RuntimeError(
-                "SCTGR energy contract mismatch: " + "; ".join(errors)
+                "backbone branch dimensions do not sum to feature_dim"
+            )
+        if self.geometry_bank.feature_dim != self.feature_dim:
+            raise RuntimeError(
+                "GeometryBank and backbone feature dimensions differ"
+            )
+        if self.geometry_bank.spectral_dim != self.spectral_dim:
+            raise RuntimeError(
+                "GeometryBank spectral dimension is inconsistent"
+            )
+        if self.geometry_bank.spatial_dim != self.spatial_dim:
+            raise RuntimeError(
+                "GeometryBank spatial dimension is inconsistent"
+            )
+        if self.geometry_bank.raw_spectral_dim != (
+            self.backbone.raw_num_bands
+        ):
+            raise RuntimeError(
+                "GeometryBank and backbone raw spectral widths differ"
             )
 
+        required_bank_methods = (
+            "fit_global_priors",
+            "extract_rows",
+            "energy_matrix",
+            "pair_risk_matrix",
+            "build_transported_rows",
+            "commit_base_rows",
+            "commit_incremental_phase",
+            "rows_digest",
+            "export_snapshot",
+            "load_snapshot",
+        )
+        missing = [
+            name
+            for name in required_bank_methods
+            if not callable(
+                getattr(self.geometry_bank, name, None)
+            )
+        ]
+        if missing:
+            raise RuntimeError(
+                f"GeometryBank lacks required methods: {missing}"
+            )
+
+        if any(
+            parameter.requires_grad
+            for parameter in self.geometry_bank.parameters()
+        ):
+            raise RuntimeError(
+                "GeometryBank must contain buffers only"
+            )
+        if any(
+            parameter.requires_grad
+            for parameter in self.classifier.parameters()
+        ):
+            raise RuntimeError(
+                "factor-energy classifier must be parameter-free"
+            )
+
+        classifier_contract = (
+            self.classifier.classifier_contract()
+        )
+        if classifier_contract.get(
+            "classification_factorization"
+        ) != "p(z|c)":
+            raise RuntimeError(
+                "classifier factorization is inconsistent"
+            )
+        if classifier_contract.get(
+            "uses_raw_spectra_at_inference"
+        ) is not False:
+            raise RuntimeError(
+                "raw spectra must not enter classifier inference"
+            )
+
+    def get_extra_state(self) -> Dict[str, Any]:
+        return {
+            "architecture_version":
+                self.ARCHITECTURE_VERSION,
+            "architecture_digest":
+                self.architecture_digest(),
+            "current_phase": int(self.current_phase),
+            "phase_mode": str(self.phase_mode),
+            "seen_classes": list(self.seen_classes),
+            "old_classes": list(self.old_classes),
+            "new_classes": list(self.new_classes),
+            "phase_old_digest": self.phase_old_digest,
+            "base_ce_class_ids":
+                list(self.base_ce_class_ids),
+            "base_handoff":
+                copy.deepcopy(self.base_handoff),
+            "phase_context_stored_in_model": False,
+        }
+
+    def set_extra_state(self, state: Any) -> None:
+        if not isinstance(state, Mapping):
+            return
+        version = int(
+            state.get("architecture_version", -1)
+        )
+        if version != self.ARCHITECTURE_VERSION:
+            raise RuntimeError(
+                "NECILModel architecture version mismatch: "
+                f"{version} vs {self.ARCHITECTURE_VERSION}"
+            )
+
+        self.current_phase = int(
+            state.get("current_phase", 0)
+        )
+        self.phase_mode = str(
+            state.get("phase_mode", "base")
+        )
+        self.seen_classes = [
+            int(value)
+            for value in state.get("seen_classes", [])
+        ]
+        self.old_classes = [
+            int(value)
+            for value in state.get("old_classes", [])
+        ]
+        self.new_classes = [
+            int(value)
+            for value in state.get("new_classes", [])
+        ]
+        digest = state.get("phase_old_digest")
+        self.phase_old_digest = (
+            None if digest is None else str(digest)
+        )
+        self.base_ce_class_ids = [
+            int(value)
+            for value in state.get(
+                "base_ce_class_ids",
+                [],
+            )
+        ]
+        if (
+            self.base_ce_class_ids
+            and self.base_ce_head is None
+        ):
+            self.ensure_base_ce_head(
+                self.base_ce_class_ids
+            )
+        self.base_handoff = copy.deepcopy(
+            state.get("base_handoff")
+        )
+
     # ------------------------------------------------------------------
-    # Canonical feature and physical-spectrum extraction
+    # Backbone output and feature extraction
     # ------------------------------------------------------------------
-    def _validate_feature_tensor(
+
+    def _validate_output(
         self,
-        features: torch.Tensor,
-        name: str,
-        batch_size: Optional[int] = None,
-    ) -> torch.Tensor:
-        if not torch.is_tensor(features):
-            raise TypeError(f"{name} must be a tensor, got {type(features)}")
-        if features.dim() != 2 or features.size(1) != self.d_model:
-            raise RuntimeError(f"{name} must be [B,{self.d_model}], got {tuple(features.shape)}")
-        if batch_size is not None and features.size(0) != int(batch_size):
-            raise RuntimeError(f"{name} batch mismatch: {features.size(0)} != {int(batch_size)}")
-        if not torch.isfinite(features).all():
-            raise RuntimeError(f"{name} contains NaN/Inf.")
-        return features
+        output: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        required = (
+            "spectral_feature",
+            "spatial_feature",
+            "joint_feature",
+            "raw_center_spectrum",
+        )
+        missing = [
+            name for name in required
+            if name not in output
+        ]
+        if missing:
+            raise RuntimeError(
+                f"backbone output lacks {missing}"
+            )
 
-    def _canonicalize(self, z: torch.Tensor, *, name: str) -> torch.Tensor:
-        z = self._validate_feature_tensor(z, name)
-        if self.normalize_geometry_features:
-            z = F.normalize(z, p=2, dim=1, eps=1e-8) * float(self.geometry_feature_scale)
-        if self.geometry_feature_clamp > 0:
-            z = z.clamp(-self.geometry_feature_clamp, self.geometry_feature_clamp)
-        if not torch.isfinite(z).all():
-            raise RuntimeError(f"{name} became non-finite after canonicalization.")
-        return z
+        result = dict(output)
+        spectral = _feature_matrix(
+            result["spectral_feature"],
+            expected_dim=self.spectral_dim,
+            name="spectral_feature",
+        )
+        spatial = _feature_matrix(
+            result["spatial_feature"],
+            expected_dim=self.spatial_dim,
+            name="spatial_feature",
+        )
+        joint = _feature_matrix(
+            result["joint_feature"],
+            expected_dim=self.feature_dim,
+            name="joint_feature",
+        )
+        if not torch.equal(
+            joint,
+            torch.cat([spectral, spatial], dim=1),
+        ):
+            raise RuntimeError(
+                "joint feature is not exact [z_s;z_p]"
+            )
 
-    def _center_spectrum_from_input(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 4:
-            return x[:, :, x.size(-2) // 2, x.size(-1) // 2] if self.spectral_summary_mode == "center" else x.mean((-1, -2))
-        if x.dim() == 3:
-            return x[:, :, x.size(-1) // 2] if self.spectral_summary_mode == "center" else x.mean(-1)
-        if x.dim() == 2:
-            return x
-        raise RuntimeError(f"Unsupported input shape for spectral summary: {tuple(x.shape)}")
+        spectra = torch.as_tensor(
+            result["raw_center_spectrum"],
+            device=joint.device,
+            dtype=joint.dtype,
+        )
+        if spectra.shape != (
+            joint.size(0),
+            self.backbone.raw_num_bands,
+        ):
+            raise RuntimeError(
+                "raw_center_spectrum shape is invalid"
+            )
+        if not torch.isfinite(spectra).all():
+            raise RuntimeError(
+                "raw_center_spectrum contains NaN/Inf"
+            )
 
-    def _prepare_spectral_summary(
-        self,
-        x: torch.Tensor,
-        features: torch.Tensor,
-        spectral_summary: Optional[torch.Tensor] = None,
-        spectral_summary_is_physical: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, bool]:
-        if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-            s = self._center_spectrum_from_input(x).to(features.device, features.dtype)
-            physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-        else:
-            s = spectral_summary.to(features.device, features.dtype)
-            if s.dim() == 4:
-                s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-            elif s.dim() == 3:
-                s = s[:, :, s.size(-1) // 2] if s.size(0) == features.size(0) else s.reshape(features.size(0), -1)
-            elif s.dim() == 1:
-                if s.numel() % max(features.size(0), 1) != 0:
-                    raise RuntimeError("1-D spectral_summary cannot be aligned with the batch.")
-                s = s.reshape(features.size(0), -1)
-            elif s.dim() != 2:
-                s = s.reshape(features.size(0), -1)
-            physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-        if s.dim() != 2 or s.size(0) != features.size(0):
-            raise RuntimeError(f"spectral_summary must resolve to [B,S], got {tuple(s.shape)}")
-        s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-        return s, bool(physical and s.size(1) > 0)
-
-    def _band_summary(
-        self,
-        spectral_summary: torch.Tensor,
-        band_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if torch.is_tensor(band_weights) and band_weights.numel() > 0:
-            bw = band_weights.to(spectral_summary.device, spectral_summary.dtype)
-            if bw.shape == spectral_summary.shape:
-                bw = torch.nan_to_num(bw, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-                mass = bw.sum(1, keepdim=True)
-                if bool((mass > self.min_band_mass).all().item()):
-                    return bw / mass.clamp_min(self.min_band_mass)
-        b = spectral_summary.abs()
-        mass = b.sum(1, keepdim=True)
-        uniform = torch.full_like(b, 1.0 / float(max(b.size(1), 1)))
-        return torch.where(mass > self.min_band_mass, b / mass.clamp_min(self.min_band_mass), uniform)
-
-    def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if not torch.is_tensor(x):
-            raise TypeError(f"x must be a tensor, got {type(x)}")
-        out = self.backbone(x.to(self.device))
-        if isinstance(out, dict):
-            if not torch.is_tensor(out.get("features", None)):
-                raise RuntimeError("backbone output dict must contain tensor 'features'.")
-            result = dict(out)
-            result["features"] = self._validate_feature_tensor(out["features"], "backbone.features", x.size(0))
-            result.setdefault("backbone_features", result["features"])
-            return result
-        h = self._validate_feature_tensor(out, "backbone.features", x.size(0))
-        return {"features": h, "backbone_features": h}
+        result["spectral_feature"] = spectral
+        result["spatial_feature"] = spatial
+        result["joint_feature"] = joint
+        result["joint_features"] = joint
+        result["geometry_features"] = joint
+        result["features"] = joint
+        result["raw_center_spectrum"] = spectra
+        result["raw_center_spectra"] = spectra
+        return result
 
     def forward_features(
         self,
-        x: torch.Tensor,
+        model_patch: Tensor,
+        raw_spectral_patch: Optional[Tensor] = None,
+        raw_center_spectrum: Optional[Tensor] = None,
         *,
-        spectral_summary: Optional[torch.Tensor] = None,
-        band_weights: Optional[torch.Tensor] = None,
-        spectral_summary_is_physical: Optional[bool] = None,
-        apply_adapter: Optional[bool] = None,
-        **_: Any,
-    ) -> Dict[str, torch.Tensor]:
-        if bool(apply_adapter):
-            raise RuntimeError("Feature adapters are not part of spectral_coupled_geometry_replay.")
-        raw = self.extract_features(x)
-        h = self._validate_feature_tensor(raw["features"], "preproject_features", x.size(0))
-        z = self._canonicalize(self.norm(self.projection(h) + h), name="canonical_geometry_features")
-        s, physical = self._prepare_spectral_summary(
-            x.to(self.device), z,
-            spectral_summary=spectral_summary,
-            spectral_summary_is_physical=spectral_summary_is_physical,
+        deterministic: bool = True,
+    ) -> Dict[str, Any]:
+        patch = model_patch.to(self.device)
+        raw_patch = (
+            None
+            if raw_spectral_patch is None
+            else raw_spectral_patch.to(self.device)
         )
-        candidate_bw = band_weights if band_weights is not None else raw.get("band_weights", None)
-        band = self._band_summary(s, candidate_bw)
-        return {
-            "features": z,
-            "projected_features": z,
-            "geometry_features": z,
-            "canonical_features": z,
-            "canonical_projected_features": z,
-            "pre_adapter_features": z,
-            "preproject_features": h,
-            "backbone_features": h,
-            "spectral_summary": s,
-            "spectral_summary_is_physical": torch.tensor(bool(physical), device=z.device, dtype=torch.bool),
-            "band_summary": band,
-            "band_importance": band,
-            "band_weights": candidate_bw if torch.is_tensor(candidate_bw) else None,
-            "spectral_features": raw.get("spectral_features", h),
-            "spatial_features": raw.get("spatial_features", h),
-            "adapter_active": torch.tensor(False, device=z.device),
-        }
+        raw_center = (
+            None
+            if raw_center_spectrum is None
+            else raw_center_spectrum.to(self.device)
+        )
+        output = (
+            self.backbone.forward_geometry(
+                patch,
+                raw_spectral_patch=raw_patch,
+                raw_center_spectrum=raw_center,
+            )
+            if deterministic
+            else self.backbone(
+                patch,
+                raw_spectral_patch=raw_patch,
+                raw_center_spectrum=raw_center,
+            )
+        )
+        return self._validate_output(output)
 
-    def extract_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        kwargs = dict(kwargs)
-        kwargs["apply_adapter"] = False
-        return self.forward_features(x, **kwargs)
-
-    extract_canonical_projected_features = extract_projected_features
-
-    def extract_adapted_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        raise RuntimeError("Adapted feature extraction is forbidden; use canonical projected features.")
-
-    def extract_geometry_features(
-        self,
-        x: torch.Tensor,
-        *,
-        return_dict: bool = False,
-        space: str = "canonical",
-        **kwargs: Any,
-    ):
-        space_norm = str(space or "canonical").lower().strip()
-        if space_norm not in {"canonical", "pre_adapter", "base"}:
-            raise RuntimeError("GeometryBank supports canonical feature space only.")
-        out = self.extract_projected_features(x, **kwargs)
-        out["geometry_feature_space"] = "canonical"
-        out["classifier_feature_space"] = "canonical"
-        return out if bool(return_dict) else out["features"]
+    extract_geometry_features = forward_features
 
     @torch.no_grad()
-    def extract_backbone_outputs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.forward_features(x)
-
-    # Legacy adapter APIs fail or return an explicit identity view.
-    def adapt_projected_features(self, features: torch.Tensor, **_: Any) -> Dict[str, torch.Tensor]:
-        z = self._validate_feature_tensor(features, "adapt_projected_features.features")
-        zero = torch.zeros_like(z)
-        gate = torch.zeros((z.size(0), 1), device=z.device, dtype=z.dtype)
-        return {
-            "features": z,
-            "projected_features": z,
-            "geometry_features": z,
-            "delta": zero,
-            "gate": gate,
-            "adapter_delta": zero,
-            "adapter_gate": gate,
-            "adapter_active": torch.tensor(False, device=z.device),
-        }
+    def encode_observer(
+        self,
+        context: IncrementalPhaseContext,
+        model_patch: Tensor,
+        raw_spectral_patch: Optional[Tensor] = None,
+        raw_center_spectrum: Optional[Tensor] = None,
+    ) -> Dict[str, Any]:
+        self._validate_phase_context(context)
+        output = context.observer.forward_geometry(
+            model_patch.to(self.device),
+            raw_spectral_patch=(
+                None
+                if raw_spectral_patch is None
+                else raw_spectral_patch.to(self.device)
+            ),
+            raw_center_spectrum=(
+                None
+                if raw_center_spectrum is None
+                else raw_center_spectrum.to(self.device)
+            ),
+        )
+        return self._validate_output(output)
 
     # ------------------------------------------------------------------
-    # GeometryBank capacity and scoring
+    # Classifier interface
     # ------------------------------------------------------------------
-    def _infer_seen_classes(self, geometry_bank: Optional[Any] = None) -> List[int]:
-        bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-        if hasattr(bank_obj, "get_valid_mask"):
-            valid = bank_obj.get_valid_mask().detach().cpu().flatten()
-            return [int(i) for i in torch.nonzero(valid, as_tuple=False).flatten().tolist()]
-        bank = bank_obj.get_bank() if hasattr(bank_obj, "get_bank") else bank_obj
-        if not isinstance(bank, dict) or not torch.is_tensor(bank.get("sample_counts", None)):
-            return list(self.seen_classes)
-        counts = bank["sample_counts"].detach().cpu().flatten()
-        return [int(i) for i in torch.nonzero(counts > 0, as_tuple=False).flatten().tolist()]
 
-    def ensure_class_capacity(
-        self,
-        class_count: int,
-        spectral_dim: int = 0,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
-        count = int(max(0, class_count))
-        dtype = dtype or next(self.parameters()).dtype
-        self.geometry_bank.ensure_class_count(count, spectral_dim=int(spectral_dim), dtype=dtype)
-        self.current_num_classes = max(self.current_num_classes, count)
-
-    def get_subspace_bank(self) -> Dict[str, torch.Tensor]:
-        bank = dict(self.geometry_bank.get_bank())
-        if "variances" not in bank:
-            bank["variances"] = torch.cat([bank["eigvals"], bank["res_vars"].unsqueeze(-1)], dim=-1)
-        bank.setdefault("resvars", bank["res_vars"])
-        return bank
-
-    def get_old_subspace_bank(
-        self,
-        old_class_count: Optional[int] = None,
-        old_classes: Optional[Iterable[int]] = None,
-    ) -> Dict[str, torch.Tensor]:
-        ids = _ordered_unique_ints(old_classes) if old_classes is not None else list(range(int(self.old_class_count if old_class_count is None else old_class_count)))
-        bank = self.get_subspace_bank()
-        if not ids:
-            return {k: v[:0] for k, v in bank.items() if torch.is_tensor(v) and v.dim() > 0 and v.size(0) == len(self.geometry_bank)}
-        idx = torch.as_tensor(ids, device=self.geometry_bank.device, dtype=torch.long)
-        out: Dict[str, torch.Tensor] = {"class_ids": idx}
-        for key, value in bank.items():
-            if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == len(self.geometry_bank):
-                out[key] = value.index_select(0, idx)
-            elif torch.is_tensor(value):
-                out[key] = value
-        return out
+    def infer_seen_classes(self) -> List[int]:
+        valid = self.geometry_bank.valid_mask()
+        return torch.nonzero(
+            valid.detach().cpu().bool(),
+            as_tuple=False,
+        ).flatten().tolist()
 
     def compute_logits_from_features(
         self,
-        features: torch.Tensor,
-        seen_classes: Optional[Iterable[int]] = None,
-        geometry_bank: Optional[Any] = None,
-        mode: str = "geometry",
+        features: Tensor,
         *,
-        classifier_mode: Optional[str] = None,
-        targets: Optional[torch.Tensor] = None,
+        class_ids: Sequence[int],
+        temporary_rows: Optional[
+            Mapping[int, Mapping[str, Any]]
+        ] = None,
+        targets: Optional[Tensor] = None,
         targets_are_global: bool = False,
-        old_classes: Optional[Iterable[int]] = None,
-        new_classes: Optional[Iterable[int]] = None,
+        old_classes: Optional[Sequence[int]] = None,
+        new_classes: Optional[Sequence[int]] = None,
+        mode: str = "factor_geometry",
         return_energy: bool = False,
         return_parts: bool = False,
         return_diagnostics: bool = False,
-        **_: Any,
-    ):
-        z = self._validate_feature_tensor(features, "compute_logits_from_features.features")
-        bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-        seen = _ordered_unique_ints(seen_classes if seen_classes is not None else self._infer_seen_classes(bank_obj))
-        if not seen:
-            raise RuntimeError("seen_classes is empty. Build GeometryBank rows first.")
-        mode_norm = _normalize_classifier_mode(classifier_mode if classifier_mode is not None else mode)
-        if mode_norm != "geometry":
-            raise RuntimeError("compute_logits_from_features supports geometry-only scoring.")
-        self.assert_phase_ready(seen, mode="geometry", require_geometry=True)
-        out = self.classifier(
-            z,
-            seen_classes=seen,
-            geometry_bank=bank_obj,
-            mode="geometry_only",
+    ) -> Union[Tensor, Dict[str, Any]]:
+        return self.classifier(
+            features,
+            geometry_bank=self.geometry_bank,
+            class_ids=class_ids,
+            temporary_rows=temporary_rows,
             targets=targets,
-            targets_are_global=bool(targets_are_global),
+            targets_are_global=targets_are_global,
             old_classes=old_classes,
             new_classes=new_classes,
-            old_class_count=int(self.old_class_count),
+            mode=mode,
             return_energy=return_energy,
             return_parts=return_parts,
             return_diagnostics=return_diagnostics,
         )
-        logits = out["logits"] if isinstance(out, dict) else out
-        target_local = self.classifier.global_to_local_labels(targets, seen) if targets is not None and targets_are_global else targets
-        self.classifier.assert_logits_valid(
-            logits,
-            seen_classes=seen,
-            targets=target_local,
+
+    def forward(
+        self,
+        model_patch: Tensor,
+        raw_spectral_patch: Optional[Tensor] = None,
+        raw_center_spectrum: Optional[Tensor] = None,
+        *,
+        mode: str = GEOMETRY_MODE,
+        class_ids: Optional[Sequence[int]] = None,
+        temporary_rows: Optional[
+            Mapping[int, Mapping[str, Any]]
+        ] = None,
+        targets: Optional[Tensor] = None,
+        targets_are_global: bool = False,
+        old_classes: Optional[Sequence[int]] = None,
+        new_classes: Optional[Sequence[int]] = None,
+        classifier_mode: str = "factor_geometry",
+        deterministic: bool = True,
+        return_energy: bool = False,
+        return_parts: bool = False,
+        return_diagnostics: bool = False,
+    ) -> Union[Tensor, Dict[str, Any]]:
+        output = self.forward_features(
+            model_patch,
+            raw_spectral_patch,
+            raw_center_spectrum,
+            deterministic=deterministic,
+        )
+        selected = str(mode).strip().lower()
+
+        if selected == self.FEATURE_MODE:
+            return output
+
+        if selected == self.BASE_CE_MODE:
+            logits = self.base_ce_logits(
+                output["joint_feature"]
+            )
+            return {
+                **output,
+                "logits": logits,
+                "class_ids": torch.tensor(
+                    self.base_ce_class_ids,
+                    device=logits.device,
+                    dtype=torch.long,
+                ),
+            }
+
+        if selected != self.GEOMETRY_MODE:
+            raise ValueError(
+                "mode must be one of "
+                "features/base_ce/geometry"
+            )
+
+        ids = (
+            self.infer_seen_classes()
+            if class_ids is None
+            else _unique_ids(
+                class_ids,
+                name="class_ids",
+            )
+        )
+        if not ids:
+            raise RuntimeError(
+                "no class rows are available for geometry inference"
+            )
+
+        result = self.compute_logits_from_features(
+            output["joint_feature"],
+            class_ids=ids,
+            temporary_rows=temporary_rows,
+            targets=targets,
+            targets_are_global=targets_are_global,
             old_classes=old_classes,
             new_classes=new_classes,
-            context="NECILModel.compute_logits_from_features",
+            mode=classifier_mode,
+            return_energy=return_energy,
+            return_parts=return_parts,
+            return_diagnostics=return_diagnostics,
         )
-        self.current_num_classes = max(self.current_num_classes, max(seen) + 1)
-        self.seen_classes = list(seen)
-        return out
-
-    forward_classifier = compute_logits_from_features
-
-    def compute_energy_from_features(
-        self,
-        features: torch.Tensor,
-        seen_classes: Optional[Iterable[int]] = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        out = self.compute_logits_from_features(
-            features,
-            seen_classes=seen_classes,
-            return_energy=True,
-            **kwargs,
-        )
-        if not isinstance(out, dict) or not torch.is_tensor(out.get("energy", None)):
-            raise RuntimeError("Classifier did not return energy.")
-        return out["energy"]
-
-    # ------------------------------------------------------------------
-    # Replay-ready row construction and safe row refresh
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def refresh_geometry_for_classes(
-        self,
-        class_ids: Iterable[int],
-        features: torch.Tensor,
-        labels: torch.Tensor,
-        *,
-        spectral_summary: Optional[torch.Tensor] = None,
-        band_weights: Optional[torch.Tensor] = None,
-        spectral_summary_is_physical: bool = False,
-        phase_created: Optional[int] = None,
-        freeze_after: bool = False,
-    ) -> Dict[str, Any]:
-        z = self._validate_feature_tensor(features, "refresh_geometry_for_classes.features")
-        y = labels.to(z.device).long().flatten()
-        ids = _ordered_unique_ints(class_ids)
-        if not ids:
-            raise RuntimeError("refresh_geometry_for_classes received no classes.")
-        if y.numel() != z.size(0):
-            raise RuntimeError("labels/features batch mismatch in refresh_geometry_for_classes.")
-        bad = sorted(set(torch.unique(y).detach().cpu().tolist()).difference(ids))
-        if bad:
-            raise RuntimeError(f"labels contain classes outside refresh ids: {bad}")
-        spectral_dim = int(spectral_summary.size(1)) if torch.is_tensor(spectral_summary) and spectral_summary.dim() == 2 else 0
-        self.ensure_class_capacity(max(ids) + 1, spectral_dim=spectral_dim, dtype=z.dtype)
-        rows = self.geometry_bank.build_candidate_geometry_rows(
-            z,
-            y,
-            spectral_summary=spectral_summary,
-            band_weights=band_weights,
-            spectral_summary_is_physical=bool(spectral_summary_is_physical),
-            class_ids=ids,
-        )
-        result = self.geometry_bank.commit_candidate_geometry_rows(
-            rows,
-            allow_frozen_update=False,
-            phase_created=int(self.current_phase if phase_created is None else phase_created),
-            freeze=bool(freeze_after),
-            context="NECILModel.refresh_geometry_for_classes",
-        )
-        self.geometry_bank.assert_bank_valid(seen_classes=ids, strict=True)
-        self.current_num_classes = max(self.current_num_classes, max(ids) + 1)
+        if isinstance(result, Mapping):
+            return {**output, **dict(result)}
         return result
 
-    def _row_metadata_for_refresh(self, class_id: int) -> Dict[str, torch.Tensor]:
-        c = int(class_id)
-        if c < 0 or c >= len(self.geometry_bank):
-            return {}
-        if float(self.geometry_bank.sample_counts[c].detach().cpu().item()) <= 0:
-            return {}
-        row = self.geometry_bank.get_class_geometry(c)
-        mapping = {
-            "spectral_prototype": "spectral_prototype",
-            "band_importance": "band_importance",
-            "sample_count": "sample_count",
-            "active_rank": "active_rank",
-            "reliability": "reliability",
-            "feature_reliability": "feature_reliability",
-            "band_reliability": "band_reliability",
-            "spectral_reliability": "spectral_reliability",
-            "spectral_basis": "spectral_basis",
-            "spectral_eigvals": "spectral_eigvals",
-            "spectral_res_var": "spectral_res_var",
-            "spectral_active_rank": "spectral_active_rank",
-            "spectral_to_feature": "spectral_to_feature",
-            "coupling_residual_vars": "coupling_residual_vars",
-            "coupling_reliability": "coupling_reliability",
-            "spectral_sam_limit": "spectral_sam_limit",
-            "spectral_d1_limit": "spectral_d1_limit",
-            "spectral_d2_limit": "spectral_d2_limit",
-            "energy_quantiles": "energy_quantiles",
-            "margin_quantiles": "margin_quantiles",
-        }
-        return {dst: row[src] for dst, src in mapping.items() if src in row}
-
-    @torch.no_grad()
-    def refresh_class_subspace(
-        self,
-        cls: int,
-        mean: torch.Tensor,
-        basis: torch.Tensor,
-        eigvals: torch.Tensor,
-        res_var: Optional[torch.Tensor] = None,
-        resvar: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> None:
-        """Compatibility row refresh that never drops spectral coupling metadata."""
-        rv = res_var if res_var is not None else resvar
-        if rv is None:
-            raise ValueError("refresh_class_subspace requires res_var/resvar.")
-        c = int(cls)
-        self.ensure_class_capacity(c + 1)
-        preserved = self._row_metadata_for_refresh(c)
-        aliases = {
-            "spectral_proto": "spectral_prototype",
-            "spectral_curve_mean": "spectral_prototype",
-            "spectral_shape_reliability": "spectral_reliability",
-        }
-        for key, value in kwargs.items():
-            target = aliases.get(key, key)
-            if value is not None:
-                preserved[target] = value
-        self.geometry_bank.add_or_update_class_geometry(
-            c,
-            mean=mean,
-            basis=basis,
-            eigvals=eigvals,
-            res_var=rv,
-            phase_created=int(kwargs.get("phase_created", self.current_phase)),
-            freeze=bool(kwargs.get("freeze", False)),
-            allow_frozen_update=bool(kwargs.get("allow_frozen_update", False)),
-            **{k: v for k, v in preserved.items() if k not in {"phase_created", "freeze", "allow_frozen_update"}},
-        )
-
-    @torch.no_grad()
-    def sample_geometry_replay(
-        self,
-        class_ids: Iterable[int],
-        samples_per_class: int | Mapping[int, int] = 16,
-        **kwargs: Any,
-    ) -> Dict[str, torch.Tensor]:
-        return self.geometry_bank.sample_replay(
-            class_ids,
-            samples_per_class=samples_per_class,
-            **kwargs,
-        )
-
     # ------------------------------------------------------------------
-    # Memory snapshot and checkpoint compatibility
+    # Base warm-up and bank handoff
     # ------------------------------------------------------------------
-    @torch.no_grad()
-    def export_memory_snapshot(self) -> Dict[str, Any]:
-        snapshot = self.geometry_bank.export_snapshot()
-        snapshot.update({
-            "current_phase": int(self.current_phase),
-            "old_class_count": int(self.old_class_count),
-            "old_classes": list(self.old_classes),
-            "current_num_classes": int(self.current_num_classes),
-            "seen_classes": list(self.seen_classes),
-            "feature_contract": self.feature_contract(),
-        })
-        return snapshot
 
-    @torch.no_grad()
-    def load_memory_snapshot(self, snapshot: Dict[str, Any], strict: bool = True) -> None:
-        if not snapshot:
-            if strict:
-                raise ValueError("empty memory snapshot")
-            return
-        self._assert_snapshot_feature_contract(snapshot, strict=strict)
-        self.geometry_bank.load_snapshot(snapshot, strict=strict)
-        self.current_phase = int(snapshot.get("current_phase", self.current_phase))
-        self.old_class_count = int(snapshot.get("old_class_count", self.old_class_count))
-        self.old_classes = [int(c) for c in snapshot.get("old_classes", list(range(self.old_class_count)))]
-        self.current_num_classes = int(snapshot.get("current_num_classes", len(self.geometry_bank)))
-        self.seen_classes = [int(c) for c in snapshot.get("seen_classes", self._infer_seen_classes())]
-
-    def feature_contract(self) -> Dict[str, Any]:
-        return {
-            "d_model": int(self.d_model),
-            "subspace_rank": int(self.subspace_rank),
-            "spectral_rank": int(self.geometry_bank.spectral_rank),
-            "normalize_geometry_features": bool(self.normalize_geometry_features),
-            "geometry_feature_scale": float(self.geometry_feature_scale),
-            "spectral_summary_mode": str(self.spectral_summary_mode),
-            "classifier_contract": "logits[B,len(seen_classes)]",
-            "incremental_update_mode": str(self.incremental_update_mode),
-            "geometry_feature_space": "canonical",
-            "spectral_coupled_replay": True,
-            "feature_adapter_available": False,
-            "energy_contract": {
-                "residual_variance_scale": 1.0,
-                "normalize_energy_by_dim": True,
-                "use_logdet_energy": False,
-                "logdet_energy_weight": 0.0,
-                "center_logdet_energy": False,
-                "use_reliability_penalty": False,
-                "reliability_energy_weight": 0.0,
-            },
-        }
-
-    def _assert_snapshot_feature_contract(self, snapshot: Dict[str, Any], *, strict: bool) -> None:
-        if not strict:
-            return
-        old = snapshot.get("feature_contract", snapshot.get("geometry_feature_contract", None))
-        if not isinstance(old, dict):
-            return
-        cur = self.feature_contract()
-        mismatches = []
-        for key in ("d_model", "subspace_rank", "normalize_geometry_features", "spectral_summary_mode"):
-            if key in old and old[key] != cur[key]:
-                mismatches.append(f"{key}: snapshot={old[key]!r}, current={cur[key]!r}")
-        if "geometry_feature_scale" in old and abs(float(old["geometry_feature_scale"]) - float(cur["geometry_feature_scale"])) > 1e-6:
-            mismatches.append(
-                f"geometry_feature_scale: snapshot={old['geometry_feature_scale']!r}, current={cur['geometry_feature_scale']!r}"
+    def ensure_base_ce_head(
+        self,
+        base_class_ids: Sequence[int],
+    ) -> nn.Linear:
+        ids = _unique_ids(
+            base_class_ids,
+            name="base_class_ids",
+        )
+        if len(ids) < 2:
+            raise ValueError(
+                "base phase requires at least two classes"
             )
-        if mismatches:
-            raise RuntimeError("Memory snapshot was built under a different feature contract: " + "; ".join(mismatches))
 
-    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):  # type: ignore[override]
-        """Load old checkpoints while discarding removed adapter parameters only."""
-        cleaned = {
-            k: v for k, v in state_dict.items()
-            if "geometry_plastic_adapter" not in k and "incremental_adapter" not in k
-        }
-        try:
-            return super().load_state_dict(cleaned, strict=strict, assign=assign)
-        except TypeError:  # older PyTorch
-            return super().load_state_dict(cleaned, strict=strict)
-
-    # ------------------------------------------------------------------
-    # Phase modes and freezing
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _set_requires_grad(module: Optional[nn.Module], value: bool) -> None:
-        if module is not None:
-            for parameter in module.parameters():
-                parameter.requires_grad = bool(value)
-
-    def freeze_backbone_except_allowed(
-        self,
-        *,
-        allow_last_blocks: bool = False,
-        allow_projection: bool = False,
-        allow_norm: Optional[bool] = None,
-        **_: Any,
-    ) -> None:
-        self._set_requires_grad(self.backbone, False)
-        if bool(allow_last_blocks) and hasattr(self.backbone, "get_last_blocks"):
-            for block in self.backbone.get_last_blocks():
-                self._set_requires_grad(block, True)
-        self._set_requires_grad(self.projection, bool(allow_projection))
-        self._set_requires_grad(self.norm, bool(allow_projection if allow_norm is None else allow_norm))
-
-    def freeze_backbone_only(self) -> None:
-        self._set_requires_grad(self.backbone, False)
-
-    def unfreeze_backbone(self) -> None:
-        self._set_requires_grad(self.backbone, True)
-
-    def freeze_projection_head(self) -> None:
-        self._set_requires_grad(self.projection, False)
-        self._set_requires_grad(self.norm, False)
-
-    def unfreeze_projection_head(self) -> None:
-        self._set_requires_grad(self.projection, True)
-        self._set_requires_grad(self.norm, True)
-
-    def freeze_semantic_encoder(self) -> None:
-        self._set_requires_grad(self.semantic_encoder, False)
-        self._set_requires_grad(self.concept_encoder, False)
-
-    def freeze_classifier(self) -> None:
-        self._set_requires_grad(self.classifier, False)
-
-    def unfreeze_classifier(self) -> None:
-        raise RuntimeError("The geometry classifier is parameter-free/frozen in the main architecture.")
-
-    def freeze_classes(self, class_ids_or_count: Iterable[int] | int) -> None:
-        if isinstance(class_ids_or_count, int):
-            self.geometry_bank.freeze_classes_up_to(int(max(0, class_ids_or_count)))
-        else:
-            self.geometry_bank.freeze_classes(_ordered_unique_ints(class_ids_or_count))
-
-    def freeze_old_geometry_states(self, old_class_count: Optional[Any] = None) -> None:
-        if old_class_count is None:
-            ids = list(self.old_classes) if self.old_classes else list(range(self.old_class_count))
-        elif isinstance(old_class_count, int):
-            ids = list(range(int(max(0, old_class_count))))
-        else:
-            ids = _ordered_unique_ints(old_class_count)
-        self.old_classes = list(ids)
-        self.old_class_count = len(ids)
-        self.freeze_classes(ids)
-
-    def freeze_base_ce_head(self) -> None:
-        self._set_requires_grad(self.base_ce_head, False)
-
-    def unfreeze_base_ce_head(self) -> None:
-        self._set_requires_grad(self.base_ce_head, True)
-
-    def set_base_mode(self, *, train_backbone: bool = True, train_projection: bool = True) -> None:
-        self.current_phase = 0
-        self.old_class_count = 0
-        self.old_classes = []
-        self.base_mode_active = True
-        self.incremental_mode_active = False
-        super().train(True)
-        self._set_requires_grad(self.backbone, bool(train_backbone))
-        self._set_requires_grad(self.projection, bool(train_projection))
-        self._set_requires_grad(self.norm, bool(train_projection))
-        self.freeze_classifier()
-        self.freeze_semantic_encoder()
-        if self.base_ce_head is not None:
-            self.unfreeze_base_ce_head()
-
-    def set_incremental_mode(
-        self,
-        *,
-        phase: Optional[int] = None,
-        old_class_count: Optional[int] = None,
-        old_classes: Optional[Iterable[int]] = None,
-        train_classifier_calibration: bool = False,
-        train_geometry_adapter: Optional[bool] = None,
-        **_: Any,
-    ) -> None:
-        if bool(train_classifier_calibration) or bool(train_geometry_adapter):
-            raise RuntimeError("Classifier calibration and feature adapters are forbidden in SCTGR-RGA.")
-        if phase is not None:
-            self.current_phase = int(phase)
-        if old_classes is not None:
-            ids = _ordered_unique_ints(old_classes)
-        else:
-            count = int(self.old_class_count if old_class_count is None else old_class_count)
-            ids = list(range(max(count, 0)))
-        self.old_classes = ids
-        self.old_class_count = len(ids)
-        self.base_mode_active = False
-        self.incremental_mode_active = True
-        self.freeze_backbone_except_allowed(allow_last_blocks=False, allow_projection=False)
-        self.freeze_classifier()
-        self.freeze_semantic_encoder()
-        self.freeze_base_ce_head()
-        self.freeze_old_geometry_states(ids)
-        self.backbone.eval()
-        self.projection.eval()
-        self.norm.eval()
-        self._incremental_frozen_modules = ["backbone", "projection", "norm", "classifier"]
-
-    def assert_frozen_modules(self) -> None:
-        bad_req: List[str] = []
-        bad_grad: List[str] = []
-        for prefix, module in {
-            "backbone": self.backbone,
-            "projection": self.projection,
-            "norm": self.norm,
-            "classifier": self.classifier,
-        }.items():
-            for name, parameter in module.named_parameters():
-                if parameter.requires_grad:
-                    bad_req.append(f"{prefix}.{name}")
-                if parameter.grad is not None and float(parameter.grad.detach().abs().sum().cpu().item()) != 0:
-                    bad_grad.append(f"{prefix}.{name}")
-        if bad_req:
-            raise RuntimeError(f"Frozen modules still have trainable parameters: {bad_req[:20]}")
-        if bad_grad:
-            raise RuntimeError(f"Frozen modules have nonzero gradients: {bad_grad[:20]}")
-
-    # Compatibility methods for removed branches.
-    def freeze_incremental_adapter(self) -> None: return
-    def freeze_geometry_plastic_adapter(self) -> None: return
-    def disable_incremental_adapter(self) -> None:
-        self.use_incremental_adapter = False
-        self.use_geometry_gated_adapter = False
-    def enable_incremental_adapter(self) -> None:
-        raise RuntimeError("Feature adapters are removed from the main architecture.")
-    def unfreeze_incremental_adapter(self) -> None:
-        raise RuntimeError("Feature adapters are removed from the main architecture.")
-    def unfreeze_geometry_plastic_adapter(self) -> None:
-        raise RuntimeError("Feature adapters are removed from the main architecture.")
-    def freeze_geometry_calibrator(self) -> None: self.use_geometry_calibrator = False
-    def unfreeze_geometry_calibrator(self) -> None: raise RuntimeError("Geometry calibration is disabled.")
-    def freeze_energy_calibrator(self) -> None:
-        if hasattr(self.classifier, "freeze_all_adaptation"):
-            self.classifier.freeze_all_adaptation()
-    def unfreeze_energy_calibrator(self) -> None: raise RuntimeError("Energy calibration is disabled.")
-    def adaptive_boundary_parameters(self) -> List[nn.Parameter]: return []
-    def ensure_adaptive_boundary_capacity(self, class_count: int) -> None: del class_count
-    def adaptive_boundary_state(self, old_class_count: int = 0) -> Dict[str, float]:
-        return {"old_class_count": float(old_class_count), "adaptive_boundary_available": 0.0}
-
-    def train(self, mode: bool = True):  # type: ignore[override]
-        super().train(mode)
-        if self.incremental_mode_active:
-            self.backbone.eval()
-            self.projection.eval()
-            self.norm.eval()
-            self.classifier.eval()
-        return self
-
-    # ------------------------------------------------------------------
-    # Base CE head
-    # ------------------------------------------------------------------
-    def ensure_base_ce_head(self, num_base_classes: int, feature_dim: Optional[int] = None) -> nn.Linear:
-        n = int(num_base_classes)
-        d = int(feature_dim or self.d_model)
-        if d != self.d_model:
-            raise RuntimeError(f"base CE feature_dim must equal d_model={self.d_model}, got {d}")
-        if self.base_ce_head is None or self.base_ce_num_classes != n:
-            self.base_ce_head = nn.Linear(self.d_model, n).to(self.device)
-            nn.init.normal_(self.base_ce_head.weight, mean=0.0, std=0.01)
+        if (
+            self.base_ce_head is None
+            or self.base_ce_head.out_features != len(ids)
+        ):
+            self.base_ce_head = nn.Linear(
+                self.feature_dim,
+                len(ids),
+            ).to(self.device)
+            nn.init.normal_(
+                self.base_ce_head.weight,
+                mean=0.0,
+                std=0.01,
+            )
             nn.init.zeros_(self.base_ce_head.bias)
-            self.base_ce_num_classes = n
+        self.base_ce_class_ids = list(ids)
         return self.base_ce_head
 
-    def base_ce_logits(self, features: torch.Tensor, num_base_classes: Optional[int] = None) -> torch.Tensor:
-        z = self._validate_feature_tensor(features, "base_ce_logits.features")
+    def base_ce_logits(self, features: Tensor) -> Tensor:
         if self.base_ce_head is None:
-            if num_base_classes is None:
-                raise RuntimeError("base_ce_head is not initialized.")
-            self.ensure_base_ce_head(int(num_base_classes))
-        return self.base_ce_head(z)
-
-    def forward_base_ce(self, x: torch.Tensor, num_base_classes: int, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        out = self.forward_features(
-            x,
-            spectral_summary=kwargs.get("spectral_summary"),
-            band_weights=kwargs.get("band_weights"),
-            spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical"),
+            raise RuntimeError(
+                "base CE head is not initialized"
+            )
+        value = _feature_matrix(
+            features,
+            expected_dim=self.feature_dim,
+            name="base CE features",
         )
-        logits = self.base_ce_logits(out["features"], num_base_classes)
-        result = dict(out)
-        result["base_logits"] = logits
-        result["logits"] = logits
-        return result
+        return self.base_ce_head(value)
 
     def drop_base_ce_head(self) -> None:
         self.base_ce_head = None
-        self.base_ce_num_classes = 0
+        self.base_ce_class_ids = []
 
-    ensure_base_prl_head = ensure_base_ce_head
-    base_prl_logits = base_ce_logits
-    drop_base_prl_head = drop_base_ce_head
-    freeze_base_prl_head = freeze_base_ce_head
-    unfreeze_base_prl_head = unfreeze_base_ce_head
-
-    # ------------------------------------------------------------------
-    # Contracts
-    # ------------------------------------------------------------------
     @torch.no_grad()
-    def assert_base_handoff_ready(
+    def fit_global_priors(
         self,
-        base_class_ids: Iterable[int],
+        features: Tensor,
+        raw_center_spectra: Tensor,
         *,
         freeze: bool = True,
-        strict: bool = True,
-    ) -> Dict[str, Any]:
-        ids = _ordered_unique_ints(base_class_ids)
-        result = self.geometry_bank.assert_phase0_base_handoff_ready(
-            ids,
-            freeze=bool(freeze),
-            strict=bool(strict),
+        overwrite: bool = False,
+    ) -> Dict[str, float]:
+        if (
+            self.current_phase != 0
+            or self.phase_mode != "base"
+        ):
+            raise RuntimeError(
+                "global priors can only be fitted in base phase"
+            )
+        return self.geometry_bank.fit_global_priors(
+            features,
+            raw_center_spectra,
+            freeze=freeze,
+            overwrite=overwrite,
         )
-        self.old_classes = list(ids)
-        self.old_class_count = len(ids)
-        self.current_num_classes = max(self.current_num_classes, max(ids) + 1 if ids else 0)
-        self.seen_classes = list(ids)
+
+    @torch.no_grad()
+    def build_geometry_rows(
+        self,
+        *,
+        class_ids: Sequence[int],
+        features: Tensor,
+        raw_center_spectra: Tensor,
+        labels: Tensor,
+        sample_weights: Optional[Tensor] = None,
+    ) -> Dict[int, Row]:
+        ids = _unique_ids(
+            class_ids,
+            name="class_ids",
+        )
+        rows = self.geometry_bank.extract_rows(
+            features,
+            labels,
+            raw_spectra=raw_center_spectra,
+            sample_weights=sample_weights,
+            class_ids=ids,
+        )
+        if set(rows) != set(ids):
+            raise RuntimeError(
+                "GeometryBank returned an incomplete row set"
+            )
+        return rows
+
+    @torch.no_grad()
+    def build_geometry_rows_from_output(
+        self,
+        output: Mapping[str, Any],
+        labels: Tensor,
+        class_ids: Sequence[int],
+        *,
+        sample_weights: Optional[Tensor] = None,
+    ) -> Dict[int, Row]:
+        checked = self._validate_output(output)
+        return self.build_geometry_rows(
+            class_ids=class_ids,
+            features=checked["joint_feature"],
+            raw_center_spectra=checked[
+                "raw_center_spectrum"
+            ],
+            labels=labels,
+            sample_weights=sample_weights,
+        )
+
+    @torch.no_grad()
+    def finalize_base_geometry(
+        self,
+        *,
+        base_class_ids: Sequence[int],
+        features: Tensor,
+        raw_center_spectra: Tensor,
+        labels: Tensor,
+        sample_weights: Optional[Tensor] = None,
+        update_statistics: bool = True,
+        fit_overlap_temperatures: bool = True,
+        drop_ce_head: bool = True,
+        calibrated_temperature: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if (
+            self.current_phase != 0
+            or self.phase_mode != "base"
+        ):
+            raise RuntimeError(
+                "finalize_base_geometry is base-phase only"
+            )
+        ids = _unique_ids(
+            base_class_ids,
+            name="base_class_ids",
+        )
+        self.geometry_bank.assert_global_priors_ready()
+        if not bool(
+            self.geometry_bank.global_priors_frozen.item()
+        ):
+            raise RuntimeError(
+                "base-fitted global priors must be frozen"
+            )
+        if bool(
+            self.geometry_bank.valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "base geometry can only be committed once"
+            )
+
+        bank_snapshot = (
+            self.geometry_bank.export_snapshot()
+        )
+        classifier_state = copy.deepcopy(
+            self.classifier.state_dict()
+        )
+        previous_state = (
+            list(self.seen_classes),
+            list(self.old_classes),
+            list(self.new_classes),
+            str(self.phase_mode),
+            copy.deepcopy(self.base_handoff),
+        )
+
+        try:
+            rows = self.build_geometry_rows(
+                class_ids=ids,
+                features=features,
+                raw_center_spectra=
+                    raw_center_spectra,
+                labels=labels,
+                sample_weights=sample_weights,
+            )
+            commit = (
+                self.geometry_bank.commit_base_rows(
+                    rows,
+                    base_class_ids=ids,
+                    phase=0,
+                )
+            )
+
+            overlap_report = None
+            if fit_overlap_temperatures:
+                overlap_report = (
+                    self.geometry_bank
+                    .fit_overlap_temperatures(
+                        ids,
+                        freeze=True,
+                    )
+                )
+
+            statistics = None
+            if update_statistics:
+                statistics = (
+                    self.geometry_bank.update_statistics(
+                        features,
+                        labels,
+                        ids,
+                    )
+                )
+
+            admission = (
+                self.geometry_bank.admission_report(
+                    ids,
+                    maximum_reconstruction_error=float(
+                        getattr(
+                            self.args,
+                            "maximum_geometry_reconstruction_error",
+                            0.75,
+                        )
+                    ),
+                    minimum_effective_dimension=float(
+                        getattr(
+                            self.args,
+                            "minimum_geometry_effective_dimension",
+                            1.25,
+                        )
+                    ),
+                    require_statistics=update_statistics,
+                )
+            )
+            if not admission["ok"]:
+                raise RuntimeError(
+                    "base geometry admission failed: "
+                    + "; ".join(admission["errors"])
+                )
+
+            if calibrated_temperature is not None:
+                self.classifier.set_temperature(
+                    calibrated_temperature
+                )
+
+            contract_digest = (
+                self.classifier
+                .bind_geometry_bank_contract(
+                    self.geometry_bank,
+                    require_committed_rows=True,
+                    enforce_after_binding=True,
+                )
+            )
+
+            self.seen_classes = list(ids)
+            self.old_classes = list(ids)
+            self.new_classes = []
+            self.phase_mode = "evaluation"
+            self.backbone.freeze_all()
+            if drop_ce_head:
+                self.drop_base_ce_head()
+
+            self.base_handoff = {
+                "commit": commit,
+                "overlap_temperatures":
+                    overlap_report,
+                "statistics": statistics,
+                "admission": admission,
+                "bank_contract_digest":
+                    contract_digest,
+                "classification_factorization":
+                    "p(z|c)",
+                "spectral_relation_factorization":
+                    "p(h|c)",
+                "atomic": True,
+            }
+            return copy.deepcopy(
+                self.base_handoff
+            )
+        except Exception:
+            self.geometry_bank.load_snapshot(
+                bank_snapshot,
+                strict=True,
+            )
+            self.classifier.load_state_dict(
+                classifier_state
+            )
+            (
+                self.seen_classes,
+                self.old_classes,
+                self.new_classes,
+                self.phase_mode,
+                self.base_handoff,
+            ) = previous_state
+            raise
+
+    # ------------------------------------------------------------------
+    # Incremental phase lifecycle
+    # ------------------------------------------------------------------
+
+    def set_base_mode(self) -> None:
+        if bool(
+            self.geometry_bank.valid_mask().any().item()
+        ):
+            raise RuntimeError(
+                "committed rows exist; reset the bank before "
+                "restarting base training"
+            )
+        self.current_phase = 0
+        self.phase_mode = "base"
+        self.seen_classes = []
+        self.old_classes = []
+        self.new_classes = []
+        self.phase_old_digest = None
+        self.base_handoff = None
+        self.backbone.enable_base_training()
+        self.classifier.require_bound_contract = False
+
+    def _static_bank_digest(self) -> str:
+        return self.classifier.bank_contract_digest(
+            self.geometry_bank
+        )
+
+    def begin_incremental_phase(
+        self,
+        *,
+        phase: int,
+        old_class_ids: Sequence[int],
+        new_class_ids: Sequence[int],
+        controlled_plasticity: bool = True,
+    ) -> IncrementalPhaseContext:
+        phase = int(phase)
+        if phase <= 0:
+            raise ValueError(
+                "incremental phase must be >= 1"
+            )
+        old_ids = _unique_ids(
+            old_class_ids,
+            name="old_class_ids",
+        )
+        new_ids = _unique_ids(
+            new_class_ids,
+            name="new_class_ids",
+        )
+        if set(old_ids) & set(new_ids):
+            raise RuntimeError(
+                "old and new class IDs overlap"
+            )
+        committed = self.infer_seen_classes()
+        if set(committed) != set(old_ids):
+            raise RuntimeError(
+                f"old classes {sorted(old_ids)} do not match "
+                f"committed rows {sorted(committed)}"
+            )
+        self.geometry_bank.assert_valid(
+            old_ids,
+            strict=True,
+        )
+        self.geometry_bank.assert_global_priors_ready()
+
+        current_contract = self._static_bank_digest()
+        if (
+            self.classifier.bound_bank_contract_digest
+            != current_contract
+        ):
+            raise RuntimeError(
+                "finalize and bind base geometry before "
+                "starting an incremental phase"
+            )
+
+        # Capture the accepted phase-start coordinates before changing
+        # trainability or optimizer state.
+        observer = self.backbone.make_phase_observer()
+
+        self.current_phase = phase
+        self.phase_mode = "incremental"
+        self.old_classes = list(old_ids)
+        self.new_classes = list(new_ids)
+        self.seen_classes = [
+            *old_ids,
+            *new_ids,
+        ]
+        self.phase_old_digest = (
+            self.geometry_bank.rows_digest(old_ids)
+        )
+
+        if controlled_plasticity:
+            self.backbone.enable_incremental_plasticity()
+            parameter_snapshot = {
+                name: parameter.detach().clone()
+                for name, parameter
+                in self.backbone.named_parameters()
+                if parameter.requires_grad
+            }
+        else:
+            self.backbone.freeze_for_incremental()
+            parameter_snapshot = {}
+
+        self.backbone.assert_incremental_policy()
+        return IncrementalPhaseContext(
+            phase=phase,
+            old_class_ids=list(old_ids),
+            new_class_ids=list(new_ids),
+            old_rows_digest=str(
+                self.phase_old_digest
+            ),
+            bank_contract_digest=current_contract,
+            observer=observer,
+            parameter_snapshot=
+                parameter_snapshot,
+            controlled_plasticity=bool(
+                controlled_plasticity
+            ),
+        )
+
+    def restore_incremental_context(
+        self,
+        state: Mapping[str, Any],
+    ) -> IncrementalPhaseContext:
+        if self.phase_mode != "incremental":
+            raise RuntimeError(
+                "model must be in incremental mode before "
+                "restoring phase context"
+            )
+        observer = copy.deepcopy(
+            self.backbone
+        ).to(self.device)
+        observer.load_state_dict(
+            state["observer_state_dict"],
+            strict=True,
+        )
+        observer.freeze_all()
+        observer.eval()
+
+        snapshot = {
+            str(name): torch.as_tensor(
+                value,
+                device=self.device,
+            ).detach().clone()
+            for name, value in dict(
+                state.get(
+                    "parameter_snapshot",
+                    {},
+                )
+            ).items()
+        }
+        context = IncrementalPhaseContext(
+            phase=int(state["phase"]),
+            old_class_ids=[
+                int(value)
+                for value in state["old_class_ids"]
+            ],
+            new_class_ids=[
+                int(value)
+                for value in state["new_class_ids"]
+            ],
+            old_rows_digest=str(
+                state["old_rows_digest"]
+            ),
+            bank_contract_digest=str(
+                state["bank_contract_digest"]
+            ),
+            observer=observer,
+            parameter_snapshot=snapshot,
+            controlled_plasticity=bool(
+                state["controlled_plasticity"]
+            ),
+        )
+        self._validate_phase_context(context)
+        return context
+
+    def _validate_phase_context(
+        self,
+        context: IncrementalPhaseContext,
+    ) -> None:
+        if not isinstance(
+            context,
+            IncrementalPhaseContext,
+        ):
+            raise TypeError(
+                "context must be IncrementalPhaseContext"
+            )
+        if self.phase_mode != "incremental":
+            raise RuntimeError(
+                "no incremental phase is active"
+            )
+        if context.phase != self.current_phase:
+            raise RuntimeError(
+                "context phase does not match active phase"
+            )
+        if context.old_class_ids != self.old_classes:
+            raise RuntimeError(
+                "context old classes do not match active phase"
+            )
+        if context.new_class_ids != self.new_classes:
+            raise RuntimeError(
+                "context new classes do not match active phase"
+            )
+        if context.old_rows_digest != self.phase_old_digest:
+            raise RuntimeError(
+                "context old-row digest mismatch"
+            )
+        if (
+            context.bank_contract_digest
+            != self._static_bank_digest()
+        ):
+            raise RuntimeError(
+                "context GeometryBank contract mismatch"
+            )
+
+    def incremental_trainable_parameters(
+        self,
+    ) -> List[nn.Parameter]:
+        if self.phase_mode != "incremental":
+            raise RuntimeError(
+                "incremental parameters require active phase"
+            )
+        return (
+            self.backbone
+            .incremental_trainable_parameters()
+        )
+
+    def incremental_trainable_parameter_names(
+        self,
+    ) -> List[str]:
+        return (
+            self.backbone
+            .incremental_trainable_parameter_names()
+        )
+
+    @torch.no_grad()
+    def fit_phase_transform(
+        self,
+        context: IncrementalPhaseContext,
+        *,
+        support_previous_features: Tensor,
+        support_current_features: Tensor,
+        validation_previous_features: Tensor,
+        validation_current_features: Tensor,
+        support_weights: Optional[Tensor] = None,
+        validation_weights: Optional[Tensor] = None,
+    ) -> Tuple[
+        BranchSimilarityTransform,
+        Dict[str, Any],
+    ]:
+        self._validate_phase_context(context)
+        return self.transport_estimator.fit(
+            support_previous_features,
+            support_current_features,
+            validation_previous_features,
+            validation_current_features,
+            support_weights=support_weights,
+            validation_weights=validation_weights,
+        )
+
+    @torch.no_grad()
+    def build_transported_old_rows(
+        self,
+        *,
+        transform: BranchSimilarityTransform,
+    ) -> Tuple[Dict[int, Row], Dict[str, Any]]:
+        if self.phase_mode != "incremental":
+            raise RuntimeError(
+                "transported rows require active incremental phase"
+            )
+        return self.geometry_bank.build_transported_rows(
+            self.old_classes,
+            transform=transform,
+        )
+
+    @torch.no_grad()
+    def build_phase_rows(
+        self,
+        *,
+        transform: BranchSimilarityTransform,
+        new_support_features: Tensor,
+        new_support_raw_spectra: Tensor,
+        new_support_labels: Tensor,
+        new_support_weights: Optional[Tensor] = None,
+    ) -> Tuple[Dict[int, Row], Dict[str, Any]]:
+        transported, report = (
+            self.build_transported_old_rows(
+                transform=transform,
+            )
+        )
+        new_rows = self.build_geometry_rows(
+            class_ids=self.new_classes,
+            features=new_support_features,
+            raw_center_spectra=
+                new_support_raw_spectra,
+            labels=new_support_labels,
+            sample_weights=new_support_weights,
+        )
+        overlap = set(transported) & set(new_rows)
+        if overlap:
+            raise RuntimeError(
+                "old/new temporary row overlap: "
+                f"{sorted(overlap)}"
+            )
+        return {
+            **transported,
+            **new_rows,
+        }, report
+
+    @torch.no_grad()
+    def phase_pair_risk(
+        self,
+        temporary_rows: Mapping[
+            int,
+            Mapping[str, Any],
+        ],
+    ) -> Tensor:
+        if self.phase_mode != "incremental":
+            raise RuntimeError(
+                "phase pair risk requires active incremental phase"
+            )
+        expected = set(self.seen_classes)
+        if set(int(key) for key in temporary_rows) != expected:
+            raise RuntimeError(
+                "temporary rows do not cover all seen classes"
+            )
+        return self.geometry_bank.pair_risk_matrix(
+            self.seen_classes,
+            rows=temporary_rows,
+        )
+
+    @torch.no_grad()
+    def commit_incremental_phase(
+        self,
+        *,
+        transform: BranchSimilarityTransform,
+        new_rows: Mapping[int, Mapping[str, Any]],
+        phase: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if self.phase_mode != "incremental":
+            raise RuntimeError("no active incremental phase")
+        phase_value = self.current_phase if phase is None else int(phase)
+        if phase_value != self.current_phase:
+            raise RuntimeError("phase value does not match active phase")
+        if set(int(key) for key in new_rows) != set(self.new_classes):
+            raise RuntimeError("new row IDs do not match active new classes")
+
+        contract_before = self._static_bank_digest()
+        old_ids = list(self.old_classes)
+        old_index = torch.tensor(
+            old_ids, device=self.geometry_bank.device, dtype=torch.long
+        )
+        old_energy_quantiles = (
+            self.geometry_bank.energy_quantiles.index_select(0, old_index).clone()
+        )
+        old_margin_quantiles = (
+            self.geometry_bank.margin_quantiles.index_select(0, old_index).clone()
+        )
+        old_statistics_ready = (
+            self.geometry_bank.statistics_ready.index_select(0, old_index).clone()
+        )
+
+        transported, transport_report = self.build_transported_old_rows(
+            transform=transform
+        )
+        result = self.geometry_bank.commit_incremental_phase(
+            transported_old_rows=transported,
+            new_rows=new_rows,
+            old_class_ids=old_ids,
+            new_class_ids=self.new_classes,
+            phase=phase_value,
+            expected_old_digest=self.phase_old_digest,
+        )
+
+        # Exact similarity pushforward preserves every Mahalanobis quadratic
+        # term and every inter-class energy margin.  Only the log-volume term
+        # receives one class-independent additive shift.  Preserve old
+        # diagnostics analytically instead of requiring forbidden old samples.
+        logdet_shift = 2.0 * (
+            self.spectral_dim * math.log(float(transform.spectral_scale))
+            + self.spatial_dim * math.log(float(transform.spatial_scale))
+        )
+        energy_shift = (
+            float(self.geometry_bank.volume_weight)
+            * logdet_shift
+            / float(self.feature_dim)
+        )
+        self.geometry_bank.energy_quantiles.index_copy_(
+            0, old_index, old_energy_quantiles + energy_shift
+        )
+        self.geometry_bank.margin_quantiles.index_copy_(
+            0, old_index, old_margin_quantiles
+        )
+        self.geometry_bank.statistics_ready.index_copy_(
+            0, old_index, old_statistics_ready
+        )
+
+        contract_after = self._static_bank_digest()
+        if contract_after != contract_before:
+            raise RuntimeError("row commit changed the static bank contract")
+        if self.classifier.bound_bank_contract_digest != contract_after:
+            raise RuntimeError("classifier/bank contract diverged after commit")
+
+        self.seen_classes = [*old_ids, *self.new_classes]
+        self.old_classes = list(self.seen_classes)
+        self.new_classes = []
+        self.phase_old_digest = None
+        self.phase_mode = "evaluation"
+        self.backbone.freeze_all()
+
+        result["transport_report"] = transport_report
+        result["old_statistics_preserved_analytically"] = True
+        result["old_energy_quantile_shift"] = float(energy_shift)
+        result["classification_factorization"] = "p(z|c)"
+        result["spectral_relation_factorization"] = "p(h|c)"
+        result["transport_absorbed"] = True
+        result["temporary_phase_context_must_be_deleted"] = True
         return result
 
-    def assert_phase_ready(
+    def abort_incremental_phase(self) -> None:
+        """Discard phase metadata; trainer restores accepted checkpoint."""
+        self.phase_old_digest = None
+        self.new_classes = []
+        self.seen_classes = (
+            self.infer_seen_classes()
+        )
+        self.old_classes = list(
+            self.seen_classes
+        )
+        self.phase_mode = "evaluation"
+        self.backbone.freeze_all()
+
+    # ------------------------------------------------------------------
+    # Diagnostics and memory
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update_geometry_statistics(
         self,
-        seen_classes: Iterable[int],
         *,
-        mode: str = "geometry",
-        require_geometry: bool = True,
-    ) -> None:
-        seen = _ordered_unique_ints(seen_classes)
-        if not seen:
-            raise RuntimeError("seen_classes is empty.")
-        if self.geometry_bank.d_model != self.d_model:
-            raise RuntimeError("GeometryBank/model feature dimensions differ.")
-        if _normalize_classifier_mode(mode) == "geometry" and require_geometry:
-            self.geometry_bank.assert_bank_valid(seen_classes=seen, strict=True)
-        if self.incremental_mode_active:
-            bad_train = [name for name in ("backbone", "projection", "norm") if getattr(self, name).training]
-            if bad_train:
-                raise RuntimeError(f"Frozen incremental modules must be eval(): {bad_train}")
-        self.classifier.expand_to_seen_classes(seen)
+        features: Tensor,
+        labels: Tensor,
+        class_ids: Sequence[int],
+        rows: Optional[
+            Mapping[int, Mapping[str, Any]]
+        ] = None,
+    ) -> Dict[str, float]:
+        return self.geometry_bank.update_statistics(
+            features,
+            labels,
+            class_ids,
+            rows=rows,
+        )
 
-    def assert_no_missing_class_geometry(self, seen_classes: Iterable[int]) -> None:
-        self.geometry_bank.assert_bank_valid(seen_classes=seen_classes, strict=True)
+    @torch.no_grad()
+    def geometry_admission_report(
+        self,
+        class_ids: Optional[Sequence[int]] = None,
+        *,
+        maximum_reconstruction_error: float = 0.75,
+        minimum_effective_dimension: float = 1.25,
+        require_statistics: bool = True,
+    ) -> Dict[str, Any]:
+        ids = (
+            self.infer_seen_classes()
+            if class_ids is None
+            else _unique_ids(
+                class_ids,
+                name="class_ids",
+            )
+        )
+        return self.geometry_bank.admission_report(
+            ids,
+            maximum_reconstruction_error=
+                maximum_reconstruction_error,
+            minimum_effective_dimension=
+                minimum_effective_dimension,
+            require_statistics=require_statistics,
+        )
 
-    def assert_method_identity(self) -> None:
-        if self.incremental_update_mode != "spectral_coupled_geometry_replay":
-            raise RuntimeError(f"Unexpected incremental_update_mode={self.incremental_update_mode!r}")
-        forbidden = {
-            "use_geometry_gated_adapter": self.use_geometry_gated_adapter,
-            "use_incremental_adapter": self.use_incremental_adapter,
-            "use_geometry_transport": self.use_geometry_transport,
-            "use_sglat_transport": self.use_sglat_transport,
-            "use_geometry_calibrator": self.use_geometry_calibrator,
-            "use_energy_calibrator": self.use_energy_calibrator,
-            "use_adaptive_boundary": self.use_adaptive_boundary,
+    @torch.no_grad()
+    def memory_snapshot(self) -> Dict[str, Any]:
+        ids = self.infer_seen_classes()
+        return {
+            "bank":
+                self.geometry_bank.export_snapshot(),
+            "bank_contract_digest":
+                self._static_bank_digest(),
+            "rows_digest": (
+                self.geometry_bank.rows_digest(ids)
+                if ids else None
+            ),
+            "phase": int(self.current_phase),
+            "phase_mode": str(self.phase_mode),
+            "seen_classes":
+                list(self.seen_classes),
+            "classification_factorization":
+                "p(z|c)",
+            "spectral_relation_factorization":
+                "p(h|c)",
+            "stores_sample_level_memory": False,
+            "stores_phase_observer": False,
         }
-        active = [name for name, value in forbidden.items() if bool(value)]
-        if active:
-            raise RuntimeError(f"Forbidden architecture branches are active: {active}")
-        if self.geometry_plastic_adapter is not None:
-            raise RuntimeError("Feature adapter module must not exist in the SCTGR-RGA model.")
-        self._assert_strict_energy_contract()
 
-    def assert_pg_rga_contract(self, seen_classes: Iterable[int], *, phase: str = "base") -> None:
-        self.assert_method_identity()
-        self.assert_phase_ready(seen_classes, mode="geometry", require_geometry=True)
-        if not str(phase).lower().startswith("base"):
-            self.assert_frozen_modules()
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-        mode = _normalize_classifier_mode(kwargs.get("classifier_mode", kwargs.get("mode", "geometry")))
-        if bool(kwargs.get("apply_adapter", False)):
-            raise RuntimeError("Feature adapter routing is forbidden.")
-        features_out = self.forward_features(
-            x,
-            spectral_summary=kwargs.get("spectral_summary"),
-            band_weights=kwargs.get("band_weights"),
-            spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical"),
-            apply_adapter=False,
-        )
-        return_features_only = _to_bool(kwargs.get("return_features_only", False), False)
-        if mode == "base_ce" or return_features_only:
-            if mode == "base_ce" or "num_base_classes" in kwargs:
-                nbase = int(kwargs.get("num_base_classes", self.base_ce_num_classes))
-                if nbase <= 0:
-                    raise RuntimeError("num_base_classes is required for base_ce mode.")
-                features_out = dict(features_out)
-                features_out["logits"] = self.base_ce_logits(features_out["features"], nbase)
-            return features_out
+TransportVerifiedNECILModel = NECILModel
 
-        seen_classes = kwargs.get("seen_classes", None)
-        if seen_classes is None:
-            seen_classes = self._infer_seen_classes()
-        logits_out = self.compute_logits_from_features(
-            features_out["features"],
-            seen_classes=seen_classes,
-            geometry_bank=self.geometry_bank,
-            mode="geometry",
-            targets=kwargs.get("targets", kwargs.get("labels")),
-            targets_are_global=_to_bool(kwargs.get("targets_are_global", kwargs.get("labels_are_global", False))),
-            old_classes=kwargs.get("old_classes"),
-            new_classes=kwargs.get("new_classes"),
-            return_energy=_to_bool(kwargs.get("return_energy", False)),
-            return_parts=_to_bool(kwargs.get("return_parts", False)),
-            return_diagnostics=_to_bool(kwargs.get("return_diagnostics", False)),
-        )
-        out: Dict[str, Any] = dict(features_out)
-        if isinstance(logits_out, dict):
-            out.update(logits_out)
-        else:
-            out["logits"] = logits_out
-        return out
+
+
 
 
 
@@ -1209,2632 +2152,1396 @@ class NECILModel(nn.Module):
 
 # from __future__ import annotations
 
-# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-
-# import inspect
+# import copy
+# import hashlib
 # import math
+# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
 
 # from models.backbone import SSMBackbone
-# from models.geometry_bank import GeometryBank
 # from models.classifier import GeometryEnergyClassifier
+# from models.geometry_bank import GeometryBank
 
 
-# def _to_bool(value: Any, default: bool = False) -> bool:
-#     if value is None:
-#         return bool(default)
-#     if isinstance(value, bool):
-#         return value
-#     if isinstance(value, (int, float)):
-#         return bool(value)
-#     if isinstance(value, str):
-#         v = value.strip().lower()
-#         if v in {"1", "true", "yes", "y", "on"}:
-#             return True
-#         if v in {"0", "false", "no", "n", "off", "none", "null", ""}:
-#             return False
-#     return bool(value)
+# Tensor = torch.Tensor
+# Row = Dict[str, Tensor]
 
 
-# def _filter_supported_kwargs(cls_or_fn: Any, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-#     try:
-#         sig = inspect.signature(cls_or_fn)
-#     except (TypeError, ValueError):
-#         return dict(kwargs)
-#     if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-#         return dict(kwargs)
-#     allowed = set(sig.parameters.keys())
-#     allowed.discard("self")
-#     return {k: v for k, v in kwargs.items() if k in allowed}
+# def _unique_ids(
+#     values: Iterable[int],
+#     *,
+#     name: str,
+#     allow_empty: bool = False,
+# ) -> List[int]:
+#     output: List[int] = []
+#     observed: set[int] = set()
+#     for value in values:
+#         class_id = int(value)
+#         if class_id < 0:
+#             raise ValueError(f"{name} contains negative class ID {class_id}")
+#         if class_id in observed:
+#             raise ValueError(f"{name} contains duplicate class ID {class_id}")
+#         observed.add(class_id)
+#         output.append(class_id)
+#     if not output and not allow_empty:
+#         raise ValueError(f"{name} is empty")
+#     return output
 
 
-# def _ordered_unique_ints(values: Iterable[int]) -> List[int]:
-#     out: List[int] = []
-#     seen = set()
-#     for v in values:
-#         iv = int(v)
-#         if iv not in seen:
-#             out.append(iv)
-#             seen.add(iv)
-#     return out
+# def _bounded_frobenius(value: Tensor, maximum_norm: float) -> Tensor:
+#     """Smoothly bound a tensor's Frobenius norm below ``maximum_norm``."""
+#     maximum = float(maximum_norm)
+#     if maximum <= 0.0:
+#         return torch.zeros_like(value)
+#     norm = value.norm()
+#     return maximum * value / (maximum + norm)
 
 
-# def _normalize_classifier_mode(mode: Optional[str], default: str = "geometry") -> str:
-#     """Normalize classifier mode for the clean PG-RGA model.
+# class SpectralConditionedPhaseTransport(nn.Module):
+#     """One phase-wise invertible map ``T(z,s)=Mz+Hs+b``.
 
-#     Public commands may use ``geometry_only`` while the classifier implementation
-#     uses ``geometry`` internally.  Calibrated/topology aliases are accepted only
-#     for backward compatibility and are routed to plain geometry, because the
-#     main path must remain geometry-only.
-#     """
-#     m = str(default if mode is None else mode).lower().strip()
-#     aliases = {
-#         "": "geometry",
-#         "none": "geometry",
-#         "geo": "geometry",
-#         "geometry": "geometry",
-#         "geometry_only": "geometry",
-#         "geometry-only": "geometry",
-#         "feature_geometry": "geometry",
-#         "low_rank_geometry": "geometry",
-#         "anchor": "geometry",
-#         "anchor_concept": "geometry",
-#         "anchor_concept_geometry": "geometry",
-#         "srgp": "geometry",
-#         "srgp_geometry": "geometry",
-#         "spectral_geometry": "geometry",
-#         "spectral_residual": "geometry",
-#         "calibrated": "geometry",
-#         "calibrated_geometry": "geometry",
-#         "topology_calibrated_geometry": "geometry",
-#         "base_ce": "base_ce",
-#     }
-#     out = aliases.get(m, m)
-#     if out not in {"geometry", "base_ce"}:
-#         raise ValueError(f"Unsupported classifier mode {mode!r}. Use geometry_only/geometry or base_ce.")
-#     return out
+#     ``M`` is a low-rank residual around the identity. Its residual Frobenius
+#     norm is bounded below one, which guarantees invertibility by
+#     ``sigma_min(I+R) >= 1 - ||R||_2``. ``H`` and ``b`` are also norm bounded.
 
-
-
-# def _normalize_incremental_update_mode(mode: Optional[str]) -> str:
-#     """Normalize incremental update mode for the clean PG-RGA architecture.
-
-#     The main method has exactly one model-plasticity path: the bounded
-#     geometry-gated residual adapter.  Legacy descriptor/frozen names are
-#     accepted only so old commands do not route to a different implementation.
-#     """
-#     m = str(mode or "geometry_gated_adapter").lower().strip()
-#     aliases = {
-#         "": "geometry_gated_adapter",
-#         "none": "geometry_gated_adapter",
-#         "false": "geometry_gated_adapter",
-#         "off": "geometry_gated_adapter",
-#         "clean": "geometry_gated_adapter",
-#         "main": "geometry_gated_adapter",
-#         "pg_rga": "geometry_gated_adapter",
-#         "pg-rga": "geometry_gated_adapter",
-#         "pgrga": "geometry_gated_adapter",
-#         "geometry_gated_adapter": "geometry_gated_adapter",
-#         "geometry_gated": "geometry_gated_adapter",
-#         "gated_adapter": "geometry_gated_adapter",
-#         "geometry_adapter": "geometry_gated_adapter",
-#         "adapter": "geometry_gated_adapter",
-#         "g2rpa": "geometry_gated_adapter",
-#         "g2-rpa": "geometry_gated_adapter",
-#         "descriptor": "geometry_gated_adapter",
-#         "descriptor_only": "geometry_gated_adapter",
-#         "descriptor_refinement": "geometry_gated_adapter",
-#         "frozen": "geometry_gated_adapter",
-#         "frozen_geometry": "geometry_gated_adapter",
-#         "scbgr": "geometry_gated_adapter",
-#         "scb-gr": "geometry_gated_adapter",
-#         "rsgi": "geometry_gated_adapter",
-#     }
-#     out = aliases.get(m, m)
-#     if out != "geometry_gated_adapter":
-#         raise ValueError(
-#             f"Unsupported incremental_update_mode={mode!r}. "
-#             "Use geometry_gated_adapter for the PG-RGA main path."
-#         )
-#     return out
-
-
-# def _module_has_trainable_params(module: Optional[nn.Module]) -> bool:
-#     return bool(module is not None and any(p.requires_grad for p in module.parameters()))
-
-
-# class GeometryPlasticAdapter(nn.Module):
-#     """Bounded geometry-gated residual adapter for controlled incremental plasticity.
-
-#     This module operates directly in the canonical projected GeometryBank space.
-#     It is deliberately small: it can make a bounded residual correction for new
-#     classes, but it cannot rewrite the backbone/projection or old bank rows.
+#     The module is temporary: its effect is analytically absorbed into the
+#     GeometryBank at phase commit and the module is then discarded.
 #     """
 
 #     def __init__(
 #         self,
-#         d_model: int,
 #         *,
-#         bottleneck: int = 32,
-#         max_scale: float = 0.10,
-#         dropout: float = 0.0,
-#         gate_bias_init: float = -3.0,
+#         d_model: int,
+#         spectral_anchor_dim: int,
+#         feature_rank: int = 8,
+#         spectral_rank: int = 8,
+#         maximum_matrix_residual_norm: float = 0.20,
+#         maximum_spectral_shift_norm: float = 0.50,
+#         maximum_bias_norm: float = 0.25,
+#         initialization_std: float = 0.02,
 #     ) -> None:
 #         super().__init__()
 #         self.d_model = int(d_model)
-#         self.bottleneck = int(max(1, bottleneck))
-#         self.max_scale = float(max(0.0, max_scale))
-#         self.norm = nn.LayerNorm(self.d_model)
-#         self.delta = nn.Sequential(
-#             nn.Linear(self.d_model, self.bottleneck),
-#             nn.GELU(),
-#             nn.Dropout(float(max(0.0, dropout))),
-#             nn.Linear(self.bottleneck, self.d_model),
+#         self.spectral_anchor_dim = int(spectral_anchor_dim)
+#         self.feature_rank = int(feature_rank)
+#         self.spectral_rank = int(spectral_rank)
+#         self.maximum_matrix_residual_norm = float(
+#             maximum_matrix_residual_norm
 #         )
-#         self.gate = nn.Sequential(
-#             nn.Linear(self.d_model, self.bottleneck),
-#             nn.GELU(),
-#             nn.Linear(self.bottleneck, 1),
+#         self.maximum_spectral_shift_norm = float(
+#             maximum_spectral_shift_norm
 #         )
-#         self.reset_parameters(float(gate_bias_init))
+#         self.maximum_bias_norm = float(maximum_bias_norm)
 
-#     def reset_parameters(self, gate_bias_init: float = -3.0) -> None:
-#         for module in self.modules():
-#             if isinstance(module, nn.Linear):
-#                 nn.init.xavier_uniform_(module.weight)
-#                 nn.init.zeros_(module.bias)
-#         # Start as an identity map. The adapter earns plasticity only through
-#         # incremental new/replay losses.
-#         last_delta = self.delta[-1]
-#         if isinstance(last_delta, nn.Linear):
-#             nn.init.zeros_(last_delta.weight)
-#             nn.init.zeros_(last_delta.bias)
-#         last_gate = self.gate[-1]
-#         if isinstance(last_gate, nn.Linear):
-#             nn.init.zeros_(last_gate.weight)
-#             nn.init.constant_(last_gate.bias, float(gate_bias_init))
+#         if self.d_model <= 0 or self.spectral_anchor_dim <= 0:
+#             raise ValueError("transport dimensions must be positive")
+#         if not 1 <= self.feature_rank <= self.d_model:
+#             raise ValueError("feature_rank must be in [1,d_model]")
+#         if not 1 <= self.spectral_rank <= min(
+#             self.d_model, self.spectral_anchor_dim
+#         ):
+#             raise ValueError(
+#                 "spectral_rank must be in [1,min(d_model,anchor_dim)]"
+#             )
+#         if not 0.0 < self.maximum_matrix_residual_norm < 1.0:
+#             raise ValueError(
+#                 "maximum_matrix_residual_norm must lie strictly in (0,1)"
+#             )
+#         if self.maximum_spectral_shift_norm < 0.0:
+#             raise ValueError("maximum_spectral_shift_norm must be non-negative")
+#         if self.maximum_bias_norm < 0.0:
+#             raise ValueError("maximum_bias_norm must be non-negative")
 
-#     def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         if features.dim() != 2:
-#             raise RuntimeError(f"GeometryPlasticAdapter expects [B,D], got {tuple(features.shape)}")
-#         h = self.norm(features)
-#         gate = torch.sigmoid(self.gate(h))
-#         direction = torch.tanh(self.delta(h))
-#         delta = gate * float(self.max_scale) * direction
-#         adapted = features + delta
+#         std = float(max(initialization_std, 1e-6))
+#         self.feature_left = nn.Parameter(
+#             torch.randn(self.d_model, self.feature_rank) * std
+#         )
+#         self.feature_right = nn.Parameter(
+#             torch.zeros(self.d_model, self.feature_rank)
+#         )
+#         self.spectral_left = nn.Parameter(
+#             torch.randn(self.d_model, self.spectral_rank) * std
+#         )
+#         self.spectral_right = nn.Parameter(
+#             torch.zeros(self.spectral_anchor_dim, self.spectral_rank)
+#         )
+#         self.raw_bias = nn.Parameter(torch.zeros(self.d_model))
+
+#     def matrix_residual(self) -> Tensor:
+#         raw = (
+#             self.feature_left @ self.feature_right.transpose(0, 1)
+#         ) / math.sqrt(float(self.feature_rank))
+#         return _bounded_frobenius(
+#             raw, self.maximum_matrix_residual_norm
+#         )
+
+#     def matrix(self) -> Tensor:
+#         identity = torch.eye(
+#             self.d_model,
+#             device=self.feature_left.device,
+#             dtype=self.feature_left.dtype,
+#         )
+#         return identity + self.matrix_residual()
+
+#     def spectral_shift(self) -> Tensor:
+#         raw = (
+#             self.spectral_left @ self.spectral_right.transpose(0, 1)
+#         ) / math.sqrt(float(self.spectral_rank))
+#         return _bounded_frobenius(
+#             raw, self.maximum_spectral_shift_norm
+#         )
+
+#     def bias(self) -> Tensor:
+#         return _bounded_frobenius(
+#             self.raw_bias, self.maximum_bias_norm
+#         )
+
+#     def forward(self, features: Tensor, spectral_anchors: Tensor) -> Tensor:
+#         if features.dim() != 2 or features.size(1) != self.d_model:
+#             raise ValueError(
+#                 f"features must be [N,{self.d_model}], got {tuple(features.shape)}"
+#             )
+#         if spectral_anchors.dim() != 2 or spectral_anchors.size(1) != (
+#             self.spectral_anchor_dim
+#         ):
+#             raise ValueError(
+#                 "spectral_anchors must be "
+#                 f"[N,{self.spectral_anchor_dim}], got "
+#                 f"{tuple(spectral_anchors.shape)}"
+#             )
+#         if features.size(0) != spectral_anchors.size(0):
+#             raise ValueError("features and spectral anchors are not aligned")
+#         if not torch.isfinite(features).all() or not torch.isfinite(
+#             spectral_anchors
+#         ).all():
+#             raise RuntimeError("transport inputs contain NaN/Inf")
+
+#         matrix = self.matrix().to(
+#             device=features.device, dtype=features.dtype
+#         )
+#         spectral_shift = self.spectral_shift().to(
+#             device=features.device, dtype=features.dtype
+#         )
+#         bias = self.bias().to(device=features.device, dtype=features.dtype)
+#         return (
+#             features @ matrix.transpose(0, 1)
+#             + spectral_anchors @ spectral_shift.transpose(0, 1)
+#             + bias.view(1, -1)
+#         )
+
+#     def inverse(self, current_features: Tensor, spectral_anchors: Tensor) -> Tensor:
+#         if current_features.dim() != 2 or current_features.size(1) != (
+#             self.d_model
+#         ):
+#             raise ValueError("current_features have the wrong shape")
+#         if spectral_anchors.shape != (
+#             current_features.size(0),
+#             self.spectral_anchor_dim,
+#         ):
+#             raise ValueError("spectral_anchors have the wrong shape")
+#         matrix = self.matrix().to(
+#             device=current_features.device, dtype=current_features.dtype
+#         )
+#         spectral_shift = self.spectral_shift().to(
+#             device=current_features.device, dtype=current_features.dtype
+#         )
+#         bias = self.bias().to(
+#             device=current_features.device, dtype=current_features.dtype
+#         )
+#         centered = (
+#             current_features
+#             - spectral_anchors @ spectral_shift.transpose(0, 1)
+#             - bias.view(1, -1)
+#         )
+#         return torch.linalg.solve(
+#             matrix, centered.transpose(0, 1)
+#         ).transpose(0, 1)
+
+#     def tensors(self, *, detach: bool = False) -> Dict[str, Tensor]:
+#         values = {
+#             "matrix": self.matrix(),
+#             "spectral_shift": self.spectral_shift(),
+#             "bias": self.bias(),
+#         }
+#         if detach:
+#             return {name: value.detach() for name, value in values.items()}
+#         return values
+
+#     @torch.no_grad()
+#     def diagnostics(self) -> Dict[str, float]:
+#         matrix = self.matrix()
+#         singular = torch.linalg.svdvals(matrix)
+#         minimum = float(singular.min().item())
+#         maximum = float(singular.max().item())
 #         return {
-#             "features": adapted,
-#             "projected_features": adapted,
-#             "delta": delta,
-#             "gate": gate,
-#             "adapter_delta": delta,
-#             "adapter_gate": gate,
+#             "matrix_residual_frobenius": float(
+#                 self.matrix_residual().norm().item()
+#             ),
+#             "spectral_shift_frobenius": float(
+#                 self.spectral_shift().norm().item()
+#             ),
+#             "bias_norm": float(self.bias().norm().item()),
+#             "minimum_singular_value": minimum,
+#             "maximum_singular_value": maximum,
+#             "condition_number": maximum / max(minimum, 1e-12),
 #         }
 
 
 # class NECILModel(nn.Module):
-#     """Clean NECIL-HSI model router.
+#     """Evolving spectral-conditioned geometry architecture.
 
-#     Contract:
-#         - One canonical projected feature space ``z`` is used for base geometry,
-#           incremental geometry insertion, synthetic replay, and evaluation.
-#         - GeometryBank is the only non-exemplar memory.
-#         - Classifier always receives explicit ``seen_classes`` and returns
-#           logits [B, len(seen_classes)].
-#         - Semantic/concept/adaptor/transport paths are not part of this clean
-#           main model. Their hooks are kept as no-ops or hard-disabled aliases so
-#           stale trainer code does not silently route through a different space.
+#     Main representation
+#     -------------------
+#     ``x -> plastic spectral-spatial backbone -> z_t``
+
+#     Persistent memory
+#     -----------------
+#     ``p(s|c) p(z_t|s,c)`` where ``s`` is a frozen base-fitted anchor of
+#     ordered physical spectra. No old image, spectrum, feature, prototype
+#     classifier weight, teacher, or task adapter is stored.
+
+#     Incremental synchronization
+#     ---------------------------
+#     A temporary phase transport ``T_t(z,s)=M_t z + H_t s + b_t`` maps old
+#     aggregate geometry and old geometry replay into the current feature space.
+#     Its effect is absorbed into the GeometryBank at commit.
 #     """
+
+#     ARCHITECTURE_VERSION = 1
+#     METHOD_NAME = "Evolving spectral-conditioned geometry"
+
+#     FEATURE_MODE = "features"
+#     BASE_CE_MODE = "base_ce"
+#     GEOMETRY_MODE = "geometry"
 
 #     def __init__(self, args: Any) -> None:
 #         super().__init__()
 #         self.args = args
 #         self.device = torch.device(getattr(args, "device", "cpu"))
 #         self.d_model = int(getattr(args, "d_model", 128))
-#         self.subspace_rank = int(getattr(args, "subspace_rank", getattr(args, "rank", 5)))
-#         if self.d_model <= 0:
-#             raise ValueError("d_model must be positive.")
-#         if self.subspace_rank < 0:
-#             raise ValueError("subspace_rank must be non-negative.")
-
-#         self.current_phase = 0
-#         self.old_class_count = 0
-#         self.current_num_classes = 0
-#         self.seen_classes: List[int] = []
-#         self.base_mode_active = True
-#         self.incremental_mode_active = False
-#         self._incremental_frozen_modules: List[str] = []
-
-#         # Main architecture switch.
-#         # PG-RGA uses a bounded residual geometry adapter during incremental
-#         # learning, while the backbone/projection and old GeometryBank rows stay
-#         # frozen. Descriptor-only/frozen modes remain available as ablations.
-#         self.incremental_update_mode = _normalize_incremental_update_mode(
-#             getattr(args, "incremental_update_mode", None)
+#         self.feature_rank = int(
+#             getattr(args, "subspace_rank", getattr(args, "rank", 5))
 #         )
-
-#         # Hard-disable stale/unsafe paths in the model object. They can exist in
-#         # other files for ablation compatibility, but this clean model must not
-#         # silently route through them.
-#         self.use_incremental_adapter = False
-#         self.use_geometry_calibrator = False
-#         self.use_bicyc_geometry_cycle = False
-#         self.use_geometry_transport = False
-#         self.use_sglat_transport = False
-#         self.use_geometry_gated_adapter = (
-#             self.incremental_update_mode == "geometry_gated_adapter"
-#             or _to_bool(getattr(args, "use_geometry_gated_adapter", False), False)
+#         self.spectral_anchor_dim = int(
+#             getattr(args, "spectral_anchor_dim", 12)
 #         )
-#         self.semantic_encoder: Optional[nn.Module] = None
-#         self.concept_encoder: Optional[nn.Module] = None
+#         self.spectral_rank = int(getattr(args, "spectral_rank", 4))
 
 #         self.backbone = SSMBackbone(args)
-#         dropout = float(getattr(args, "projection_dropout", 0.0))
-#         self.projection = nn.Sequential(
-#             nn.Linear(self.d_model, self.d_model),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(self.d_model, self.d_model),
+#         self.geometry_bank = GeometryBank(
+#             d_model=self.d_model,
+#             rank=self.feature_rank,
+#             raw_spectral_dim=int(self.backbone.raw_num_bands),
+#             spectral_anchor_dim=self.spectral_anchor_dim,
+#             spectral_rank=self.spectral_rank,
+#             device=self.device,
+#             feature_variance_floor=float(
+#                 getattr(args, "geom_var_floor", 1e-4)
+#             ),
+#             spectral_variance_floor=float(
+#                 getattr(args, "spectral_variance_floor", 1e-4)
+#             ),
+#             feature_shrinkage=float(
+#                 getattr(args, "geometry_variance_shrinkage", 0.10)
+#             ),
+#             spectral_shrinkage=float(
+#                 getattr(args, "spectral_variance_shrinkage", 0.20)
+#             ),
+#             shrinkage_tau=float(
+#                 getattr(args, "geometry_shrinkage_tau", 20.0)
+#             ),
+#             retained_energy=float(
+#                 getattr(args, "rank_energy_threshold", 0.95)
+#             ),
+#             noise_ratio=float(
+#                 getattr(args, "rank_noise_ratio_threshold", 1.50)
+#             ),
+#             coupling_ridge=float(
+#                 getattr(args, "spectral_coupling_ridge", 1e-2)
+#             ),
+#             coupling_shrinkage_tau=float(
+#                 getattr(args, "spectral_coupling_shrinkage_tau", 20.0)
+#             ),
+#             robust_iterations=int(
+#                 getattr(args, "robust_geometry_iterations", 3)
+#             ),
+#             robust_huber_delta=float(
+#                 getattr(args, "robust_geometry_huber_delta", 2.5)
+#             ),
+#             spatial_purity_power=float(
+#                 getattr(args, "spatial_purity_power", 1.0)
+#             ),
+#             spectral_weight=float(
+#                 getattr(args, "spectral_weight", 1.0)
+#             ),
+#             feature_weight=float(
+#                 getattr(args, "feature_weight", 1.0)
+#             ),
+#             logdet_weight=float(
+#                 getattr(args, "energy_logdet_weight", 1.0)
+#             ),
+#             boundary_oversample_factor=int(
+#                 getattr(args, "boundary_oversample_factor", 8)
+#             ),
+#             maximum_transport_condition=float(
+#                 getattr(args, "maximum_transport_condition", 2.0)
+#             ),
 #         )
-#         self.norm = nn.LayerNorm(self.d_model)
 
-#         self.normalize_geometry_features = _to_bool(getattr(args, "normalize_geometry_features", True), True)
-#         raw_scale = float(getattr(args, "geometry_feature_scale", 0.0) or 0.0)
-#         self.geometry_feature_scale = raw_scale if raw_scale > 0.0 else math.sqrt(float(self.d_model))
-#         self.geometry_feature_clamp = float(getattr(args, "geometry_feature_clamp", 0.0) or 0.0)
-#         self.spectral_summary_mode = str(getattr(args, "spectral_summary_mode", "center")).lower().strip()
-#         if self.spectral_summary_mode not in {"center", "mean"}:
-#             raise ValueError("spectral_summary_mode must be 'center' or 'mean'.")
-#         pca_components = int(getattr(args, "pca_components", 0) or 0)
-#         self.default_spectral_physical = bool(getattr(args, "spectral_summary_is_physical", pca_components <= 0))
-#         self.min_band_mass = float(getattr(args, "min_band_mass", 1e-8))
-
-#         bank_kwargs = _filter_supported_kwargs(
-#             GeometryBank.__init__,
-#             {
-#                 "device": self.device,
-#                 "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-#                 "variance_shrinkage": float(getattr(args, "geometry_variance_shrinkage", 0.10)),
-#                 "max_variance_ratio": float(getattr(args, "geometry_max_variance_ratio", 50.0)),
-#                 "min_reliability": float(getattr(args, "geometry_min_reliability", 0.05)),
-#                 "reliability_sample_alpha": float(getattr(args, "reliability_sample_alpha", 20.0)),
-#                 "rank_energy_threshold": float(getattr(args, "rank_energy_threshold", 0.95)),
-#                 "rank_eigen_ratio_threshold": float(getattr(args, "rank_eigen_ratio_threshold", 1e-3)),
-#                 "min_active_rank": int(getattr(args, "min_active_rank", 1)),
-#             },
+#         temperature = float(getattr(args, "energy_temperature", 1.0))
+#         self.classifier = GeometryEnergyClassifier(
+#             d_model=self.d_model,
+#             temperature=temperature,
+#             expected_spectral_anchor_dim=self.spectral_anchor_dim,
+#             expected_bank_schema_version=int(
+#                 self.geometry_bank.SCHEMA_VERSION
+#             ),
+#             require_bound_contract=False,
 #         )
-#         self.geometry_bank = GeometryBank(self.d_model, self.subspace_rank, **bank_kwargs)
 
-#         clf_kwargs = _filter_supported_kwargs(
-#             GeometryEnergyClassifier.__init__,
-#             {
-#                 "initial_classes": 0,
-#                 "d_model": self.d_model,
-#                 "logit_scale": float(getattr(args, "loss_scale", getattr(args, "logit_scale", 8.0))),
-#                 "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-#                 "residual_variance_scale": float(getattr(args, "residual_variance_scale", 0.75)),
-#                 "normalize_energy_by_dim": _to_bool(getattr(args, "energy_normalize_by_dim", True), True),
-#                 "use_logdet_energy": _to_bool(getattr(args, "use_logdet_energy", True), True),
-#                 "logdet_energy_weight": float(getattr(args, "logdet_energy_weight", 0.05)),
-#                 "use_reliability_penalty": _to_bool(getattr(args, "use_reliability_penalty", True), True),
-#                 "reliability_energy_weight": float(getattr(args, "reliability_energy_weight", 0.03)),
-#                 "use_old_new_calibration": False,
-#                 "calibration_max_abs_bias": float(getattr(args, "calibration_max_abs_bias", getattr(args, "energy_calibrator_max_bias", 1.0))),
-#                 "logit_clip": float(getattr(args, "geometry_logit_clip", 0.0)),
-#             },
-#         )
-#         self.classifier = GeometryEnergyClassifier(**clf_kwargs)
-
-#         self.geometry_plastic_adapter = GeometryPlasticAdapter(
-#             self.d_model,
-#             bottleneck=int(getattr(args, "adapter_bottleneck", 32)),
-#             max_scale=float(getattr(args, "adapter_max_scale", 0.10)),
-#             dropout=float(getattr(args, "adapter_dropout", 0.0)),
-#             gate_bias_init=float(getattr(args, "adapter_gate_bias_init", -3.0)),
-#         )
-#         self._set_requires_grad(self.geometry_plastic_adapter, False)
-
+#         self.phase_transport: Optional[
+#             SpectralConditionedPhaseTransport
+#         ] = None
 #         self.base_ce_head: Optional[nn.Linear] = None
-#         self.base_ce_num_classes = 0
+#         self.base_ce_class_ids: List[int] = []
+
+#         self.current_phase = 0
+#         self.seen_classes: List[int] = []
+#         self.old_classes: List[int] = []
+#         self.new_classes: List[int] = []
+#         self.phase_old_digest: Optional[str] = None
+#         self.base_handoff: Optional[Dict[str, Any]] = None
+#         self.phase_mode = "base"
 
 #         self.to(self.device)
+#         self.assert_architecture_contract()
+
+#     def _new_phase_transport(self) -> SpectralConditionedPhaseTransport:
+#         return SpectralConditionedPhaseTransport(
+#             d_model=self.d_model,
+#             spectral_anchor_dim=self.spectral_anchor_dim,
+#             feature_rank=int(getattr(self.args, "transport_rank", 8)),
+#             spectral_rank=int(
+#                 getattr(self.args, "transport_spectral_rank", 8)
+#             ),
+#             maximum_matrix_residual_norm=float(
+#                 getattr(
+#                     self.args,
+#                     "transport_max_matrix_residual_norm",
+#                     0.20,
+#                 )
+#             ),
+#             maximum_spectral_shift_norm=float(
+#                 getattr(
+#                     self.args,
+#                     "transport_max_spectral_shift_norm",
+#                     0.50,
+#                 )
+#             ),
+#             maximum_bias_norm=float(
+#                 getattr(self.args, "transport_max_bias_norm", 0.25)
+#             ),
+#         ).to(self.device)
 
 #     # ------------------------------------------------------------------
-#     # Input / feature utilities
+#     # Architecture and checkpoint contract
 #     # ------------------------------------------------------------------
-#     def _validate_feature_tensor(self, features: torch.Tensor, name: str, batch_size: Optional[int] = None) -> torch.Tensor:
-#         if not torch.is_tensor(features):
-#             raise TypeError(f"{name} must be a torch.Tensor, got {type(features)}")
-#         if features.dim() != 2:
-#             raise RuntimeError(f"{name} must be [B,D], got {tuple(features.shape)}")
+#     def architecture_summary(self) -> Dict[str, Any]:
+#         return {
+#             "architecture_version": self.ARCHITECTURE_VERSION,
+#             "method": self.METHOD_NAME,
+#             "factorization": "p(s|c)p(z|s,c)",
+#             "encoder": "plastic spectral-spatial S4D bridge",
+#             "spectral_object": "base-fitted frozen physical spectral anchor",
+#             "phase_transport": "low-rank invertible T(z,s)=Mz+Hs+b",
+#             "classifier": "parameter-free joint energy",
+#             "old_rows_evolve": True,
+#             "stores_exemplars": False,
+#             "stores_old_features": False,
+#             "stores_old_spectra": False,
+#             "uses_teacher": False,
+#             "uses_task_adapters": False,
+#             "uses_candidate_row_corrections": False,
+#         }
+
+#     def architecture_digest(self) -> str:
+#         payload = (
+#             self.architecture_summary(),
+#             self.backbone.backbone_contract(),
+#             self.classifier.classifier_contract(),
+#         )
+#         return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+#     def assert_architecture_contract(self) -> None:
+#         if self.backbone.d_model != self.d_model:
+#             raise RuntimeError("backbone and model feature widths differ")
+#         if self.geometry_bank.d_model != self.d_model:
+#             raise RuntimeError("bank and model feature widths differ")
+#         if self.geometry_bank.raw_spectral_dim != (
+#             self.backbone.raw_num_bands
+#         ):
+#             raise RuntimeError("backbone and bank raw spectral widths differ")
+#         if self.geometry_bank.spectral_anchor_dim != (
+#             self.spectral_anchor_dim
+#         ):
+#             raise RuntimeError("bank spectral-anchor width is inconsistent")
+#         required_bank = (
+#             "fit_spectral_anchor",
+#             "encode_spectra",
+#             "extract_rows",
+#             "joint_energy_matrix",
+#             "sample_replay",
+#             "build_transported_rows",
+#             "commit_incremental_phase",
+#             "contract_digest",
+#         )
+#         missing = [
+#             name
+#             for name in required_bank
+#             if not callable(getattr(self.geometry_bank, name, None))
+#         ]
+#         if missing:
+#             raise RuntimeError(f"GeometryBank lacks required methods: {missing}")
+#         if any(
+#             parameter.requires_grad
+#             for parameter in self.geometry_bank.parameters()
+#         ):
+#             raise RuntimeError("GeometryBank must contain buffers only")
+#         if any(
+#             parameter.requires_grad
+#             for parameter in self.classifier.parameters()
+#         ):
+#             raise RuntimeError("classifier must be parameter-free")
+#         contract = self.classifier.classifier_contract()
+#         if contract.get("factorization") != "p(s|c)p(z|s,c)":
+#             raise RuntimeError("classifier factorization is inconsistent")
+
+#     def get_extra_state(self) -> Dict[str, Any]:
+#         return {
+#             "architecture_version": self.ARCHITECTURE_VERSION,
+#             "architecture_digest": self.architecture_digest(),
+#             "current_phase": self.current_phase,
+#             "seen_classes": list(self.seen_classes),
+#             "old_classes": list(self.old_classes),
+#             "new_classes": list(self.new_classes),
+#             "phase_old_digest": self.phase_old_digest,
+#             "phase_mode": self.phase_mode,
+#             "base_ce_class_ids": list(self.base_ce_class_ids),
+#             "base_handoff": copy.deepcopy(self.base_handoff),
+#         }
+
+#     def set_extra_state(self, state: Any) -> None:
+#         if not isinstance(state, Mapping):
+#             return
+#         version = int(state.get("architecture_version", -1))
+#         if version != self.ARCHITECTURE_VERSION:
+#             raise RuntimeError(
+#                 f"NECILModel architecture version mismatch: {version}"
+#             )
+#         self.current_phase = int(state.get("current_phase", 0))
+#         self.seen_classes = [int(v) for v in state.get("seen_classes", [])]
+#         self.old_classes = [int(v) for v in state.get("old_classes", [])]
+#         self.new_classes = [int(v) for v in state.get("new_classes", [])]
+#         digest = state.get("phase_old_digest")
+#         self.phase_old_digest = None if digest is None else str(digest)
+#         self.phase_mode = str(state.get("phase_mode", "base"))
+#         self.base_ce_class_ids = [
+#             int(v) for v in state.get("base_ce_class_ids", [])
+#         ]
+#         if self.base_ce_class_ids and self.base_ce_head is None:
+#             self.ensure_base_ce_head(self.base_ce_class_ids)
+#         if self.phase_mode == "incremental" and self.phase_transport is None:
+#             self.phase_transport = self._new_phase_transport()
+#         self.base_handoff = copy.deepcopy(state.get("base_handoff"))
+
+#     # ------------------------------------------------------------------
+#     # Feature and spectrum extraction
+#     # ------------------------------------------------------------------
+#     def _validate_output(self, output: Mapping[str, Any]) -> Dict[str, Any]:
+#         required = (
+#             "geometry_features",
+#             "raw_center_spectra",
+#             "spatial_purity",
+#         )
+#         missing = [name for name in required if name not in output]
+#         if missing:
+#             raise RuntimeError(f"backbone output lacks {missing}")
+#         result = dict(output)
+#         features = result["geometry_features"]
+#         spectra = result["raw_center_spectra"]
+#         purity = result["spatial_purity"]
+#         if not torch.is_tensor(features) or features.dim() != 2:
+#             raise RuntimeError("geometry_features must be [N,D]")
 #         if features.size(1) != self.d_model:
-#             raise RuntimeError(f"{name} dim mismatch: expected {self.d_model}, got {features.size(1)}")
-#         if batch_size is not None and features.size(0) != int(batch_size):
-#             raise RuntimeError(f"{name} batch mismatch: got {features.size(0)}, expected {int(batch_size)}")
-#         if not torch.isfinite(features).all():
-#             raise RuntimeError(f"{name} contains NaN/Inf values.")
-#         return features
-
-#     def _canonicalize(self, z: torch.Tensor, *, name: str) -> torch.Tensor:
-#         z = self._validate_feature_tensor(z, name)
-#         if self.normalize_geometry_features:
-#             z = F.normalize(z, p=2, dim=1, eps=1e-8) * float(self.geometry_feature_scale)
-#         if self.geometry_feature_clamp > 0.0:
-#             z = z.clamp(-self.geometry_feature_clamp, self.geometry_feature_clamp)
-#         if not torch.isfinite(z).all():
-#             raise RuntimeError(f"{name} contains NaN/Inf after canonicalization.")
-#         return z
-
-#     def _center_spectrum_from_input(self, x: torch.Tensor) -> torch.Tensor:
-#         if x.dim() == 4:
-#             if self.spectral_summary_mode == "center":
-#                 return x[:, :, x.size(-2) // 2, x.size(-1) // 2]
-#             return x.mean(dim=(-1, -2))
-#         if x.dim() == 3:
-#             if self.spectral_summary_mode == "center":
-#                 return x[:, :, x.size(-1) // 2]
-#             return x.mean(dim=-1)
-#         if x.dim() == 2:
-#             return x
-#         raise RuntimeError(f"Unsupported input shape for spectral summary: {tuple(x.shape)}")
-
-#     def _prepare_spectral_summary(
-#         self,
-#         x: torch.Tensor,
-#         features: torch.Tensor,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#     ) -> Tuple[torch.Tensor, bool]:
-#         if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-#             s = self._center_spectrum_from_input(x).to(device=features.device, dtype=features.dtype)
-#             physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-#         else:
-#             s = spectral_summary.to(device=features.device, dtype=features.dtype)
-#             if s.dim() == 4:
-#                 s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#             elif s.dim() == 3:
-#                 if s.size(0) == features.size(0) and s.size(-1) > 1:
-#                     s = s[:, :, s.size(-1) // 2]
-#                 else:
-#                     s = s.reshape(features.size(0), -1)
-#             elif s.dim() == 1:
-#                 if s.numel() % max(int(features.size(0)), 1) != 0:
-#                     raise RuntimeError(f"1-D spectral_summary cannot be reshaped to batch size {features.size(0)}")
-#                 s = s.reshape(features.size(0), -1)
-#             elif s.dim() > 4:
-#                 s = s.flatten(1)
-#             physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-#         if s.dim() != 2 or s.size(0) != features.size(0):
-#             raise RuntimeError(f"spectral_summary must resolve to [B,S], got {tuple(s.shape)}")
-#         s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-#         if s.size(1) == 0:
-#             physical = False
-#         return s, bool(physical)
-
-#     def _band_summary(self, spectral_summary: torch.Tensor, band_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-#         if band_weights is not None and torch.is_tensor(band_weights) and band_weights.numel() > 0:
-#             bw = band_weights.to(device=spectral_summary.device, dtype=spectral_summary.dtype)
-#             if bw.dim() == 2 and bw.size(0) == spectral_summary.size(0) and bw.size(1) == spectral_summary.size(1):
-#                 bw = torch.nan_to_num(bw, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-#                 denom = bw.sum(dim=1, keepdim=True)
-#                 if bool((denom > self.min_band_mass).all().item()):
-#                     return bw / denom.clamp_min(self.min_band_mass)
-#         b = spectral_summary.abs()
-#         denom = b.sum(dim=1, keepdim=True)
-#         uniform = torch.full_like(b, 1.0 / float(max(int(b.size(1)), 1)))
-#         b = torch.where(denom > self.min_band_mass, b / denom.clamp_min(self.min_band_mass), uniform)
-#         return b
-
-#     def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         """Backbone-only feature extraction. Does not touch GeometryBank/classifier."""
-#         if not torch.is_tensor(x):
-#             raise TypeError(f"x must be a torch.Tensor, got {type(x)}")
-#         out = self.backbone(x.to(self.device))
-#         if isinstance(out, dict):
-#             if "features" not in out:
-#                 raise RuntimeError("backbone output dict must contain key 'features'.")
-#             features = self._validate_feature_tensor(out["features"], "backbone.features", int(x.size(0)))
-#             result = dict(out)
-#             result["features"] = features
-#             result.setdefault("backbone_features", features)
-#             return result
-#         features = self._validate_feature_tensor(out, "backbone.features", int(x.size(0)))
-#         return {"features": features, "backbone_features": features}
+#             raise RuntimeError("geometry feature width changed")
+#         if not torch.is_tensor(spectra) or spectra.shape != (
+#             features.size(0),
+#             self.backbone.raw_num_bands,
+#         ):
+#             raise RuntimeError("raw_center_spectra shape is invalid")
+#         if not torch.is_tensor(purity) or purity.numel() != features.size(0):
+#             raise RuntimeError("spatial_purity shape is invalid")
+#         if not all(
+#             torch.isfinite(value).all()
+#             for value in (features, spectra, purity)
+#         ):
+#             raise RuntimeError("backbone output contains NaN/Inf")
+#         result["spatial_purity"] = purity.flatten().clamp(0.0, 1.0)
+#         if bool(self.geometry_bank.anchor_ready.item()):
+#             result["spectral_anchors"] = self.geometry_bank.encode_spectra(
+#                 spectra
+#             )
+#         return result
 
 #     def forward_features(
 #         self,
-#         x: torch.Tensor,
+#         inputs: Tensor,
+#         raw_spectral_patch: Optional[Tensor] = None,
 #         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         band_weights: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#         apply_adapter: Optional[bool] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Return projected geometry features.
-
-#         Important contract:
-#             - ``canonical_features`` are always the backbone/projection z-space
-#               used to build the base GeometryBank.
-#             - ``features`` / ``projected_features`` are the scoring features.
-#               They equal canonical z in base mode and become adapted z only when
-#               PG-RGA adapter routing is explicitly active.
-#         """
-#         raw = self.extract_features(x)
-#         h = self._validate_feature_tensor(raw["features"], "preproject_features", int(x.size(0)))
-#         z_canonical = self.norm(self.projection(h) + h)
-#         z_canonical = self._canonicalize(z_canonical, name="canonical_geometry_features")
-
-#         use_adapter = False if apply_adapter is None else bool(apply_adapter)
-#         z = z_canonical
-#         adapter_out: Optional[Dict[str, torch.Tensor]] = None
-#         if use_adapter:
-#             adapter_out = self.adapt_projected_features(
-#                 z_canonical,
-#                 force=(apply_adapter is True),
-#                 return_delta=True,
-#                 recanonicalize=True,
-#             )
-#             z = adapter_out["features"]
-
-#         s, physical = self._prepare_spectral_summary(
-#             x.to(self.device),
-#             z,
-#             spectral_summary=spectral_summary,
-#             spectral_summary_is_physical=spectral_summary_is_physical,
+#         deterministic: bool = True,
+#     ) -> Dict[str, Any]:
+#         inputs = inputs.to(self.device)
+#         raw = (
+#             None
+#             if raw_spectral_patch is None
+#             else raw_spectral_patch.to(self.device)
 #         )
-#         candidate_bw = band_weights if band_weights is not None else raw.get("band_weights", None)
-#         band = self._band_summary(s, candidate_bw)
-#         result = {
-#             "features": z,
-#             "projected_features": z,
-#             "geometry_features": z,
-#             "canonical_features": z_canonical,
-#             "canonical_projected_features": z_canonical,
-#             "pre_adapter_features": z_canonical,
-#             "preproject_features": h,
-#             "backbone_features": h,
-#             "spectral_summary": s,
-#             "spectral_summary_is_physical": torch.tensor(bool(physical), device=z.device, dtype=torch.bool),
-#             "band_summary": band,
-#             "band_importance": band,
-#             "band_weights": candidate_bw if torch.is_tensor(candidate_bw) else None,
-#             "spectral_features": raw.get("spectral_features", h),
-#             "spatial_features": raw.get("spatial_features", h),
-#         }
-#         if adapter_out is not None:
-#             result["adapter_delta"] = adapter_out["adapter_delta"]
-#             result["adapter_gate"] = adapter_out["adapter_gate"]
-#             result["adapter_active"] = adapter_out["adapter_active"]
-#         return result
+#         output = (
+#             self.backbone.forward_geometry(inputs, raw)
+#             if deterministic
+#             else self.backbone(inputs, raw)
+#         )
+#         return self._validate_output(output)
 
-#     # Compatibility aliases expected by existing trainers.
-#     def extract_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         # Projected features are canonical by contract.  Incremental scoring uses
-#         # the adapter only through forward(...)/extract_adapted_projected_features.
-#         kwargs = dict(kwargs)
-#         kwargs["apply_adapter"] = False
-#         return self.forward_features(x, **kwargs)
+#     extract_geometry_features = forward_features
 
-#     def extract_canonical_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         kwargs = dict(kwargs)
-#         kwargs["apply_adapter"] = False
-#         return self.forward_features(x, **kwargs)
-
-#     def extract_adapted_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         kwargs = dict(kwargs)
-#         kwargs["apply_adapter"] = True
-#         return self.forward_features(x, **kwargs)
-
-#     def extract_geometry_features(self, x: torch.Tensor, *, return_dict: bool = False, space: str = "canonical", **kwargs: Any):
-#         space_norm = str(space or "canonical").lower().strip()
-#         if space_norm in {"canonical", "pre_adapter", "base"}:
-#             out = self.extract_canonical_projected_features(x, **kwargs)
-#         elif space_norm in {"scoring", "adapted", "post_adapter"}:
-#             out = self.extract_adapted_projected_features(x, **kwargs)
-#         else:
-#             raise RuntimeError(f"Unsupported geometry feature space {space!r}; use canonical or scoring.")
-#         out["geometry_feature_space"] = "scoring" if space_norm in {"scoring", "adapted", "post_adapter"} else "canonical"
-#         return out if bool(return_dict) else out["features"]
+#     def create_reference_backbone(self) -> SSMBackbone:
+#         """Return a non-persistent frozen snapshot for one incremental phase."""
+#         if self.phase_mode != "incremental":
+#             raise RuntimeError(
+#                 "create_reference_backbone requires incremental mode"
+#             )
+#         reference = copy.deepcopy(self.backbone).to(self.device)
+#         reference.freeze_all()
+#         reference.eval()
+#         return reference
 
 #     @torch.no_grad()
-#     def extract_backbone_outputs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         return self.forward_features(x)
-
-#     # ------------------------------------------------------------------
-#     # Controlled geometry-gated adapter
-#     # ------------------------------------------------------------------
-#     def _adapter_runtime_enabled(self, *, force: bool = False) -> bool:
-#         return bool(
-#             getattr(self, "geometry_plastic_adapter", None) is not None
-#             and (bool(force) or (bool(getattr(self, "use_geometry_gated_adapter", False)) and bool(self.incremental_mode_active)))
-#         )
-
-#     def adapt_projected_features(
+#     def encode_reference(
 #         self,
-#         features: torch.Tensor,
-#         *,
-#         force: bool = False,
-#         return_delta: bool = True,
-#         recanonicalize: bool = True,
-#         **_: Any,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Apply the bounded adapter directly to canonical z-space features.
-
-#         This is required for synthetic old replay: replay samples already live
-#         in GeometryBank space and cannot pass through the backbone. The adapter
-#         must still see them so replay CE can close old-region gates.
-#         """
-#         z0 = self._validate_feature_tensor(features, "adapt_projected_features.features")
-#         if not self._adapter_runtime_enabled(force=force):
-#             zero_delta = torch.zeros_like(z0)
-#             zero_gate = torch.zeros((z0.size(0), 1), device=z0.device, dtype=z0.dtype)
-#             return {
-#                 "features": z0,
-#                 "projected_features": z0,
-#                 "geometry_features": z0,
-#                 "delta": zero_delta,
-#                 "gate": zero_gate,
-#                 "adapter_delta": zero_delta,
-#                 "adapter_gate": zero_gate,
-#                 "adapter_active": torch.tensor(False, device=z0.device),
-#             }
-#         raw = self.geometry_plastic_adapter(z0)
-#         z = raw["features"]
-#         if bool(recanonicalize):
-#             z = self._canonicalize(z, name="adapted_geometry_features")
-#         delta = z - z0
-#         gate = raw.get("gate", torch.zeros((z0.size(0), 1), device=z0.device, dtype=z0.dtype))
-#         return {
-#             "features": z,
-#             "projected_features": z,
-#             "geometry_features": z,
-#             "delta": delta,
-#             "gate": gate,
-#             "adapter_delta": delta,
-#             "adapter_gate": gate,
-#             "adapter_active": torch.tensor(True, device=z0.device),
-#         }
-
-#     # ------------------------------------------------------------------
-#     # Seen classes / bank helpers
-#     # ------------------------------------------------------------------
-#     def _infer_seen_classes(self, geometry_bank: Optional[Any] = None) -> List[int]:
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         if hasattr(bank_obj, "get_valid_mask"):
-#             valid = bank_obj.get_valid_mask().detach().cpu().flatten()
-#             return [int(i) for i in torch.nonzero(valid, as_tuple=False).flatten().tolist()]
-#         bank = bank_obj.get_bank() if hasattr(bank_obj, "get_bank") else bank_obj
-#         if not isinstance(bank, dict) or "sample_counts" not in bank:
-#             return list(self.seen_classes)
-#         counts = bank["sample_counts"].detach().cpu().flatten()
-#         return [int(i) for i in torch.nonzero(counts > 0, as_tuple=False).flatten().tolist()]
-
-#     def ensure_class_capacity(self, class_count: int, spectral_dim: int = 0, dtype: Optional[torch.dtype] = None) -> None:
-#         count = int(max(0, class_count))
-#         dtype = dtype or next(self.parameters()).dtype
-#         if hasattr(self.geometry_bank, "ensure_class_count"):
-#             self.geometry_bank.ensure_class_count(count, spectral_dim=int(spectral_dim), dtype=dtype)
-#         elif hasattr(self.geometry_bank, "ensure_num_classes"):
-#             self.geometry_bank.ensure_num_classes(count)
-#         self.current_num_classes = max(self.current_num_classes, count)
-
-#     def get_subspace_bank(self) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self.geometry_bank, "get_bank"):
-#             raise RuntimeError("GeometryBank must expose get_bank().")
-#         bank = self.geometry_bank.get_bank()
-#         if "variances" not in bank and "eigvals" in bank and "res_vars" in bank:
-#             bank = dict(bank)
-#             bank["variances"] = torch.cat([bank["eigvals"], bank["res_vars"].unsqueeze(-1)], dim=-1)
-#         if "resvars" not in bank and "res_vars" in bank:
-#             bank = dict(bank)
-#             bank["resvars"] = bank["res_vars"]
-#         return bank
-
-#     def get_old_subspace_bank(self, old_class_count: Optional[int] = None) -> Dict[str, torch.Tensor]:
-#         old = int(self.old_class_count if old_class_count is None else old_class_count)
-#         bank = self.get_subspace_bank()
-#         old = max(0, min(old, int(bank["means"].size(0))))
-#         out = {}
-#         for k, v in bank.items():
-#             if torch.is_tensor(v) and v.dim() > 0 and v.size(0) >= old:
-#                 out[k] = v[:old]
-#         return out
-
-#     # ------------------------------------------------------------------
-#     # Classifier routing
-#     # ------------------------------------------------------------------
-#     def forward_classifier(
-#         self,
-#         features: torch.Tensor,
-#         seen_classes: Iterable[int],
-#         mode: str = "geometry",
-#         *,
-#         geometry_bank: Optional[Any] = None,
-#         targets: Optional[torch.Tensor] = None,
-#         targets_are_global: bool = False,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
-#         return_energy: bool = False,
-#         return_parts: bool = False,
-#         return_diagnostics: bool = False,
-#     ):
-#         return self.compute_logits_from_features(
-#             features=features,
-#             seen_classes=seen_classes,
-#             geometry_bank=geometry_bank,
-#             mode=mode,
-#             targets=targets,
-#             targets_are_global=targets_are_global,
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             return_energy=return_energy,
-#             return_parts=return_parts,
-#             return_diagnostics=return_diagnostics,
+#         reference_backbone: SSMBackbone,
+#         inputs: Tensor,
+#         raw_spectral_patch: Optional[Tensor] = None,
+#     ) -> Dict[str, Any]:
+#         output = reference_backbone.forward_geometry(
+#             inputs.to(self.device),
+#             None
+#             if raw_spectral_patch is None
+#             else raw_spectral_patch.to(self.device),
 #         )
+#         return self._validate_output(output)
+
+#     # ------------------------------------------------------------------
+#     # Classifier interface
+#     # ------------------------------------------------------------------
+#     def infer_seen_classes(self) -> List[int]:
+#         valid = self.geometry_bank.valid_mask()
+#         return torch.nonzero(
+#             valid.detach().cpu().bool(), as_tuple=False
+#         ).flatten().tolist()
 
 #     def compute_logits_from_features(
 #         self,
-#         features: torch.Tensor,
-#         seen_classes: Optional[Iterable[int]] = None,
-#         geometry_bank: Optional[Any] = None,
-#         mode: str = "geometry",
+#         features: Tensor,
 #         *,
-#         classifier_mode: Optional[str] = None,
-#         targets: Optional[torch.Tensor] = None,
+#         seen_classes: Sequence[int],
+#         raw_spectra: Optional[Tensor] = None,
+#         spectral_anchors: Optional[Tensor] = None,
+#         temporary_rows: Optional[Mapping[int, Mapping[str, Any]]] = None,
+#         targets: Optional[Tensor] = None,
 #         targets_are_global: bool = False,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
+#         old_classes: Optional[Sequence[int]] = None,
+#         new_classes: Optional[Sequence[int]] = None,
+#         mode: str = "spectral_conditioned_joint",
 #         return_energy: bool = False,
 #         return_parts: bool = False,
 #         return_diagnostics: bool = False,
-#         **_: Any,
-#     ):
-#         features = self._validate_feature_tensor(features, "compute_logits_from_features.features")
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         seen = _ordered_unique_ints(seen_classes if seen_classes is not None else self._infer_seen_classes(bank_obj))
-#         if not seen:
-#             raise RuntimeError("seen_classes is empty. Build GeometryBank rows or pass seen_classes explicitly.")
-#         mode_norm = _normalize_classifier_mode(classifier_mode if classifier_mode is not None else mode, "geometry")
-#         self.assert_phase_ready(seen, mode=mode_norm, require_geometry=True)
-#         out = self.classifier(
+#     ) -> Union[Tensor, Dict[str, Any]]:
+#         return self.classifier(
 #             features,
-#             seen_classes=seen,
-#             geometry_bank=bank_obj,
-#             mode=mode_norm,
-#             targets=targets,
-#             targets_are_global=bool(targets_are_global),
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             old_class_count=int(self.old_class_count),
-#             return_energy=return_energy,
-#             return_parts=return_parts,
-#             return_diagnostics=return_diagnostics,
-#         )
-#         logits = out["logits"] if isinstance(out, dict) else out
-#         self.classifier.assert_logits_valid(
-#             logits,
-#             seen_classes=seen,
-#             targets=(self.classifier.global_to_local_labels(targets, seen) if targets is not None and targets_are_global else targets),
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             context="NECILModel.compute_logits_from_features",
-#         )
-#         self.current_num_classes = max(self.current_num_classes, max(seen) + 1)
-#         self.seen_classes = list(seen)
-#         return out
-
-#     def compute_energy_from_features(self, features: torch.Tensor, seen_classes: Optional[Iterable[int]] = None, **kwargs: Any):
-#         out = self.compute_logits_from_features(features, seen_classes=seen_classes, return_energy=True, **kwargs)
-#         if not isinstance(out, dict) or "energy" not in out:
-#             raise RuntimeError("Expected dict with energy from compute_logits_from_features(return_energy=True).")
-#         return out["energy"]
-
-#     # ------------------------------------------------------------------
-#     # Geometry refresh / memory snapshots
-#     # ------------------------------------------------------------------
-#     @torch.no_grad()
-#     def refresh_geometry_for_classes(
-#         self,
-#         class_ids: Iterable[int],
-#         features: torch.Tensor,
-#         labels: torch.Tensor,
-#         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         band_weights: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: bool = False,
-#         phase_created: Optional[int] = None,
-#         freeze_after: bool = False,
-#     ) -> Dict[str, Any]:
-#         features = self._validate_feature_tensor(features, "refresh_geometry_for_classes.features")
-#         labels = labels.to(device=features.device).long().flatten()
-#         ids = _ordered_unique_ints(class_ids)
-#         if labels.numel() != features.size(0):
-#             raise RuntimeError("labels/features batch mismatch in refresh_geometry_for_classes")
-#         bad = sorted(set(int(v) for v in torch.unique(labels).detach().cpu().tolist()).difference(set(ids)))
-#         if bad:
-#             raise RuntimeError(f"labels contain classes outside requested refresh ids: bad={bad}, class_ids={ids}")
-#         band_dim = 0
-#         if spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0:
-#             band_dim = int(spectral_summary.reshape(features.size(0), -1).size(1))
-#         elif band_weights is not None and torch.is_tensor(band_weights) and band_weights.numel() > 0:
-#             band_dim = int(band_weights.reshape(features.size(0), -1).size(1))
-#         self.ensure_class_capacity(max(ids) + 1 if ids else 0, spectral_dim=band_dim, dtype=features.dtype)
-#         rows = self.geometry_bank.extract_geometry(
-#             features,
-#             labels,
-#             spectral_summary=spectral_summary,
-#             band_weights=band_weights,
-#             spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#         )
-#         committed: List[int] = []
-#         for c in ids:
-#             if c not in rows:
-#                 raise RuntimeError(f"No geometry could be extracted for class {c}.")
-#             row = rows[c]
-#             self.geometry_bank.add_or_update_class_geometry(
-#                 c,
-#                 mean=row["mean"],
-#                 basis=row["basis"],
-#                 eigvals=row["eigvals"],
-#                 res_var=row["res_var"],
-#                 spectral_prototype=row.get("spectral_prototype"),
-#                 band_importance=row.get("band_importance"),
-#                 sample_count=row.get("sample_count"),
-#                 active_rank=row.get("active_rank"),
-#                 reliability=row.get("reliability"),
-#                 feature_reliability=row.get("feature_reliability"),
-#                 band_reliability=row.get("band_reliability"),
-#                 spectral_reliability=row.get("spectral_reliability"),
-#                 phase_created=int(self.current_phase if phase_created is None else phase_created),
-#                 allow_frozen_update=False,
-#             )
-#             committed.append(c)
-#         if bool(freeze_after):
-#             self.freeze_classes(committed)
-#         self.geometry_bank.assert_bank_valid(seen_classes=committed, strict=True)
-#         self.current_num_classes = max(self.current_num_classes, max(committed) + 1 if committed else self.current_num_classes)
-#         return {"committed_class_ids": committed, "phase_created": int(self.current_phase if phase_created is None else phase_created)}
-
-#     @torch.no_grad()
-#     def refresh_class_subspace(self, cls: int, mean: torch.Tensor, basis: torch.Tensor, eigvals: torch.Tensor, res_var: Optional[torch.Tensor] = None, resvar: Optional[torch.Tensor] = None, **kwargs: Any) -> None:
-#         rv = res_var if res_var is not None else resvar
-#         if rv is None:
-#             raise ValueError("refresh_class_subspace requires res_var/resvar.")
-#         c = int(cls)
-#         self.ensure_class_capacity(c + 1)
-#         self.geometry_bank.add_or_update_class_geometry(
-#             c,
-#             mean=mean,
-#             basis=basis,
-#             eigvals=eigvals,
-#             res_var=rv,
-#             spectral_prototype=kwargs.get("spectral_prototype", kwargs.get("spectral_proto", None)),
-#             band_importance=kwargs.get("band_importance", None),
-#             sample_count=kwargs.get("sample_count", None),
-#             active_rank=kwargs.get("active_rank", None),
-#             reliability=kwargs.get("reliability", None),
-#             feature_reliability=kwargs.get("feature_reliability", None),
-#             band_reliability=kwargs.get("band_reliability", None),
-#             phase_created=kwargs.get("phase_created", self.current_phase),
-#             allow_frozen_update=bool(kwargs.get("allow_frozen_update", False)),
-#         )
-
-#     @torch.no_grad()
-#     def export_memory_snapshot(self) -> Dict[str, Any]:
-#         snap = self.geometry_bank.export_snapshot()
-#         snap.update(
-#             {
-#                 "current_phase": int(self.current_phase),
-#                 "old_class_count": int(self.old_class_count),
-#                 "current_num_classes": int(self.current_num_classes),
-#                 "seen_classes": list(self.seen_classes),
-#                 "feature_contract": self.feature_contract(),
-#             }
-#         )
-#         return snap
-
-#     @torch.no_grad()
-#     def load_memory_snapshot(self, snapshot: Dict[str, Any], strict: bool = True) -> None:
-#         if not snapshot:
-#             if strict:
-#                 raise ValueError("empty memory snapshot")
-#             return
-#         self._assert_snapshot_feature_contract(snapshot, strict=strict)
-#         self.geometry_bank.load_snapshot(snapshot, strict=strict)
-#         self.current_phase = int(snapshot.get("current_phase", self.current_phase))
-#         self.old_class_count = int(snapshot.get("old_class_count", self.old_class_count))
-#         self.current_num_classes = int(snapshot.get("current_num_classes", len(self.geometry_bank)))
-#         self.seen_classes = [int(c) for c in snapshot.get("seen_classes", self._infer_seen_classes())]
-
-#     def feature_contract(self) -> Dict[str, Any]:
-#         return {
-#             "d_model": int(self.d_model),
-#             "subspace_rank": int(self.subspace_rank),
-#             "normalize_geometry_features": bool(self.normalize_geometry_features),
-#             "geometry_feature_scale": float(self.geometry_feature_scale),
-#             "spectral_summary_mode": str(self.spectral_summary_mode),
-#             "classifier_contract": "logits[B,len(seen_classes)]",
-#             "incremental_update_mode": str(self.incremental_update_mode),
-#             "geometry_gated_adapter_available": hasattr(self, "geometry_plastic_adapter"),
-#             "geometry_gated_adapter_enabled": bool(self.use_geometry_gated_adapter),
-#             "semantic_encoder_enabled": False,
-#             "concept_encoder_enabled": False,
-#         }
-
-#     def _assert_snapshot_feature_contract(self, snapshot: Dict[str, Any], *, strict: bool) -> None:
-#         if not strict:
-#             return
-#         old = snapshot.get("feature_contract", snapshot.get("geometry_feature_contract", None))
-#         if not isinstance(old, dict):
-#             return
-#         cur = self.feature_contract()
-#         mismatches = []
-#         for k in ("d_model", "subspace_rank", "normalize_geometry_features", "spectral_summary_mode"):
-#             if k in old and old[k] != cur[k]:
-#                 mismatches.append(f"{k}: snapshot={old[k]!r}, current={cur[k]!r}")
-#         if "geometry_feature_scale" in old and abs(float(old["geometry_feature_scale"]) - float(cur["geometry_feature_scale"])) > 1e-6:
-#             mismatches.append(f"geometry_feature_scale: snapshot={old['geometry_feature_scale']!r}, current={cur['geometry_feature_scale']!r}")
-#         if mismatches:
-#             raise RuntimeError("Memory snapshot was built under a different feature contract: " + "; ".join(mismatches))
-
-#     # ------------------------------------------------------------------
-#     # Freezing / phase modes
-#     # ------------------------------------------------------------------
-#     def _set_requires_grad(self, module: Optional[nn.Module], value: bool) -> None:
-#         if module is None:
-#             return
-#         for p in module.parameters():
-#             p.requires_grad = bool(value)
-
-#     def freeze_backbone_except_allowed(self, *, allow_last_blocks: bool = False, allow_projection: bool = False, allow_norm: Optional[bool] = None) -> None:
-#         self._set_requires_grad(self.backbone, False)
-#         if bool(allow_last_blocks) and hasattr(self.backbone, "get_last_blocks"):
-#             for block in self.backbone.get_last_blocks():
-#                 self._set_requires_grad(block, True)
-#         self._set_requires_grad(self.projection, bool(allow_projection))
-#         self._set_requires_grad(self.norm, bool(allow_projection if allow_norm is None else allow_norm))
-
-#     def freeze_backbone_only(self) -> None:
-#         self._set_requires_grad(self.backbone, False)
-
-#     def unfreeze_backbone(self) -> None:
-#         self._set_requires_grad(self.backbone, True)
-
-#     def freeze_projection_head(self) -> None:
-#         self._set_requires_grad(self.projection, False)
-#         self._set_requires_grad(self.norm, False)
-
-#     def unfreeze_projection_head(self) -> None:
-#         self._set_requires_grad(self.projection, True)
-#         self._set_requires_grad(self.norm, True)
-
-#     def freeze_semantic_encoder(self) -> None:
-#         self._set_requires_grad(self.semantic_encoder, False)
-#         self._set_requires_grad(self.concept_encoder, False)
-
-#     def freeze_classifier(self) -> None:
-#         self._set_requires_grad(self.classifier, False)
-
-#     def unfreeze_classifier(self) -> None:
-#         self._set_requires_grad(self.classifier, True)
-
-#     def freeze_classes(self, class_ids_or_count: Iterable[int] | int) -> None:
-#         # GeometryBank.freeze_classes expects an iterable; freeze_classes_up_to
-#         # expects a count. Keep both contracts explicit to avoid treating an int
-#         # as an iterable during base handoff.
-#         if isinstance(class_ids_or_count, int):
-#             count = int(max(0, class_ids_or_count))
-#             if hasattr(self.geometry_bank, "freeze_classes_up_to"):
-#                 self.geometry_bank.freeze_classes_up_to(count)
-#             elif hasattr(self.geometry_bank, "freeze_classes"):
-#                 self.geometry_bank.freeze_classes(range(count))
-#             return
-#         ids = _ordered_unique_ints(class_ids_or_count)
-#         if hasattr(self.geometry_bank, "freeze_classes"):
-#             self.geometry_bank.freeze_classes(ids)
-#         elif hasattr(self.geometry_bank, "freeze_classes_up_to"):
-#             count = max(ids) + 1 if ids else 0
-#             self.geometry_bank.freeze_classes_up_to(count)
-
-#     def freeze_old_geometry_states(self, old_class_count: Optional[Any] = None) -> None:
-#         """Freeze old GeometryBank rows without assuming a hidden update.
-
-#         ``old_class_count`` may be an int count for the standard sequential IP/HC
-#         protocol or an explicit iterable of global class IDs.
-#         """
-#         if old_class_count is None:
-#             old = int(self.old_class_count)
-#             self.freeze_classes(range(old))
-#             return
-#         if isinstance(old_class_count, int):
-#             old = int(max(0, old_class_count))
-#             self.old_class_count = old
-#             self.freeze_classes(range(old))
-#             return
-#         ids = _ordered_unique_ints(old_class_count)
-#         self.old_class_count = len(ids)
-#         self.freeze_classes(ids)
-
-#     def freeze_base_ce_head(self) -> None:
-#         self._set_requires_grad(self.base_ce_head, False)
-
-#     def unfreeze_base_ce_head(self) -> None:
-#         self._set_requires_grad(self.base_ce_head, True)
-
-#     def set_base_mode(self, *, train_backbone: bool = True, train_projection: bool = True) -> None:
-#         self.current_phase = 0
-#         self.old_class_count = 0
-#         self.base_mode_active = True
-#         self.incremental_mode_active = False
-#         self.train()
-#         self._set_requires_grad(self.backbone, bool(train_backbone))
-#         self._set_requires_grad(self.projection, bool(train_projection))
-#         self._set_requires_grad(self.norm, bool(train_projection))
-#         self.freeze_semantic_encoder()
-#         self.freeze_classifier()
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), False)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.eval()
-#         if self.base_ce_head is not None:
-#             self.unfreeze_base_ce_head()
-
-#     def set_incremental_mode(
-#         self,
-#         *,
-#         phase: Optional[int] = None,
-#         old_class_count: Optional[int] = None,
-#         old_classes: Optional[Iterable[int]] = None,
-#         train_classifier_calibration: bool = False,
-#         train_geometry_adapter: Optional[bool] = None,
-#     ) -> None:
-#         if phase is not None:
-#             self.current_phase = int(phase)
-#         if old_class_count is not None:
-#             self.old_class_count = int(old_class_count)
-#         self.base_mode_active = False
-#         self.incremental_mode_active = True
-
-#         # Freeze backbone/projection and put them in eval mode to kill dropout.
-#         self.freeze_backbone_except_allowed(allow_last_blocks=False, allow_projection=False)
-#         self.backbone.eval()
-#         self.projection.eval()
-#         self.norm.eval()
-#         self.freeze_semantic_encoder()
-#         self.freeze_base_ce_head()
-#         self.freeze_old_geometry_states(old_classes if old_classes is not None else self.old_class_count)
-
-#         if bool(train_classifier_calibration):
-#             # Only classifier calibration parameters may be trainable if enabled.
-#             self.unfreeze_classifier()
-#         else:
-#             self.freeze_classifier()
-#         # PG-RGA main path: train only the bounded residual geometry adapter.
-#         # Descriptor-only/frozen ablations keep it disabled.
-#         if train_geometry_adapter is None:
-#             train_geometry_adapter = bool(self.use_geometry_gated_adapter)
-#         if bool(train_geometry_adapter):
-#             self.unfreeze_geometry_plastic_adapter()
-#         else:
-#             self.freeze_geometry_plastic_adapter()
-#         self._incremental_frozen_modules = ["backbone", "projection", "norm", "semantic_encoder", "concept_encoder"]
-
-#     def assert_frozen_modules(self) -> None:
-#         modules = {
-#             "backbone": self.backbone,
-#             "projection": self.projection,
-#             "norm": self.norm,
-#             "semantic_encoder": self.semantic_encoder,
-#             "concept_encoder": self.concept_encoder,
-#         }
-#         bad_req: List[str] = []
-#         bad_grad: List[str] = []
-#         for prefix, module in modules.items():
-#             if module is None:
-#                 continue
-#             for name, p in module.named_parameters():
-#                 full = f"{prefix}.{name}"
-#                 if p.requires_grad:
-#                     bad_req.append(full)
-#                 if p.grad is not None and torch.is_tensor(p.grad) and float(p.grad.detach().abs().sum().cpu().item()) != 0.0:
-#                     bad_grad.append(full)
-#         if bad_req:
-#             raise RuntimeError(f"Frozen modules still have requires_grad=True: {bad_req[:20]}")
-#         if bad_grad:
-#             raise RuntimeError(f"Frozen modules have nonzero gradients: {bad_grad[:20]}")
-
-#     # Legacy aliases kept safe, but routed to the bounded geometry adapter when
-#     # the explicit geometry_gated_adapter ablation is selected.
-#     def freeze_incremental_adapter(self) -> None:
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), False)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.eval()
-
-#     def unfreeze_incremental_adapter(self) -> None:
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), True)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.train()
-
-#     def disable_incremental_adapter(self) -> None:
-#         self.use_incremental_adapter = False
-#         self.freeze_incremental_adapter()
-
-#     def enable_incremental_adapter(self) -> None:
-#         self.use_geometry_gated_adapter = True
-#         self.unfreeze_incremental_adapter()
-
-#     def freeze_geometry_plastic_adapter(self) -> None:
-#         self.freeze_incremental_adapter()
-
-#     def unfreeze_geometry_plastic_adapter(self) -> None:
-#         self.use_geometry_gated_adapter = True
-#         self.unfreeze_incremental_adapter()
-
-#     def adaptive_boundary_parameters(self) -> List[nn.Parameter]:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "boundary_parameters"):
-#             return list(clf.boundary_parameters())
-#         return []
-
-#     def ensure_adaptive_boundary_capacity(self, class_count: int) -> None:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "ensure_class_capacity"):
-#             try:
-#                 clf.ensure_class_capacity(int(class_count))
-#             except TypeError:
-#                 pass
-#         if clf is not None and hasattr(clf, "expand_to_seen_classes"):
-#             try:
-#                 clf.expand_to_seen_classes(list(range(int(class_count))))
-#             except TypeError:
-#                 pass
-
-#     def adaptive_boundary_state(self, old_class_count: int = 0) -> Dict[str, float]:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "adaptive_boundary_state"):
-#             try:
-#                 return {k: float(v) for k, v in clf.adaptive_boundary_state(old_class_count=int(old_class_count)).items()}
-#             except TypeError:
-#                 try:
-#                     return {k: float(v) for k, v in clf.adaptive_boundary_state(int(old_class_count)).items()}
-#                 except Exception:
-#                     pass
-#         return {"old_class_count": float(old_class_count), "adaptive_boundary_available": float(bool(clf is not None and hasattr(clf, "boundary_parameters")))}
-
-#     def freeze_geometry_calibrator(self) -> None: self.use_geometry_calibrator = False
-#     def unfreeze_geometry_calibrator(self) -> None:
-#         raise RuntimeError("Legacy geometry calibrator is disabled in the clean NECILModel.")
-#     def freeze_energy_calibrator(self) -> None:
-#         if hasattr(self.classifier, "freeze_all_adaptation"):
-#             self.classifier.freeze_all_adaptation()
-#     def unfreeze_energy_calibrator(self) -> None:
-#         raise RuntimeError("Energy/logit calibration is disabled in the clean PG-RGA model.")
-
-#     # ------------------------------------------------------------------
-#     # Base CE head
-#     # ------------------------------------------------------------------
-#     def ensure_base_ce_head(self, num_base_classes: int, feature_dim: Optional[int] = None) -> nn.Linear:
-#         num_base_classes = int(num_base_classes)
-#         feature_dim = int(feature_dim or self.d_model)
-#         if feature_dim != self.d_model:
-#             raise RuntimeError(f"base CE head feature_dim must equal d_model={self.d_model}, got {feature_dim}")
-#         if self.base_ce_head is None or self.base_ce_num_classes != num_base_classes:
-#             self.base_ce_head = nn.Linear(self.d_model, num_base_classes).to(self.device)
-#             nn.init.normal_(self.base_ce_head.weight, mean=0.0, std=0.01)
-#             nn.init.zeros_(self.base_ce_head.bias)
-#             self.base_ce_num_classes = num_base_classes
-#         return self.base_ce_head
-
-#     def base_ce_logits(self, features: torch.Tensor, num_base_classes: Optional[int] = None) -> torch.Tensor:
-#         features = self._validate_feature_tensor(features, "base_ce_logits.features")
-#         if self.base_ce_head is None:
-#             if num_base_classes is None:
-#                 raise RuntimeError("base_ce_head is not initialized.")
-#             self.ensure_base_ce_head(int(num_base_classes))
-#         logits = self.base_ce_head(features)
-#         if logits.dim() != 2 or logits.size(0) != features.size(0):
-#             raise RuntimeError("base_ce_head returned invalid logits")
-#         return logits
-
-#     def forward_base_ce(self, x: torch.Tensor, num_base_classes: int, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         out = self.forward_features(
-#             x,
-#             spectral_summary=kwargs.get("spectral_summary", None),
-#             band_weights=kwargs.get("band_weights", None),
-#             spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical", None),
-#         )
-#         logits = self.base_ce_logits(out["features"], num_base_classes=int(num_base_classes))
-#         out = dict(out)
-#         out["base_logits"] = logits
-#         out["logits"] = logits
-#         return out
-
-#     def drop_base_ce_head(self) -> None:
-#         self.base_ce_head = None
-#         self.base_ce_num_classes = 0
-
-#     # PRL aliases from older trainer code.
-#     ensure_base_prl_head = ensure_base_ce_head
-#     base_prl_logits = base_ce_logits
-#     def drop_base_prl_head(self) -> None: self.drop_base_ce_head()
-#     def freeze_base_prl_head(self) -> None: self.freeze_base_ce_head()
-#     def unfreeze_base_prl_head(self) -> None: self.unfreeze_base_ce_head()
-
-#     def train(self, mode: bool = True):  # type: ignore[override]
-#         super().train(mode)
-#         if bool(getattr(self, "incremental_mode_active", False)):
-#             # Frozen feature modules must remain deterministic during adapter
-#             # training. Calling model.train() from the trainer should not turn
-#             # dropout/batch statistics back on for backbone/projection.
-#             self.backbone.eval()
-#             self.projection.eval()
-#             self.norm.eval()
-#             if getattr(self, "geometry_plastic_adapter", None) is not None:
-#                 self.geometry_plastic_adapter.train(mode and _module_has_trainable_params(self.geometry_plastic_adapter))
-#         return self
-
-
-#     # ------------------------------------------------------------------
-#     # PG-RGA helper APIs used by the incremental trainer
-#     # ------------------------------------------------------------------
-#     @torch.no_grad()
-#     def sample_geometry_replay(
-#         self,
-#         class_ids: Iterable[int],
-#         samples_per_class: int | Mapping[int, int] = 16,
-#         *,
-#         seen_classes: Optional[Iterable[int]] = None,
-#         label_to_local: Optional[Mapping[int, int]] = None,
-#         parallel_scale: float = 1.0,
-#         residual_scale: float = 0.25,
-#         reliability_gated: bool = True,
-#     ) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self.geometry_bank, "sample_replay"):
-#             raise RuntimeError("GeometryBank must expose sample_replay for PG-RGA old geometry replay.")
-#         return self.geometry_bank.sample_replay(
-#             class_ids,
-#             samples_per_class=samples_per_class,
-#             seen_classes=seen_classes,
-#             label_to_local=label_to_local,
-#             parallel_scale=float(parallel_scale),
-#             residual_scale=float(residual_scale),
-#             reliability_gated=bool(reliability_gated),
-#         )
-
-#     def compute_old_geometry_risk_features(
-#         self,
-#         features: torch.Tensor,
-#         *,
-#         old_class_count: Optional[int] = None,
-#         geometry_bank: Optional[Any] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         z = self._validate_feature_tensor(features, "compute_old_geometry_risk_features.features")
-#         old = int(self.old_class_count if old_class_count is None else old_class_count)
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         bank = bank_obj.get_bank() if hasattr(bank_obj, "get_bank") else bank_obj
-#         if not hasattr(self.classifier, "old_geometry_risk_features_from_bank"):
-#             raise RuntimeError("Classifier must expose old_geometry_risk_features_from_bank for PG-RGA gating.")
-#         return self.classifier.old_geometry_risk_features_from_bank(z, bank, old_class_count=old)
-
-#     @torch.no_grad()
-#     def assert_base_handoff_ready(self, base_class_ids: Iterable[int], *, freeze: bool = True, strict: bool = True) -> Dict[str, Any]:
-#         ids = _ordered_unique_ints(base_class_ids)
-#         if hasattr(self.geometry_bank, "assert_phase0_base_handoff_ready"):
-#             result = self.geometry_bank.assert_phase0_base_handoff_ready(ids, freeze=bool(freeze), strict=bool(strict))
-#         else:
-#             if bool(freeze):
-#                 self.freeze_classes(ids)
-#             result = self.geometry_bank.assert_bank_valid(seen_classes=ids, strict=bool(strict))
-#         self.old_class_count = len(ids)
-#         self.current_num_classes = max(self.current_num_classes, max(ids) + 1 if ids else 0)
-#         self.seen_classes = list(ids)
-#         return result
-
-#     def assert_pg_rga_contract(self, seen_classes: Iterable[int], *, phase: str = "base") -> None:
-#         seen = _ordered_unique_ints(seen_classes)
-#         self.assert_phase_ready(seen, mode="geometry", require_geometry=True)
-#         if str(phase).lower().startswith("base"):
-#             if self.incremental_mode_active:
-#                 raise RuntimeError("Base contract violation: incremental_mode_active=True during base phase.")
-#             if _module_has_trainable_params(self.geometry_plastic_adapter):
-#                 raise RuntimeError("Base contract violation: geometry_plastic_adapter is trainable during base phase.")
-#         else:
-#             self.assert_frozen_modules()
-#             if self.use_geometry_gated_adapter and not _module_has_trainable_params(self.geometry_plastic_adapter):
-#                 raise RuntimeError("PG-RGA incremental contract violation: geometry_plastic_adapter is not trainable.")
-
-#     # ------------------------------------------------------------------
-#     # Assertions
-#     # ------------------------------------------------------------------
-#     def assert_phase_ready(self, seen_classes: Iterable[int], *, mode: str = "geometry", require_geometry: bool = True) -> None:
-#         seen = _ordered_unique_ints(seen_classes)
-#         if not seen:
-#             raise RuntimeError("seen_classes is empty.")
-#         if self.geometry_bank.d_model != self.d_model:
-#             raise RuntimeError(f"GeometryBank d_model={self.geometry_bank.d_model} != model d_model={self.d_model}")
-#         if _normalize_classifier_mode(mode, "geometry") in {"geometry", "calibrated_geometry"} and require_geometry:
-#             if hasattr(self.geometry_bank, "assert_bank_valid"):
-#                 self.geometry_bank.assert_bank_valid(seen_classes=seen, strict=True)
-#             else:
-#                 bank = self.get_subspace_bank()
-#                 missing = [c for c in seen if c >= bank["sample_counts"].numel() or float(bank["sample_counts"][c].item()) <= 0.0]
-#                 if missing:
-#                     raise RuntimeError(f"Missing class geometry for seen classes: {missing}")
-#         if self.incremental_mode_active:
-#             # In incremental mode, frozen feature modules must stay eval to avoid dropout drift.
-#             bad_train = []
-#             for name in ("backbone", "projection"):
-#                 m = getattr(self, name)
-#                 if m.training:
-#                     bad_train.append(name)
-#             if bad_train:
-#                 raise RuntimeError(f"Incremental frozen modules must be eval(), but these are train(): {bad_train}")
-#         self.classifier.expand_to_seen_classes(seen)
-
-#     def assert_no_missing_class_geometry(self, seen_classes: Iterable[int]) -> None:
-#         if hasattr(self.geometry_bank, "assert_bank_valid"):
-#             self.geometry_bank.assert_bank_valid(seen_classes=seen_classes, strict=True)
-
-
-#     def assert_method_identity(self) -> None:
-#         """Hard runtime check used by main.py/trainer.py."""
-#         if self.incremental_update_mode != "geometry_gated_adapter":
-#             raise RuntimeError(f"Unexpected incremental_update_mode={self.incremental_update_mode!r}")
-#         if not hasattr(self, "geometry_plastic_adapter"):
-#             raise RuntimeError("PG-RGA model missing geometry_plastic_adapter.")
-#         if bool(getattr(self, "use_geometry_transport", False)) or bool(getattr(self, "use_sglat_transport", False)):
-#             raise RuntimeError("Transport is disabled in the PG-RGA main model.")
-#         if bool(getattr(self, "use_geometry_calibrator", False)):
-#             raise RuntimeError("Geometry/logit calibrator is disabled in the PG-RGA main model.")
-#         if bool(getattr(self, "use_incremental_adapter", False)):
-#             raise RuntimeError("Legacy incremental_adapter must remain disabled; use geometry_plastic_adapter only.")
-
-#     # ------------------------------------------------------------------
-#     # Forward
-#     # ------------------------------------------------------------------
-#     def forward(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-#         mode = _normalize_classifier_mode(kwargs.get("classifier_mode", kwargs.get("mode", "geometry")), "geometry")
-#         return_features_only = _to_bool(kwargs.get("return_features_only", False), False)
-#         seen_classes = kwargs.get("seen_classes", None)
-#         old_classes = kwargs.get("old_classes", None)
-#         new_classes = kwargs.get("new_classes", None)
-#         targets = kwargs.get("targets", kwargs.get("labels", None))
-#         targets_are_global = _to_bool(kwargs.get("targets_are_global", kwargs.get("labels_are_global", False)), False)
-#         return_energy = _to_bool(kwargs.get("return_energy", False), False)
-#         return_parts = _to_bool(kwargs.get("return_parts", False), False)
-#         return_diagnostics = _to_bool(kwargs.get("return_diagnostics", False), False)
-
-#         apply_adapter = kwargs.get("apply_adapter", None)
-#         if mode == "base_ce":
-#             apply_adapter = False
-#         elif apply_adapter is None:
-#             apply_adapter = bool(self._adapter_runtime_enabled(force=False))
-#         features_out = self.forward_features(
-#             x,
-#             spectral_summary=kwargs.get("spectral_summary", None),
-#             band_weights=kwargs.get("band_weights", None),
-#             spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical", None),
-#             apply_adapter=apply_adapter,
-#         )
-#         if return_features_only or mode == "base_ce":
-#             if mode == "base_ce" or "num_base_classes" in kwargs:
-#                 nbase = int(kwargs.get("num_base_classes", self.base_ce_num_classes))
-#                 if nbase <= 0:
-#                     raise RuntimeError("num_base_classes is required for base_ce mode.")
-#                 features_out = dict(features_out)
-#                 features_out["logits"] = self.base_ce_logits(features_out["features"], nbase)
-#             return features_out
-
-#         if seen_classes is None:
-#             seen_classes = self._infer_seen_classes(self.geometry_bank)
-#         logits_out = self.compute_logits_from_features(
-#             features_out["features"],
-#             seen_classes=seen_classes,
 #             geometry_bank=self.geometry_bank,
-#             mode=mode,
+#             seen_classes=seen_classes,
+#             raw_spectra=raw_spectra,
+#             spectral_anchors=spectral_anchors,
+#             temporary_rows=temporary_rows,
 #             targets=targets,
 #             targets_are_global=targets_are_global,
 #             old_classes=old_classes,
 #             new_classes=new_classes,
+#             mode=mode,
 #             return_energy=return_energy,
 #             return_parts=return_parts,
 #             return_diagnostics=return_diagnostics,
 #         )
-#         out: Dict[str, Any] = dict(features_out)
-#         if isinstance(logits_out, dict):
-#             out.update(logits_out)
-#         else:
-#             out["logits"] = logits_out
-#         return out
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-
-# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-
-# import inspect
-# import math
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
-# from models.backbone import SSMBackbone
-# from models.geometry_bank import GeometryBank
-# from models.classifier import GeometryEnergyClassifier
-
-
-# def _to_bool(value: Any, default: bool = False) -> bool:
-#     if value is None:
-#         return bool(default)
-#     if isinstance(value, bool):
-#         return value
-#     if isinstance(value, (int, float)):
-#         return bool(value)
-#     if isinstance(value, str):
-#         v = value.strip().lower()
-#         if v in {"1", "true", "yes", "y", "on"}:
-#             return True
-#         if v in {"0", "false", "no", "n", "off", "none", "null", ""}:
-#             return False
-#     return bool(value)
-
-
-# def _filter_supported_kwargs(cls_or_fn: Any, kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-#     try:
-#         sig = inspect.signature(cls_or_fn)
-#     except (TypeError, ValueError):
-#         return dict(kwargs)
-#     if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-#         return dict(kwargs)
-#     allowed = set(sig.parameters.keys())
-#     allowed.discard("self")
-#     return {k: v for k, v in kwargs.items() if k in allowed}
-
-
-# def _ordered_unique_ints(values: Iterable[int]) -> List[int]:
-#     out: List[int] = []
-#     seen = set()
-#     for v in values:
-#         iv = int(v)
-#         if iv not in seen:
-#             out.append(iv)
-#             seen.add(iv)
-#     return out
-
-
-# def _normalize_classifier_mode(mode: Optional[str], default: str = "geometry") -> str:
-#     m = str(default if mode is None else mode).lower().strip()
-#     aliases = {
-#         "": default,
-#         "none": default,
-#         "geo": "geometry",
-#         "geometry_only": "geometry",
-#         "geometry-only": "geometry",
-#         "feature_geometry": "geometry",
-#         "low_rank_geometry": "geometry",
-#         "anchor": "geometry",
-#         "anchor_concept": "geometry",
-#         "anchor_concept_geometry": "geometry",
-#         "srgp": "geometry",
-#         "srgp_geometry": "geometry",
-#         "spectral_geometry": "geometry",
-#         "spectral_residual": "geometry",
-#         "calibrated_geometry": "calibrated_geometry",
-#         "topology_calibrated_geometry": "calibrated_geometry",
-#     }
-#     out = aliases.get(m, m)
-#     if out not in {"geometry", "calibrated_geometry", "base_ce"}:
-#         raise ValueError(f"Unsupported classifier mode {mode!r}. Use geometry, calibrated_geometry, or base_ce.")
-#     return out
-
-
-
-# def _normalize_incremental_update_mode(mode: Optional[str]) -> str:
-#     """Normalize incremental update mode for the clean PG-RGA architecture."""
-#     m = str(mode or "geometry_gated_adapter").lower().strip()
-#     aliases = {
-#         "": "geometry_gated_adapter",
-#         "none": "frozen_geometry",
-#         "false": "frozen_geometry",
-#         "off": "frozen_geometry",
-#         "geometry_gated": "geometry_gated_adapter",
-#         "gated_adapter": "geometry_gated_adapter",
-#         "pg_rga": "geometry_gated_adapter",
-#         "pgrga": "geometry_gated_adapter",
-#         "sgrga": "geometry_gated_adapter",
-#         "adapter": "geometry_gated_adapter",
-#         "descriptor": "descriptor_only",
-#         "descriptor_refinement": "descriptor_only",
-#         "frozen": "frozen_geometry",
-#         "frozen_geometry": "frozen_geometry",
-#     }
-#     out = aliases.get(m, m)
-#     if out not in {"geometry_gated_adapter", "descriptor_only", "frozen_geometry"}:
-#         raise ValueError(
-#             f"Unsupported incremental_update_mode={mode!r}. "
-#             "Use geometry_gated_adapter for the main PG-RGA path."
-#         )
-#     return out
-
-
-# def _module_has_trainable_params(module: Optional[nn.Module]) -> bool:
-#     return bool(module is not None and any(p.requires_grad for p in module.parameters()))
-
-
-# class GeometryPlasticAdapter(nn.Module):
-#     """Bounded geometry-gated residual adapter for controlled incremental plasticity.
-
-#     This module operates directly in the canonical projected GeometryBank space.
-#     It is deliberately small: it can make a bounded residual correction for new
-#     classes, but it cannot rewrite the backbone/projection or old bank rows.
-#     """
-
-#     def __init__(
+#     def forward(
 #         self,
-#         d_model: int,
+#         inputs: Tensor,
+#         raw_spectral_patch: Optional[Tensor] = None,
 #         *,
-#         bottleneck: int = 32,
-#         max_scale: float = 0.10,
-#         dropout: float = 0.0,
-#         gate_bias_init: float = -3.0,
-#     ) -> None:
-#         super().__init__()
-#         self.d_model = int(d_model)
-#         self.bottleneck = int(max(1, bottleneck))
-#         self.max_scale = float(max(0.0, max_scale))
-#         self.norm = nn.LayerNorm(self.d_model)
-#         self.delta = nn.Sequential(
-#             nn.Linear(self.d_model, self.bottleneck),
-#             nn.GELU(),
-#             nn.Dropout(float(max(0.0, dropout))),
-#             nn.Linear(self.bottleneck, self.d_model),
+#         mode: str = GEOMETRY_MODE,
+#         seen_classes: Optional[Sequence[int]] = None,
+#         temporary_rows: Optional[Mapping[int, Mapping[str, Any]]] = None,
+#         targets: Optional[Tensor] = None,
+#         targets_are_global: bool = False,
+#         old_classes: Optional[Sequence[int]] = None,
+#         new_classes: Optional[Sequence[int]] = None,
+#         classifier_mode: str = "spectral_conditioned_joint",
+#         deterministic: bool = True,
+#         return_energy: bool = False,
+#         return_parts: bool = False,
+#         return_diagnostics: bool = False,
+#     ) -> Union[Tensor, Dict[str, Any]]:
+#         output = self.forward_features(
+#             inputs,
+#             raw_spectral_patch,
+#             deterministic=deterministic,
 #         )
-#         self.gate = nn.Sequential(
-#             nn.Linear(self.d_model, self.bottleneck),
-#             nn.GELU(),
-#             nn.Linear(self.bottleneck, 1),
-#         )
-#         self.reset_parameters(float(gate_bias_init))
-
-#     def reset_parameters(self, gate_bias_init: float = -3.0) -> None:
-#         for module in self.modules():
-#             if isinstance(module, nn.Linear):
-#                 nn.init.xavier_uniform_(module.weight)
-#                 nn.init.zeros_(module.bias)
-#         # Start as an identity map. The adapter earns plasticity only through
-#         # incremental new/replay losses.
-#         last_delta = self.delta[-1]
-#         if isinstance(last_delta, nn.Linear):
-#             nn.init.zeros_(last_delta.weight)
-#             nn.init.zeros_(last_delta.bias)
-#         last_gate = self.gate[-1]
-#         if isinstance(last_gate, nn.Linear):
-#             nn.init.zeros_(last_gate.weight)
-#             nn.init.constant_(last_gate.bias, float(gate_bias_init))
-
-#     def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         if features.dim() != 2:
-#             raise RuntimeError(f"GeometryPlasticAdapter expects [B,D], got {tuple(features.shape)}")
-#         h = self.norm(features)
-#         gate = torch.sigmoid(self.gate(h))
-#         direction = torch.tanh(self.delta(h))
-#         delta = gate * float(self.max_scale) * direction
-#         adapted = features + delta
-#         return {
-#             "features": adapted,
-#             "projected_features": adapted,
-#             "delta": delta,
-#             "gate": gate,
-#             "adapter_delta": delta,
-#             "adapter_gate": gate,
-#         }
-
-
-# class NECILModel(nn.Module):
-#     """Clean NECIL-HSI model router.
-
-#     Contract:
-#         - One canonical projected feature space ``z`` is used for base geometry,
-#           incremental geometry insertion, synthetic replay, and evaluation.
-#         - GeometryBank is the only non-exemplar memory.
-#         - Classifier always receives explicit ``seen_classes`` and returns
-#           logits [B, len(seen_classes)].
-#         - Semantic/concept/adaptor/transport paths are not part of this clean
-#           main model. Their hooks are kept as no-ops or hard-disabled aliases so
-#           stale trainer code does not silently route through a different space.
-#     """
-
-#     def __init__(self, args: Any) -> None:
-#         super().__init__()
-#         self.args = args
-#         self.device = torch.device(getattr(args, "device", "cpu"))
-#         self.d_model = int(getattr(args, "d_model", 128))
-#         self.subspace_rank = int(getattr(args, "subspace_rank", getattr(args, "rank", 5)))
-#         if self.d_model <= 0:
-#             raise ValueError("d_model must be positive.")
-#         if self.subspace_rank < 0:
-#             raise ValueError("subspace_rank must be non-negative.")
-
-#         self.current_phase = 0
-#         self.old_class_count = 0
-#         self.current_num_classes = 0
-#         self.seen_classes: List[int] = []
-#         self.base_mode_active = True
-#         self.incremental_mode_active = False
-#         self._incremental_frozen_modules: List[str] = []
-
-#         # Main architecture switch.
-#         # PG-RGA uses a bounded residual geometry adapter during incremental
-#         # learning, while the backbone/projection and old GeometryBank rows stay
-#         # frozen. Descriptor-only/frozen modes remain available as ablations.
-#         self.incremental_update_mode = _normalize_incremental_update_mode(
-#             getattr(args, "incremental_update_mode", None)
-#         )
-
-#         # Hard-disable stale/unsafe paths in the model object. They can exist in
-#         # other files for ablation compatibility, but this clean model must not
-#         # silently route through them.
-#         self.use_incremental_adapter = False
-#         self.use_geometry_calibrator = False
-#         self.use_bicyc_geometry_cycle = False
-#         self.use_geometry_transport = False
-#         self.use_sglat_transport = False
-#         self.use_geometry_gated_adapter = (
-#             self.incremental_update_mode == "geometry_gated_adapter"
-#             or _to_bool(getattr(args, "use_geometry_gated_adapter", False), False)
-#         )
-#         self.semantic_encoder: Optional[nn.Module] = None
-#         self.concept_encoder: Optional[nn.Module] = None
-
-#         self.backbone = SSMBackbone(args)
-#         dropout = float(getattr(args, "projection_dropout", 0.0))
-#         self.projection = nn.Sequential(
-#             nn.Linear(self.d_model, self.d_model),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(self.d_model, self.d_model),
-#         )
-#         self.norm = nn.LayerNorm(self.d_model)
-
-#         self.normalize_geometry_features = _to_bool(getattr(args, "normalize_geometry_features", True), True)
-#         raw_scale = float(getattr(args, "geometry_feature_scale", 0.0) or 0.0)
-#         self.geometry_feature_scale = raw_scale if raw_scale > 0.0 else math.sqrt(float(self.d_model))
-#         self.geometry_feature_clamp = float(getattr(args, "geometry_feature_clamp", 0.0) or 0.0)
-#         self.spectral_summary_mode = str(getattr(args, "spectral_summary_mode", "center")).lower().strip()
-#         if self.spectral_summary_mode not in {"center", "mean"}:
-#             raise ValueError("spectral_summary_mode must be 'center' or 'mean'.")
-#         pca_components = int(getattr(args, "pca_components", 0) or 0)
-#         self.default_spectral_physical = bool(getattr(args, "spectral_summary_is_physical", pca_components <= 0))
-#         self.min_band_mass = float(getattr(args, "min_band_mass", 1e-8))
-
-#         bank_kwargs = _filter_supported_kwargs(
-#             GeometryBank.__init__,
-#             {
-#                 "device": self.device,
-#                 "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-#                 "variance_shrinkage": float(getattr(args, "geometry_variance_shrinkage", 0.10)),
-#                 "max_variance_ratio": float(getattr(args, "geometry_max_variance_ratio", 50.0)),
-#                 "min_reliability": float(getattr(args, "geometry_min_reliability", 0.05)),
-#                 "reliability_sample_alpha": float(getattr(args, "reliability_sample_alpha", 20.0)),
-#                 "rank_energy_threshold": float(getattr(args, "rank_energy_threshold", 0.95)),
-#                 "rank_eigen_ratio_threshold": float(getattr(args, "rank_eigen_ratio_threshold", 1e-3)),
-#                 "min_active_rank": int(getattr(args, "min_active_rank", 1)),
-#             },
-#         )
-#         self.geometry_bank = GeometryBank(self.d_model, self.subspace_rank, **bank_kwargs)
-
-#         clf_kwargs = _filter_supported_kwargs(
-#             GeometryEnergyClassifier.__init__,
-#             {
-#                 "initial_classes": 0,
-#                 "d_model": self.d_model,
-#                 "logit_scale": float(getattr(args, "loss_scale", getattr(args, "logit_scale", 8.0))),
-#                 "variance_floor": float(getattr(args, "geom_var_floor", 1e-4)),
-#                 "residual_variance_scale": float(getattr(args, "residual_variance_scale", 0.75)),
-#                 "normalize_energy_by_dim": _to_bool(getattr(args, "energy_normalize_by_dim", True), True),
-#                 "use_logdet_energy": _to_bool(getattr(args, "use_logdet_energy", True), True),
-#                 "logdet_energy_weight": float(getattr(args, "logdet_energy_weight", 0.05)),
-#                 "use_reliability_penalty": _to_bool(getattr(args, "use_reliability_penalty", True), True),
-#                 "reliability_energy_weight": float(getattr(args, "reliability_energy_weight", 0.03)),
-#                 "use_old_new_calibration": _to_bool(getattr(args, "use_old_new_calibration", getattr(args, "use_energy_calibrator", False)), False),
-#                 "calibration_max_abs_bias": float(getattr(args, "calibration_max_abs_bias", getattr(args, "energy_calibrator_max_bias", 1.0))),
-#                 "logit_clip": float(getattr(args, "geometry_logit_clip", 0.0)),
-#             },
-#         )
-#         self.classifier = GeometryEnergyClassifier(**clf_kwargs)
-
-#         self.geometry_plastic_adapter = GeometryPlasticAdapter(
-#             self.d_model,
-#             bottleneck=int(getattr(args, "adapter_bottleneck", 32)),
-#             max_scale=float(getattr(args, "adapter_max_scale", 0.10)),
-#             dropout=float(getattr(args, "adapter_dropout", 0.0)),
-#             gate_bias_init=float(getattr(args, "adapter_gate_bias_init", -3.0)),
-#         )
-#         self._set_requires_grad(self.geometry_plastic_adapter, False)
-
-#         self.base_ce_head: Optional[nn.Linear] = None
-#         self.base_ce_num_classes = 0
-
-#         self.to(self.device)
-
-#     # ------------------------------------------------------------------
-#     # Input / feature utilities
-#     # ------------------------------------------------------------------
-#     def _validate_feature_tensor(self, features: torch.Tensor, name: str, batch_size: Optional[int] = None) -> torch.Tensor:
-#         if not torch.is_tensor(features):
-#             raise TypeError(f"{name} must be a torch.Tensor, got {type(features)}")
-#         if features.dim() != 2:
-#             raise RuntimeError(f"{name} must be [B,D], got {tuple(features.shape)}")
-#         if features.size(1) != self.d_model:
-#             raise RuntimeError(f"{name} dim mismatch: expected {self.d_model}, got {features.size(1)}")
-#         if batch_size is not None and features.size(0) != int(batch_size):
-#             raise RuntimeError(f"{name} batch mismatch: got {features.size(0)}, expected {int(batch_size)}")
-#         if not torch.isfinite(features).all():
-#             raise RuntimeError(f"{name} contains NaN/Inf values.")
-#         return features
-
-#     def _canonicalize(self, z: torch.Tensor, *, name: str) -> torch.Tensor:
-#         z = self._validate_feature_tensor(z, name)
-#         if self.normalize_geometry_features:
-#             z = F.normalize(z, p=2, dim=1, eps=1e-8) * float(self.geometry_feature_scale)
-#         if self.geometry_feature_clamp > 0.0:
-#             z = z.clamp(-self.geometry_feature_clamp, self.geometry_feature_clamp)
-#         if not torch.isfinite(z).all():
-#             raise RuntimeError(f"{name} contains NaN/Inf after canonicalization.")
-#         return z
-
-#     def _center_spectrum_from_input(self, x: torch.Tensor) -> torch.Tensor:
-#         if x.dim() == 4:
-#             if self.spectral_summary_mode == "center":
-#                 return x[:, :, x.size(-2) // 2, x.size(-1) // 2]
-#             return x.mean(dim=(-1, -2))
-#         if x.dim() == 3:
-#             if self.spectral_summary_mode == "center":
-#                 return x[:, :, x.size(-1) // 2]
-#             return x.mean(dim=-1)
-#         if x.dim() == 2:
-#             return x
-#         raise RuntimeError(f"Unsupported input shape for spectral summary: {tuple(x.shape)}")
-
-#     def _prepare_spectral_summary(
-#         self,
-#         x: torch.Tensor,
-#         features: torch.Tensor,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#     ) -> Tuple[torch.Tensor, bool]:
-#         if spectral_summary is None or not torch.is_tensor(spectral_summary) or spectral_summary.numel() == 0:
-#             s = self._center_spectrum_from_input(x).to(device=features.device, dtype=features.dtype)
-#             physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-#         else:
-#             s = spectral_summary.to(device=features.device, dtype=features.dtype)
-#             if s.dim() == 4:
-#                 s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#             elif s.dim() == 3:
-#                 if s.size(0) == features.size(0) and s.size(-1) > 1:
-#                     s = s[:, :, s.size(-1) // 2]
-#                 else:
-#                     s = s.reshape(features.size(0), -1)
-#             elif s.dim() == 1:
-#                 if s.numel() % max(int(features.size(0)), 1) != 0:
-#                     raise RuntimeError(f"1-D spectral_summary cannot be reshaped to batch size {features.size(0)}")
-#                 s = s.reshape(features.size(0), -1)
-#             elif s.dim() > 4:
-#                 s = s.flatten(1)
-#             physical = self.default_spectral_physical if spectral_summary_is_physical is None else bool(spectral_summary_is_physical)
-#         if s.dim() != 2 or s.size(0) != features.size(0):
-#             raise RuntimeError(f"spectral_summary must resolve to [B,S], got {tuple(s.shape)}")
-#         s = torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-#         if s.size(1) == 0:
-#             physical = False
-#         return s, bool(physical)
-
-#     def _band_summary(self, spectral_summary: torch.Tensor, band_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
-#         if band_weights is not None and torch.is_tensor(band_weights) and band_weights.numel() > 0:
-#             bw = band_weights.to(device=spectral_summary.device, dtype=spectral_summary.dtype)
-#             if bw.dim() == 2 and bw.size(0) == spectral_summary.size(0) and bw.size(1) == spectral_summary.size(1):
-#                 bw = torch.nan_to_num(bw, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-#                 denom = bw.sum(dim=1, keepdim=True)
-#                 if bool((denom > self.min_band_mass).all().item()):
-#                     return bw / denom.clamp_min(self.min_band_mass)
-#         b = spectral_summary.abs()
-#         denom = b.sum(dim=1, keepdim=True)
-#         uniform = torch.full_like(b, 1.0 / float(max(int(b.size(1)), 1)))
-#         b = torch.where(denom > self.min_band_mass, b / denom.clamp_min(self.min_band_mass), uniform)
-#         return b
-
-#     def extract_features(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         """Backbone-only feature extraction. Does not touch GeometryBank/classifier."""
-#         if not torch.is_tensor(x):
-#             raise TypeError(f"x must be a torch.Tensor, got {type(x)}")
-#         out = self.backbone(x.to(self.device))
-#         if isinstance(out, dict):
-#             if "features" not in out:
-#                 raise RuntimeError("backbone output dict must contain key 'features'.")
-#             features = self._validate_feature_tensor(out["features"], "backbone.features", int(x.size(0)))
-#             result = dict(out)
-#             result["features"] = features
-#             result.setdefault("backbone_features", features)
-#             return result
-#         features = self._validate_feature_tensor(out, "backbone.features", int(x.size(0)))
-#         return {"features": features, "backbone_features": features}
-
-#     def forward_features(
-#         self,
-#         x: torch.Tensor,
-#         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         band_weights: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: Optional[bool] = None,
-#         apply_adapter: Optional[bool] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Return projected geometry features.
-
-#         Important contract:
-#             - ``canonical_features`` are always the backbone/projection z-space
-#               used to build the base GeometryBank.
-#             - ``features`` / ``projected_features`` are the scoring features.
-#               They equal canonical z in base mode and become adapted z only when
-#               PG-RGA adapter routing is explicitly active.
-#         """
-#         raw = self.extract_features(x)
-#         h = self._validate_feature_tensor(raw["features"], "preproject_features", int(x.size(0)))
-#         z_canonical = self.norm(self.projection(h) + h)
-#         z_canonical = self._canonicalize(z_canonical, name="canonical_geometry_features")
-
-#         use_adapter = self._adapter_runtime_enabled(force=False) if apply_adapter is None else bool(apply_adapter)
-#         z = z_canonical
-#         adapter_out: Optional[Dict[str, torch.Tensor]] = None
-#         if use_adapter:
-#             adapter_out = self.adapt_projected_features(
-#                 z_canonical,
-#                 force=(apply_adapter is True),
-#                 return_delta=True,
-#                 recanonicalize=True,
-#             )
-#             z = adapter_out["features"]
-
-#         s, physical = self._prepare_spectral_summary(
-#             x.to(self.device),
-#             z,
-#             spectral_summary=spectral_summary,
-#             spectral_summary_is_physical=spectral_summary_is_physical,
-#         )
-#         candidate_bw = band_weights if band_weights is not None else raw.get("band_weights", None)
-#         band = self._band_summary(s, candidate_bw)
-#         result = {
-#             "features": z,
-#             "projected_features": z,
-#             "geometry_features": z,
-#             "canonical_features": z_canonical,
-#             "canonical_projected_features": z_canonical,
-#             "pre_adapter_features": z_canonical,
-#             "preproject_features": h,
-#             "backbone_features": h,
-#             "spectral_summary": s,
-#             "spectral_summary_is_physical": torch.tensor(bool(physical), device=z.device, dtype=torch.bool),
-#             "band_summary": band,
-#             "band_importance": band,
-#             "band_weights": candidate_bw if torch.is_tensor(candidate_bw) else None,
-#             "spectral_features": raw.get("spectral_features", h),
-#             "spatial_features": raw.get("spatial_features", h),
-#         }
-#         if adapter_out is not None:
-#             result["adapter_delta"] = adapter_out["adapter_delta"]
-#             result["adapter_gate"] = adapter_out["adapter_gate"]
-#             result["adapter_active"] = adapter_out["adapter_active"]
-#         return result
-
-#     # Compatibility aliases expected by existing trainers.
-#     def extract_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         return self.forward_features(x, **kwargs)
-
-#     def extract_canonical_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         kwargs = dict(kwargs)
-#         kwargs["apply_adapter"] = False
-#         return self.forward_features(x, **kwargs)
-
-#     def extract_adapted_projected_features(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         kwargs = dict(kwargs)
-#         kwargs["apply_adapter"] = True
-#         return self.forward_features(x, **kwargs)
-
-#     def extract_geometry_features(self, x: torch.Tensor, *, return_dict: bool = False, **kwargs: Any):
-#         out = self.forward_features(x, **kwargs)
-#         return out if bool(return_dict) else out["features"]
-
-#     @torch.no_grad()
-#     def extract_backbone_outputs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-#         return self.forward_features(x)
-
-#     # ------------------------------------------------------------------
-#     # Controlled geometry-gated adapter
-#     # ------------------------------------------------------------------
-#     def _adapter_runtime_enabled(self, *, force: bool = False) -> bool:
-#         return bool(
-#             getattr(self, "geometry_plastic_adapter", None) is not None
-#             and (bool(force) or (bool(getattr(self, "use_geometry_gated_adapter", False)) and bool(self.incremental_mode_active)))
-#         )
-
-#     def adapt_projected_features(
-#         self,
-#         features: torch.Tensor,
-#         *,
-#         force: bool = False,
-#         return_delta: bool = True,
-#         recanonicalize: bool = True,
-#         **_: Any,
-#     ) -> Dict[str, torch.Tensor]:
-#         """Apply the bounded adapter directly to canonical z-space features.
-
-#         This is required for synthetic old replay: replay samples already live
-#         in GeometryBank space and cannot pass through the backbone. The adapter
-#         must still see them so replay CE can close old-region gates.
-#         """
-#         z0 = self._validate_feature_tensor(features, "adapt_projected_features.features")
-#         if not self._adapter_runtime_enabled(force=force):
-#             zero_delta = torch.zeros_like(z0)
-#             zero_gate = torch.zeros((z0.size(0), 1), device=z0.device, dtype=z0.dtype)
+#         selected = str(mode).strip().lower()
+#         if selected == self.FEATURE_MODE:
+#             return output
+#         if selected == self.BASE_CE_MODE:
+#             logits = self.base_ce_logits(output["geometry_features"])
 #             return {
-#                 "features": z0,
-#                 "projected_features": z0,
-#                 "geometry_features": z0,
-#                 "delta": zero_delta,
-#                 "gate": zero_gate,
-#                 "adapter_delta": zero_delta,
-#                 "adapter_gate": zero_gate,
-#                 "adapter_active": torch.tensor(False, device=z0.device),
+#                 "logits": logits,
+#                 "geometry_features": output["geometry_features"],
+#                 "raw_center_spectra": output["raw_center_spectra"],
+#                 "spatial_purity": output["spatial_purity"],
 #             }
-#         raw = self.geometry_plastic_adapter(z0)
-#         z = raw["features"]
-#         if bool(recanonicalize):
-#             z = self._canonicalize(z, name="adapted_geometry_features")
-#         delta = z - z0
-#         gate = raw.get("gate", torch.zeros((z0.size(0), 1), device=z0.device, dtype=z0.dtype))
-#         return {
-#             "features": z,
-#             "projected_features": z,
-#             "geometry_features": z,
-#             "delta": delta,
-#             "gate": gate,
-#             "adapter_delta": delta,
-#             "adapter_gate": gate,
-#             "adapter_active": torch.tensor(True, device=z0.device),
-#         }
-
-#     # ------------------------------------------------------------------
-#     # Seen classes / bank helpers
-#     # ------------------------------------------------------------------
-#     def _infer_seen_classes(self, geometry_bank: Optional[Any] = None) -> List[int]:
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         if hasattr(bank_obj, "get_valid_mask"):
-#             valid = bank_obj.get_valid_mask().detach().cpu().flatten()
-#             return [int(i) for i in torch.nonzero(valid, as_tuple=False).flatten().tolist()]
-#         bank = bank_obj.get_bank() if hasattr(bank_obj, "get_bank") else bank_obj
-#         if not isinstance(bank, dict) or "sample_counts" not in bank:
-#             return list(self.seen_classes)
-#         counts = bank["sample_counts"].detach().cpu().flatten()
-#         return [int(i) for i in torch.nonzero(counts > 0, as_tuple=False).flatten().tolist()]
-
-#     def ensure_class_capacity(self, class_count: int, spectral_dim: int = 0, dtype: Optional[torch.dtype] = None) -> None:
-#         count = int(max(0, class_count))
-#         dtype = dtype or next(self.parameters()).dtype
-#         if hasattr(self.geometry_bank, "ensure_class_count"):
-#             self.geometry_bank.ensure_class_count(count, spectral_dim=int(spectral_dim), dtype=dtype)
-#         elif hasattr(self.geometry_bank, "ensure_num_classes"):
-#             self.geometry_bank.ensure_num_classes(count)
-#         self.current_num_classes = max(self.current_num_classes, count)
-
-#     def get_subspace_bank(self) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self.geometry_bank, "get_bank"):
-#             raise RuntimeError("GeometryBank must expose get_bank().")
-#         bank = self.geometry_bank.get_bank()
-#         if "variances" not in bank and "eigvals" in bank and "res_vars" in bank:
-#             bank = dict(bank)
-#             bank["variances"] = torch.cat([bank["eigvals"], bank["res_vars"].unsqueeze(-1)], dim=-1)
-#         if "resvars" not in bank and "res_vars" in bank:
-#             bank = dict(bank)
-#             bank["resvars"] = bank["res_vars"]
-#         return bank
-
-#     def get_old_subspace_bank(self, old_class_count: Optional[int] = None) -> Dict[str, torch.Tensor]:
-#         old = int(self.old_class_count if old_class_count is None else old_class_count)
-#         bank = self.get_subspace_bank()
-#         old = max(0, min(old, int(bank["means"].size(0))))
-#         out = {}
-#         for k, v in bank.items():
-#             if torch.is_tensor(v) and v.dim() > 0 and v.size(0) >= old:
-#                 out[k] = v[:old]
-#         return out
-
-#     # ------------------------------------------------------------------
-#     # Classifier routing
-#     # ------------------------------------------------------------------
-#     def forward_classifier(
-#         self,
-#         features: torch.Tensor,
-#         seen_classes: Iterable[int],
-#         mode: str = "geometry",
-#         *,
-#         geometry_bank: Optional[Any] = None,
-#         targets: Optional[torch.Tensor] = None,
-#         targets_are_global: bool = False,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
-#         return_energy: bool = False,
-#         return_parts: bool = False,
-#         return_diagnostics: bool = False,
-#     ):
-#         return self.compute_logits_from_features(
-#             features=features,
-#             seen_classes=seen_classes,
-#             geometry_bank=geometry_bank,
-#             mode=mode,
+#         if selected != self.GEOMETRY_MODE:
+#             raise ValueError(
+#                 f"mode must be one of features/base_ce/geometry, got {mode!r}"
+#             )
+#         seen = (
+#             self.infer_seen_classes()
+#             if seen_classes is None
+#             else _unique_ids(seen_classes, name="seen_classes")
+#         )
+#         result = self.compute_logits_from_features(
+#             output["geometry_features"],
+#             seen_classes=seen,
+#             raw_spectra=output["raw_center_spectra"],
+#             temporary_rows=temporary_rows,
 #             targets=targets,
 #             targets_are_global=targets_are_global,
 #             old_classes=old_classes,
 #             new_classes=new_classes,
+#             mode=classifier_mode,
 #             return_energy=return_energy,
 #             return_parts=return_parts,
 #             return_diagnostics=return_diagnostics,
 #         )
-
-#     def compute_logits_from_features(
-#         self,
-#         features: torch.Tensor,
-#         seen_classes: Optional[Iterable[int]] = None,
-#         geometry_bank: Optional[Any] = None,
-#         mode: str = "geometry",
-#         *,
-#         classifier_mode: Optional[str] = None,
-#         targets: Optional[torch.Tensor] = None,
-#         targets_are_global: bool = False,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
-#         return_energy: bool = False,
-#         return_parts: bool = False,
-#         return_diagnostics: bool = False,
-#         **_: Any,
-#     ):
-#         features = self._validate_feature_tensor(features, "compute_logits_from_features.features")
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         seen = _ordered_unique_ints(seen_classes if seen_classes is not None else self._infer_seen_classes(bank_obj))
-#         if not seen:
-#             raise RuntimeError("seen_classes is empty. Build GeometryBank rows or pass seen_classes explicitly.")
-#         mode_norm = _normalize_classifier_mode(classifier_mode if classifier_mode is not None else mode, "geometry")
-#         self.assert_phase_ready(seen, mode=mode_norm, require_geometry=True)
-#         out = self.classifier(
-#             features,
-#             seen_classes=seen,
-#             geometry_bank=bank_obj,
-#             mode=mode_norm,
-#             targets=targets,
-#             targets_are_global=bool(targets_are_global),
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             old_class_count=int(self.old_class_count),
-#             return_energy=return_energy,
-#             return_parts=return_parts,
-#             return_diagnostics=return_diagnostics,
-#         )
-#         logits = out["logits"] if isinstance(out, dict) else out
-#         self.classifier.assert_logits_valid(
-#             logits,
-#             seen_classes=seen,
-#             targets=(self.classifier.global_to_local_labels(targets, seen) if targets is not None and targets_are_global else targets),
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             context="NECILModel.compute_logits_from_features",
-#         )
-#         self.current_num_classes = max(self.current_num_classes, max(seen) + 1)
-#         self.seen_classes = list(seen)
-#         return out
-
-#     def compute_energy_from_features(self, features: torch.Tensor, seen_classes: Optional[Iterable[int]] = None, **kwargs: Any):
-#         out = self.compute_logits_from_features(features, seen_classes=seen_classes, return_energy=True, **kwargs)
-#         if not isinstance(out, dict) or "energy" not in out:
-#             raise RuntimeError("Expected dict with energy from compute_logits_from_features(return_energy=True).")
-#         return out["energy"]
+#         if isinstance(result, Mapping):
+#             merged = dict(result)
+#             merged["geometry_features"] = output["geometry_features"]
+#             merged["raw_center_spectra"] = output["raw_center_spectra"]
+#             merged["spatial_purity"] = output["spatial_purity"]
+#             return merged
+#         return result
 
 #     # ------------------------------------------------------------------
-#     # Geometry refresh / memory snapshots
+#     # Base CE warm-up and geometry handoff
 #     # ------------------------------------------------------------------
-#     @torch.no_grad()
-#     def refresh_geometry_for_classes(
-#         self,
-#         class_ids: Iterable[int],
-#         features: torch.Tensor,
-#         labels: torch.Tensor,
-#         *,
-#         spectral_summary: Optional[torch.Tensor] = None,
-#         band_weights: Optional[torch.Tensor] = None,
-#         spectral_summary_is_physical: bool = False,
-#         phase_created: Optional[int] = None,
-#         freeze_after: bool = False,
-#     ) -> Dict[str, Any]:
-#         features = self._validate_feature_tensor(features, "refresh_geometry_for_classes.features")
-#         labels = labels.to(device=features.device).long().flatten()
-#         ids = _ordered_unique_ints(class_ids)
-#         if labels.numel() != features.size(0):
-#             raise RuntimeError("labels/features batch mismatch in refresh_geometry_for_classes")
-#         bad = sorted(set(int(v) for v in torch.unique(labels).detach().cpu().tolist()).difference(set(ids)))
-#         if bad:
-#             raise RuntimeError(f"labels contain classes outside requested refresh ids: bad={bad}, class_ids={ids}")
-#         band_dim = 0
-#         if spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0:
-#             band_dim = int(spectral_summary.reshape(features.size(0), -1).size(1))
-#         elif band_weights is not None and torch.is_tensor(band_weights) and band_weights.numel() > 0:
-#             band_dim = int(band_weights.reshape(features.size(0), -1).size(1))
-#         self.ensure_class_capacity(max(ids) + 1 if ids else 0, spectral_dim=band_dim, dtype=features.dtype)
-#         rows = self.geometry_bank.extract_geometry(
-#             features,
-#             labels,
-#             spectral_summary=spectral_summary,
-#             band_weights=band_weights,
-#             spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#         )
-#         committed: List[int] = []
-#         for c in ids:
-#             if c not in rows:
-#                 raise RuntimeError(f"No geometry could be extracted for class {c}.")
-#             row = rows[c]
-#             self.geometry_bank.add_or_update_class_geometry(
-#                 c,
-#                 mean=row["mean"],
-#                 basis=row["basis"],
-#                 eigvals=row["eigvals"],
-#                 res_var=row["res_var"],
-#                 spectral_prototype=row.get("spectral_prototype"),
-#                 band_importance=row.get("band_importance"),
-#                 sample_count=row.get("sample_count"),
-#                 active_rank=row.get("active_rank"),
-#                 reliability=row.get("reliability"),
-#                 feature_reliability=row.get("feature_reliability"),
-#                 band_reliability=row.get("band_reliability"),
-#                 spectral_reliability=row.get("spectral_reliability"),
-#                 phase_created=int(self.current_phase if phase_created is None else phase_created),
-#                 allow_frozen_update=False,
-#             )
-#             committed.append(c)
-#         if bool(freeze_after):
-#             self.freeze_classes(committed)
-#         self.geometry_bank.assert_bank_valid(seen_classes=committed, strict=True)
-#         self.current_num_classes = max(self.current_num_classes, max(committed) + 1 if committed else self.current_num_classes)
-#         return {"committed_class_ids": committed, "phase_created": int(self.current_phase if phase_created is None else phase_created)}
-
-#     @torch.no_grad()
-#     def refresh_class_subspace(self, cls: int, mean: torch.Tensor, basis: torch.Tensor, eigvals: torch.Tensor, res_var: Optional[torch.Tensor] = None, resvar: Optional[torch.Tensor] = None, **kwargs: Any) -> None:
-#         rv = res_var if res_var is not None else resvar
-#         if rv is None:
-#             raise ValueError("refresh_class_subspace requires res_var/resvar.")
-#         c = int(cls)
-#         self.ensure_class_capacity(c + 1)
-#         self.geometry_bank.add_or_update_class_geometry(
-#             c,
-#             mean=mean,
-#             basis=basis,
-#             eigvals=eigvals,
-#             res_var=rv,
-#             spectral_prototype=kwargs.get("spectral_prototype", kwargs.get("spectral_proto", None)),
-#             band_importance=kwargs.get("band_importance", None),
-#             sample_count=kwargs.get("sample_count", None),
-#             active_rank=kwargs.get("active_rank", None),
-#             reliability=kwargs.get("reliability", None),
-#             feature_reliability=kwargs.get("feature_reliability", None),
-#             band_reliability=kwargs.get("band_reliability", None),
-#             phase_created=kwargs.get("phase_created", self.current_phase),
-#             allow_frozen_update=bool(kwargs.get("allow_frozen_update", False)),
-#         )
-
-#     @torch.no_grad()
-#     def export_memory_snapshot(self) -> Dict[str, Any]:
-#         snap = self.geometry_bank.export_snapshot()
-#         snap.update(
-#             {
-#                 "current_phase": int(self.current_phase),
-#                 "old_class_count": int(self.old_class_count),
-#                 "current_num_classes": int(self.current_num_classes),
-#                 "seen_classes": list(self.seen_classes),
-#                 "feature_contract": self.feature_contract(),
-#             }
-#         )
-#         return snap
-
-#     @torch.no_grad()
-#     def load_memory_snapshot(self, snapshot: Dict[str, Any], strict: bool = True) -> None:
-#         if not snapshot:
-#             if strict:
-#                 raise ValueError("empty memory snapshot")
-#             return
-#         self._assert_snapshot_feature_contract(snapshot, strict=strict)
-#         self.geometry_bank.load_snapshot(snapshot, strict=strict)
-#         self.current_phase = int(snapshot.get("current_phase", self.current_phase))
-#         self.old_class_count = int(snapshot.get("old_class_count", self.old_class_count))
-#         self.current_num_classes = int(snapshot.get("current_num_classes", len(self.geometry_bank)))
-#         self.seen_classes = [int(c) for c in snapshot.get("seen_classes", self._infer_seen_classes())]
-
-#     def feature_contract(self) -> Dict[str, Any]:
-#         return {
-#             "d_model": int(self.d_model),
-#             "subspace_rank": int(self.subspace_rank),
-#             "normalize_geometry_features": bool(self.normalize_geometry_features),
-#             "geometry_feature_scale": float(self.geometry_feature_scale),
-#             "spectral_summary_mode": str(self.spectral_summary_mode),
-#             "classifier_contract": "logits[B,len(seen_classes)]",
-#             "incremental_update_mode": str(self.incremental_update_mode),
-#             "geometry_gated_adapter_available": hasattr(self, "geometry_plastic_adapter"),
-#             "geometry_gated_adapter_enabled": bool(self.use_geometry_gated_adapter),
-#             "semantic_encoder_enabled": False,
-#             "concept_encoder_enabled": False,
-#         }
-
-#     def _assert_snapshot_feature_contract(self, snapshot: Dict[str, Any], *, strict: bool) -> None:
-#         if not strict:
-#             return
-#         old = snapshot.get("feature_contract", snapshot.get("geometry_feature_contract", None))
-#         if not isinstance(old, dict):
-#             return
-#         cur = self.feature_contract()
-#         mismatches = []
-#         for k in ("d_model", "subspace_rank", "normalize_geometry_features", "spectral_summary_mode"):
-#             if k in old and old[k] != cur[k]:
-#                 mismatches.append(f"{k}: snapshot={old[k]!r}, current={cur[k]!r}")
-#         if "geometry_feature_scale" in old and abs(float(old["geometry_feature_scale"]) - float(cur["geometry_feature_scale"])) > 1e-6:
-#             mismatches.append(f"geometry_feature_scale: snapshot={old['geometry_feature_scale']!r}, current={cur['geometry_feature_scale']!r}")
-#         if mismatches:
-#             raise RuntimeError("Memory snapshot was built under a different feature contract: " + "; ".join(mismatches))
-
-#     # ------------------------------------------------------------------
-#     # Freezing / phase modes
-#     # ------------------------------------------------------------------
-#     def _set_requires_grad(self, module: Optional[nn.Module], value: bool) -> None:
-#         if module is None:
-#             return
-#         for p in module.parameters():
-#             p.requires_grad = bool(value)
-
-#     def freeze_backbone_except_allowed(self, *, allow_last_blocks: bool = False, allow_projection: bool = False, allow_norm: Optional[bool] = None) -> None:
-#         self._set_requires_grad(self.backbone, False)
-#         if bool(allow_last_blocks) and hasattr(self.backbone, "get_last_blocks"):
-#             for block in self.backbone.get_last_blocks():
-#                 self._set_requires_grad(block, True)
-#         self._set_requires_grad(self.projection, bool(allow_projection))
-#         self._set_requires_grad(self.norm, bool(allow_projection if allow_norm is None else allow_norm))
-
-#     def freeze_backbone_only(self) -> None:
-#         self._set_requires_grad(self.backbone, False)
-
-#     def unfreeze_backbone(self) -> None:
-#         self._set_requires_grad(self.backbone, True)
-
-#     def freeze_projection_head(self) -> None:
-#         self._set_requires_grad(self.projection, False)
-#         self._set_requires_grad(self.norm, False)
-
-#     def unfreeze_projection_head(self) -> None:
-#         self._set_requires_grad(self.projection, True)
-#         self._set_requires_grad(self.norm, True)
-
-#     def freeze_semantic_encoder(self) -> None:
-#         self._set_requires_grad(self.semantic_encoder, False)
-#         self._set_requires_grad(self.concept_encoder, False)
-
-#     def freeze_classifier(self) -> None:
-#         self._set_requires_grad(self.classifier, False)
-
-#     def unfreeze_classifier(self) -> None:
-#         self._set_requires_grad(self.classifier, True)
-
-#     def freeze_classes(self, class_ids_or_count: Iterable[int] | int) -> None:
-#         # GeometryBank.freeze_classes expects an iterable; freeze_classes_up_to
-#         # expects a count. Keep both contracts explicit to avoid treating an int
-#         # as an iterable during base handoff.
-#         if isinstance(class_ids_or_count, int):
-#             count = int(max(0, class_ids_or_count))
-#             if hasattr(self.geometry_bank, "freeze_classes_up_to"):
-#                 self.geometry_bank.freeze_classes_up_to(count)
-#             elif hasattr(self.geometry_bank, "freeze_classes"):
-#                 self.geometry_bank.freeze_classes(range(count))
-#             return
-#         ids = _ordered_unique_ints(class_ids_or_count)
-#         if hasattr(self.geometry_bank, "freeze_classes"):
-#             self.geometry_bank.freeze_classes(ids)
-#         elif hasattr(self.geometry_bank, "freeze_classes_up_to"):
-#             count = max(ids) + 1 if ids else 0
-#             self.geometry_bank.freeze_classes_up_to(count)
-
-#     def freeze_old_geometry_states(self, old_class_count: Optional[int] = None) -> None:
-#         old = int(self.old_class_count if old_class_count is None else old_class_count)
-#         self.old_class_count = old
-#         self.freeze_classes(range(old))
-
-#     def freeze_base_ce_head(self) -> None:
-#         self._set_requires_grad(self.base_ce_head, False)
-
-#     def unfreeze_base_ce_head(self) -> None:
-#         self._set_requires_grad(self.base_ce_head, True)
-
-#     def set_base_mode(self, *, train_backbone: bool = True, train_projection: bool = True) -> None:
-#         self.current_phase = 0
-#         self.old_class_count = 0
-#         self.base_mode_active = True
-#         self.incremental_mode_active = False
-#         self.train()
-#         self._set_requires_grad(self.backbone, bool(train_backbone))
-#         self._set_requires_grad(self.projection, bool(train_projection))
-#         self._set_requires_grad(self.norm, bool(train_projection))
-#         self.freeze_semantic_encoder()
-#         self.freeze_classifier()
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), False)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.eval()
-#         if self.base_ce_head is not None:
-#             self.unfreeze_base_ce_head()
-
-#     def set_incremental_mode(
-#         self,
-#         *,
-#         phase: Optional[int] = None,
-#         old_class_count: Optional[int] = None,
-#         train_classifier_calibration: bool = False,
-#         train_geometry_adapter: Optional[bool] = None,
-#     ) -> None:
-#         if phase is not None:
-#             self.current_phase = int(phase)
-#         if old_class_count is not None:
-#             self.old_class_count = int(old_class_count)
-#         self.base_mode_active = False
-#         self.incremental_mode_active = True
-
-#         # Freeze backbone/projection and put them in eval mode to kill dropout.
-#         self.freeze_backbone_except_allowed(allow_last_blocks=False, allow_projection=False)
-#         self.backbone.eval()
-#         self.projection.eval()
-#         self.norm.eval()
-#         self.freeze_semantic_encoder()
-#         self.freeze_base_ce_head()
-#         self.freeze_old_geometry_states(self.old_class_count)
-
-#         if bool(train_classifier_calibration):
-#             # Only classifier calibration parameters may be trainable if enabled.
-#             self.unfreeze_classifier()
-#         else:
-#             self.freeze_classifier()
-#         # PG-RGA main path: train only the bounded residual geometry adapter.
-#         # Descriptor-only/frozen ablations keep it disabled.
-#         if train_geometry_adapter is None:
-#             train_geometry_adapter = bool(self.use_geometry_gated_adapter)
-#         if bool(train_geometry_adapter):
-#             self.unfreeze_geometry_plastic_adapter()
-#         else:
-#             self.freeze_geometry_plastic_adapter()
-#         self._incremental_frozen_modules = ["backbone", "projection", "norm", "semantic_encoder", "concept_encoder"]
-
-#     def assert_frozen_modules(self) -> None:
-#         modules = {
-#             "backbone": self.backbone,
-#             "projection": self.projection,
-#             "norm": self.norm,
-#             "semantic_encoder": self.semantic_encoder,
-#             "concept_encoder": self.concept_encoder,
-#         }
-#         bad_req: List[str] = []
-#         bad_grad: List[str] = []
-#         for prefix, module in modules.items():
-#             if module is None:
-#                 continue
-#             for name, p in module.named_parameters():
-#                 full = f"{prefix}.{name}"
-#                 if p.requires_grad:
-#                     bad_req.append(full)
-#                 if p.grad is not None and torch.is_tensor(p.grad) and float(p.grad.detach().abs().sum().cpu().item()) != 0.0:
-#                     bad_grad.append(full)
-#         if bad_req:
-#             raise RuntimeError(f"Frozen modules still have requires_grad=True: {bad_req[:20]}")
-#         if bad_grad:
-#             raise RuntimeError(f"Frozen modules have nonzero gradients: {bad_grad[:20]}")
-
-#     # Legacy aliases kept safe, but routed to the bounded geometry adapter when
-#     # the explicit geometry_gated_adapter ablation is selected.
-#     def freeze_incremental_adapter(self) -> None:
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), False)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.eval()
-
-#     def unfreeze_incremental_adapter(self) -> None:
-#         self._set_requires_grad(getattr(self, "geometry_plastic_adapter", None), True)
-#         if getattr(self, "geometry_plastic_adapter", None) is not None:
-#             self.geometry_plastic_adapter.train()
-
-#     def disable_incremental_adapter(self) -> None:
-#         self.use_incremental_adapter = False
-#         self.freeze_incremental_adapter()
-
-#     def enable_incremental_adapter(self) -> None:
-#         self.use_geometry_gated_adapter = True
-#         self.unfreeze_incremental_adapter()
-
-#     def freeze_geometry_plastic_adapter(self) -> None:
-#         self.freeze_incremental_adapter()
-
-#     def unfreeze_geometry_plastic_adapter(self) -> None:
-#         self.use_geometry_gated_adapter = True
-#         self.unfreeze_incremental_adapter()
-
-#     def adaptive_boundary_parameters(self) -> List[nn.Parameter]:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "boundary_parameters"):
-#             return list(clf.boundary_parameters())
-#         return []
-
-#     def ensure_adaptive_boundary_capacity(self, class_count: int) -> None:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "ensure_class_capacity"):
-#             try:
-#                 clf.ensure_class_capacity(int(class_count))
-#             except TypeError:
-#                 pass
-#         if clf is not None and hasattr(clf, "expand_to_seen_classes"):
-#             try:
-#                 clf.expand_to_seen_classes(list(range(int(class_count))))
-#             except TypeError:
-#                 pass
-
-#     def adaptive_boundary_state(self, old_class_count: int = 0) -> Dict[str, float]:
-#         clf = getattr(self, "classifier", None)
-#         if clf is not None and hasattr(clf, "adaptive_boundary_state"):
-#             try:
-#                 return {k: float(v) for k, v in clf.adaptive_boundary_state(old_class_count=int(old_class_count)).items()}
-#             except TypeError:
-#                 try:
-#                     return {k: float(v) for k, v in clf.adaptive_boundary_state(int(old_class_count)).items()}
-#                 except Exception:
-#                     pass
-#         return {"old_class_count": float(old_class_count), "adaptive_boundary_available": float(bool(clf is not None and hasattr(clf, "boundary_parameters")))}
-
-#     def freeze_geometry_calibrator(self) -> None: self.use_geometry_calibrator = False
-#     def unfreeze_geometry_calibrator(self) -> None:
-#         raise RuntimeError("Legacy geometry calibrator is disabled in the clean NECILModel.")
-#     def freeze_energy_calibrator(self) -> None:
-#         if hasattr(self.classifier, "freeze_all_adaptation"):
-#             self.classifier.freeze_all_adaptation()
-#     def unfreeze_energy_calibrator(self) -> None:
-#         if hasattr(self.classifier, "unfreeze_all_adaptation"):
-#             self.classifier.unfreeze_all_adaptation()
-
-#     # ------------------------------------------------------------------
-#     # Base CE head
-#     # ------------------------------------------------------------------
-#     def ensure_base_ce_head(self, num_base_classes: int, feature_dim: Optional[int] = None) -> nn.Linear:
-#         num_base_classes = int(num_base_classes)
-#         feature_dim = int(feature_dim or self.d_model)
-#         if feature_dim != self.d_model:
-#             raise RuntimeError(f"base CE head feature_dim must equal d_model={self.d_model}, got {feature_dim}")
-#         if self.base_ce_head is None or self.base_ce_num_classes != num_base_classes:
-#             self.base_ce_head = nn.Linear(self.d_model, num_base_classes).to(self.device)
+#     def ensure_base_ce_head(self, base_class_ids: Sequence[int]) -> nn.Linear:
+#         ids = _unique_ids(base_class_ids, name="base_class_ids")
+#         if len(ids) < 2:
+#             raise ValueError("base phase requires at least two classes")
+#         if self.base_ce_head is None or self.base_ce_head.out_features != len(ids):
+#             self.base_ce_head = nn.Linear(self.d_model, len(ids)).to(self.device)
 #             nn.init.normal_(self.base_ce_head.weight, mean=0.0, std=0.01)
 #             nn.init.zeros_(self.base_ce_head.bias)
-#             self.base_ce_num_classes = num_base_classes
+#         self.base_ce_class_ids = list(ids)
 #         return self.base_ce_head
 
-#     def base_ce_logits(self, features: torch.Tensor, num_base_classes: Optional[int] = None) -> torch.Tensor:
-#         features = self._validate_feature_tensor(features, "base_ce_logits.features")
+#     def base_ce_logits(self, features: Tensor) -> Tensor:
 #         if self.base_ce_head is None:
-#             if num_base_classes is None:
-#                 raise RuntimeError("base_ce_head is not initialized.")
-#             self.ensure_base_ce_head(int(num_base_classes))
-#         logits = self.base_ce_head(features)
-#         if logits.dim() != 2 or logits.size(0) != features.size(0):
-#             raise RuntimeError("base_ce_head returned invalid logits")
-#         return logits
-
-#     def forward_base_ce(self, x: torch.Tensor, num_base_classes: int, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#         out = self.forward_features(
-#             x,
-#             spectral_summary=kwargs.get("spectral_summary", None),
-#             band_weights=kwargs.get("band_weights", None),
-#             spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical", None),
-#         )
-#         logits = self.base_ce_logits(out["features"], num_base_classes=int(num_base_classes))
-#         out = dict(out)
-#         out["base_logits"] = logits
-#         out["logits"] = logits
-#         return out
+#             raise RuntimeError("base CE head is not initialized")
+#         if features.dim() != 2 or features.size(1) != self.d_model:
+#             raise ValueError("base CE features have the wrong shape")
+#         return self.base_ce_head(features)
 
 #     def drop_base_ce_head(self) -> None:
 #         self.base_ce_head = None
-#         self.base_ce_num_classes = 0
+#         self.base_ce_class_ids = []
 
-#     # PRL aliases from older trainer code.
-#     ensure_base_prl_head = ensure_base_ce_head
-#     base_prl_logits = base_ce_logits
-#     def drop_base_prl_head(self) -> None: self.drop_base_ce_head()
-#     def freeze_base_prl_head(self) -> None: self.freeze_base_ce_head()
-#     def unfreeze_base_prl_head(self) -> None: self.unfreeze_base_ce_head()
-
-#     def train(self, mode: bool = True):  # type: ignore[override]
-#         super().train(mode)
-#         if bool(getattr(self, "incremental_mode_active", False)):
-#             # Frozen feature modules must remain deterministic during adapter
-#             # training. Calling model.train() from the trainer should not turn
-#             # dropout/batch statistics back on for backbone/projection.
-#             self.backbone.eval()
-#             self.projection.eval()
-#             self.norm.eval()
-#             if getattr(self, "geometry_plastic_adapter", None) is not None:
-#                 self.geometry_plastic_adapter.train(mode and _module_has_trainable_params(self.geometry_plastic_adapter))
-#         return self
-
-
-#     # ------------------------------------------------------------------
-#     # PG-RGA helper APIs used by the incremental trainer
-#     # ------------------------------------------------------------------
 #     @torch.no_grad()
-#     def sample_geometry_replay(
+#     def fit_spectral_anchor(
 #         self,
-#         class_ids: Iterable[int],
-#         samples_per_class: int | Mapping[int, int] = 16,
+#         raw_center_spectra: Tensor,
 #         *,
-#         seen_classes: Optional[Iterable[int]] = None,
-#         label_to_local: Optional[Mapping[int, int]] = None,
-#         parallel_scale: float = 1.0,
-#         residual_scale: float = 0.25,
-#         reliability_gated: bool = True,
-#     ) -> Dict[str, torch.Tensor]:
-#         if not hasattr(self.geometry_bank, "sample_replay"):
-#             raise RuntimeError("GeometryBank must expose sample_replay for PG-RGA old geometry replay.")
-#         return self.geometry_bank.sample_replay(
-#             class_ids,
-#             samples_per_class=samples_per_class,
-#             seen_classes=seen_classes,
-#             label_to_local=label_to_local,
-#             parallel_scale=float(parallel_scale),
-#             residual_scale=float(residual_scale),
-#             reliability_gated=bool(reliability_gated),
+#         freeze: bool = True,
+#         overwrite: bool = False,
+#     ) -> Dict[str, Any]:
+#         if self.current_phase != 0 or self.phase_mode != "base":
+#             raise RuntimeError("spectral anchor can only be fitted in base phase")
+#         return self.geometry_bank.fit_spectral_anchor(
+#             raw_center_spectra,
+#             freeze=freeze,
+#             overwrite=overwrite,
 #         )
 
-#     def compute_old_geometry_risk_features(
+#     @torch.no_grad()
+#     def build_geometry_rows(
 #         self,
-#         features: torch.Tensor,
 #         *,
-#         old_class_count: Optional[int] = None,
-#         geometry_bank: Optional[Any] = None,
-#     ) -> Dict[str, torch.Tensor]:
-#         z = self._validate_feature_tensor(features, "compute_old_geometry_risk_features.features")
-#         old = int(self.old_class_count if old_class_count is None else old_class_count)
-#         bank_obj = self.geometry_bank if geometry_bank is None else geometry_bank
-#         bank = bank_obj.get_bank() if hasattr(bank_obj, "get_bank") else bank_obj
-#         if not hasattr(self.classifier, "old_geometry_risk_features_from_bank"):
-#             raise RuntimeError("Classifier must expose old_geometry_risk_features_from_bank for PG-RGA gating.")
-#         return self.classifier.old_geometry_risk_features_from_bank(z, bank, old_class_count=old)
+#         class_ids: Sequence[int],
+#         features: Tensor,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         spatial_purity: Optional[Tensor] = None,
+#     ) -> Dict[int, Row]:
+#         ids = _unique_ids(class_ids, name="class_ids")
+#         rows = self.geometry_bank.extract_rows(
+#             features,
+#             labels,
+#             raw_spectra=raw_center_spectra,
+#             sample_weights=spatial_purity,
+#             class_ids=ids,
+#         )
+#         if set(rows) != set(ids):
+#             raise RuntimeError("GeometryBank returned an incomplete row set")
+#         return rows
 
 #     @torch.no_grad()
-#     def assert_base_handoff_ready(self, base_class_ids: Iterable[int], *, freeze: bool = True, strict: bool = True) -> Dict[str, Any]:
-#         ids = _ordered_unique_ints(base_class_ids)
-#         if hasattr(self.geometry_bank, "assert_phase0_base_handoff_ready"):
-#             result = self.geometry_bank.assert_phase0_base_handoff_ready(ids, freeze=bool(freeze), strict=bool(strict))
-#         else:
-#             if bool(freeze):
-#                 self.freeze_classes(ids)
-#             result = self.geometry_bank.assert_bank_valid(seen_classes=ids, strict=bool(strict))
-#         self.old_class_count = len(ids)
-#         self.current_num_classes = max(self.current_num_classes, max(ids) + 1 if ids else 0)
-#         self.seen_classes = list(ids)
+#     def build_geometry_rows_from_output(
+#         self,
+#         output: Mapping[str, Any],
+#         labels: Tensor,
+#         class_ids: Sequence[int],
+#     ) -> Dict[int, Row]:
+#         return self.build_geometry_rows(
+#             class_ids=class_ids,
+#             features=output["geometry_features"],
+#             raw_center_spectra=output["raw_center_spectra"],
+#             labels=labels,
+#             spatial_purity=output.get("spatial_purity"),
+#         )
+
+#     @torch.no_grad()
+#     def finalize_base_geometry(
+#         self,
+#         *,
+#         base_class_ids: Sequence[int],
+#         features: Tensor,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         spatial_purity: Optional[Tensor] = None,
+#         update_statistics: bool = True,
+#         drop_ce_head: bool = True,
+#         calibrated_temperature: Optional[float] = None,
+#     ) -> Dict[str, Any]:
+#         if self.current_phase != 0 or self.phase_mode != "base":
+#             raise RuntimeError("finalize_base_geometry is base-phase only")
+#         ids = _unique_ids(base_class_ids, name="base_class_ids")
+#         self.geometry_bank.assert_anchor_ready()
+#         if not bool(self.geometry_bank.anchor_frozen.item()):
+#             raise RuntimeError("base spectral anchor must be frozen")
+#         if bool(self.geometry_bank.valid_mask().any().item()):
+#             raise RuntimeError("base geometry can only be committed once")
+
+#         bank_snapshot = self.geometry_bank.export_snapshot()
+#         classifier_state = copy.deepcopy(self.classifier.state_dict())
+#         previous_state = (
+#             list(self.seen_classes),
+#             list(self.old_classes),
+#             list(self.new_classes),
+#             copy.deepcopy(self.base_handoff),
+#         )
+#         try:
+#             rows = self.build_geometry_rows(
+#                 class_ids=ids,
+#                 features=features,
+#                 raw_center_spectra=raw_center_spectra,
+#                 labels=labels,
+#                 spatial_purity=spatial_purity,
+#             )
+#             commit = self.geometry_bank.commit_base_rows(
+#                 rows,
+#                 base_class_ids=ids,
+#                 phase=0,
+#             )
+#             statistics = None
+#             if update_statistics:
+#                 statistics = self.geometry_bank.update_statistics(
+#                     features,
+#                     labels,
+#                     ids,
+#                     raw_spectra=raw_center_spectra,
+#                 )
+#             admission = self.geometry_bank.admission_report(
+#                 ids,
+#                 require_statistics=update_statistics,
+#             )
+#             if not admission["ok"]:
+#                 raise RuntimeError(
+#                     "base geometry admission failed: "
+#                     + "; ".join(admission["errors"])
+#                 )
+#             if calibrated_temperature is not None:
+#                 self.classifier.set_temperature(calibrated_temperature)
+#             contract_digest = self.classifier.bind_geometry_bank_contract(
+#                 self.geometry_bank,
+#                 require_frozen_anchor=True,
+#                 require_committed_rows=True,
+#                 enforce_after_binding=True,
+#             )
+#             self.seen_classes = list(ids)
+#             self.old_classes = list(ids)
+#             self.new_classes = []
+#             if drop_ce_head:
+#                 self.drop_base_ce_head()
+#             self.backbone.freeze_all()
+#             self.phase_mode = "evaluation"
+#             self.base_handoff = {
+#                 "commit": commit,
+#                 "statistics": statistics,
+#                 "admission": admission,
+#                 "bank_contract_digest": contract_digest,
+#                 "factorization": "p(s|c)p(z|s,c)",
+#                 "feature_space_frozen": False,
+#                 "atomic": True,
+#             }
+#             return copy.deepcopy(self.base_handoff)
+#         except Exception:
+#             self.geometry_bank.load_snapshot(bank_snapshot, strict=True)
+#             self.classifier.load_state_dict(classifier_state)
+#             (
+#                 self.seen_classes,
+#                 self.old_classes,
+#                 self.new_classes,
+#                 self.base_handoff,
+#             ) = previous_state
+#             raise
+
+#     # ------------------------------------------------------------------
+#     # Incremental phase lifecycle
+#     # ------------------------------------------------------------------
+#     def set_base_mode(self) -> None:
+#         if bool(self.geometry_bank.valid_mask().any().item()):
+#             raise RuntimeError(
+#                 "committed rows exist; reset the bank before restarting base training"
+#             )
+#         self.current_phase = 0
+#         self.phase_mode = "base"
+#         self.seen_classes = []
+#         self.old_classes = []
+#         self.new_classes = []
+#         self.phase_old_digest = None
+#         self.phase_transport = None
+#         self.backbone.enable_base_training()
+#         self.classifier.require_bound_contract = False
+
+#     def begin_incremental_phase(
+#         self,
+#         *,
+#         phase: int,
+#         old_class_ids: Sequence[int],
+#         new_class_ids: Sequence[int],
+#     ) -> Dict[str, Any]:
+#         phase = int(phase)
+#         if phase <= 0:
+#             raise ValueError("incremental phase must be >= 1")
+#         old_ids = _unique_ids(old_class_ids, name="old_class_ids")
+#         new_ids = _unique_ids(new_class_ids, name="new_class_ids")
+#         if set(old_ids) & set(new_ids):
+#             raise RuntimeError("old and new class IDs overlap")
+#         committed = self.infer_seen_classes()
+#         if set(committed) != set(old_ids):
+#             raise RuntimeError(
+#                 f"old classes {sorted(old_ids)} do not match committed rows "
+#                 f"{sorted(committed)}"
+#             )
+#         self.geometry_bank.assert_valid(old_ids, strict=True)
+#         self.geometry_bank.assert_anchor_ready()
+#         if not bool(self.geometry_bank.anchor_frozen.item()):
+#             raise RuntimeError("incremental phase requires a frozen anchor")
+#         if self.classifier.bound_bank_contract_digest != (
+#             self.geometry_bank.contract_digest()
+#         ):
+#             raise RuntimeError("finalize and bind base geometry first")
+
+#         self.current_phase = phase
+#         self.old_classes = list(old_ids)
+#         self.new_classes = list(new_ids)
+#         self.seen_classes = [*old_ids, *new_ids]
+#         self.phase_old_digest = self.geometry_bank.rows_digest(old_ids)
+#         self.phase_mode = "incremental"
+#         self.phase_transport = self._new_phase_transport()
+#         self.backbone.enable_incremental_plasticity()
+#         self.classifier.eval()
+#         return {
+#             "phase": phase,
+#             "old_class_ids": old_ids,
+#             "new_class_ids": new_ids,
+#             "old_digest": self.phase_old_digest,
+#             "transport": self.phase_transport.diagnostics(),
+#         }
+
+#     def _require_transport(self) -> SpectralConditionedPhaseTransport:
+#         if self.phase_mode != "incremental" or self.phase_transport is None:
+#             raise RuntimeError("no active incremental phase transport")
+#         return self.phase_transport
+
+#     def encoder_optimizer_groups(
+#         self,
+#         *,
+#         base_lr: float,
+#         weight_decay: float = 0.0,
+#     ) -> List[Dict[str, Any]]:
+#         if self.phase_mode != "incremental":
+#             raise RuntimeError("encoder groups require incremental mode")
+#         self.backbone.enable_incremental_plasticity()
+#         return self.backbone.incremental_parameter_groups(
+#             base_lr=base_lr,
+#             weight_decay=weight_decay,
+#         )
+
+#     def transport_parameters(self) -> List[nn.Parameter]:
+#         transport = self._require_transport()
+#         return list(transport.parameters())
+
+#     def configure_transport_step(self) -> None:
+#         """Freeze encoder; update transport from pair and old-replay losses."""
+#         transport = self._require_transport()
+#         self.backbone.freeze_all()
+#         for parameter in transport.parameters():
+#             parameter.requires_grad_(True)
+#             parameter.grad = None
+#         transport.train(True)
+
+#     def configure_encoder_step(self) -> None:
+#         """Freeze transport; update encoder using real new query samples."""
+#         transport = self._require_transport()
+#         self.backbone.enable_incremental_plasticity()
+#         for parameter in transport.parameters():
+#             parameter.requires_grad_(False)
+#             parameter.grad = None
+#         transport.eval()
+
+#     def transport_pair_loss(
+#         self,
+#         previous_features: Tensor,
+#         current_features: Tensor,
+#         *,
+#         raw_center_spectra: Optional[Tensor] = None,
+#         spectral_anchors: Optional[Tensor] = None,
+#         beta: float = 0.5,
+#     ) -> Dict[str, Tensor]:
+#         """Fit transport to observed current-task coordinate correspondences.
+
+#         The current feature target is detached. This loss updates transport,
+#         not the current encoder.
+#         """
+#         transport = self._require_transport()
+#         if (raw_center_spectra is None) == (spectral_anchors is None):
+#             raise ValueError(
+#                 "pass exactly one of raw_center_spectra or spectral_anchors"
+#             )
+#         anchors = (
+#             self.geometry_bank.encode_spectra(raw_center_spectra)
+#             if raw_center_spectra is not None
+#             else spectral_anchors
+#         )
+#         assert anchors is not None
+#         predicted = transport(previous_features.detach(), anchors.detach())
+#         target = current_features.detach()
+#         pair = F.smooth_l1_loss(
+#             predicted,
+#             target,
+#             beta=float(max(beta, 1e-6)),
+#             reduction="mean",
+#         )
+#         inverse = transport.inverse(predicted, anchors.detach())
+#         inverse_error = F.mse_loss(
+#             inverse, previous_features.detach(), reduction="mean"
+#         )
+#         return {
+#             "loss": pair,
+#             "pair_loss": pair,
+#             "inverse_error": inverse_error.detach(),
+#         }
+
+#     def current_transport_tensors(
+#         self, *, detach: bool = True
+#     ) -> Dict[str, Tensor]:
+#         return self._require_transport().tensors(detach=detach)
+
+#     @torch.no_grad()
+#     def build_transported_old_rows(self) -> Tuple[Dict[int, Row], Dict[str, Any]]:
+#         tensors = self.current_transport_tensors(detach=True)
+#         return self.geometry_bank.build_transported_rows(
+#             self.old_classes,
+#             matrix=tensors["matrix"],
+#             spectral_shift=tensors["spectral_shift"],
+#             bias=tensors["bias"],
+#         )
+
+#     @torch.no_grad()
+#     def build_phase_rows(
+#         self,
+#         *,
+#         new_support_features: Tensor,
+#         new_support_raw_spectra: Tensor,
+#         new_support_labels: Tensor,
+#         new_support_purity: Optional[Tensor] = None,
+#     ) -> Tuple[Dict[int, Row], Dict[str, Any]]:
+#         transported, report = self.build_transported_old_rows()
+#         new_rows = self.build_geometry_rows(
+#             class_ids=self.new_classes,
+#             features=new_support_features,
+#             raw_center_spectra=new_support_raw_spectra,
+#             labels=new_support_labels,
+#             spatial_purity=new_support_purity,
+#         )
+#         overlap = set(transported) & set(new_rows)
+#         if overlap:
+#             raise RuntimeError(f"old/new temporary row overlap: {sorted(overlap)}")
+#         return {**transported, **new_rows}, report
+
+#     def sample_transported_replay(
+#         self,
+#         *,
+#         samples_per_class: int,
+#         generator: Optional[torch.Generator] = None,
+#     ) -> Dict[str, Tensor]:
+#         """Sample old geometry and map it through the active transport.
+
+#         The sampled source tensors are detached aggregate replay. The returned
+#         current features retain gradients to the transport when its parameters
+#         are enabled.
+#         """
+#         transport = self._require_transport()
+#         source = self.geometry_bank.sample_replay(
+#             self.old_classes,
+#             samples_per_class=samples_per_class,
+#             generator=generator,
+#         )
+#         current = transport(
+#             source["features"], source["spectral_anchors"]
+#         )
+#         return {
+#             "source_features": source["features"],
+#             "features": current,
+#             "spectral_anchors": source["spectral_anchors"],
+#             "labels": source["labels"],
+#         }
+
+#     def sample_phase_boundary_replay(
+#         self,
+#         *,
+#         temporary_rows: Mapping[int, Mapping[str, Any]],
+#         typical_per_class: int,
+#         boundary_per_class: int,
+#         oversample_factor: Optional[int] = None,
+#         typical_quantile: float = 0.95,
+#         generator: Optional[torch.Generator] = None,
+#     ) -> Dict[str, Tensor]:
+#         """Select typical and low-positive-margin old replay.
+
+#         Selection is non-differentiable, but indexing is applied to the
+#         differentiable transported feature tensor, so the selected replay loss
+#         still updates the phase transport.
+#         """
+#         typical_count = int(typical_per_class)
+#         boundary_count = int(boundary_per_class)
+#         if typical_count < 0 or boundary_count < 0:
+#             raise ValueError("replay counts must be non-negative")
+#         total = typical_count + boundary_count
+#         if total <= 0:
+#             raise ValueError("at least one replay sample is required")
+#         factor = int(
+#             oversample_factor
+#             if oversample_factor is not None
+#             else self.geometry_bank.boundary_oversample_factor
+#         )
+#         factor = max(factor, 2)
+#         replay = self.sample_transported_replay(
+#             samples_per_class=total * factor,
+#             generator=generator,
+#         )
+#         seen = [*self.old_classes, *self.new_classes]
+#         with torch.no_grad():
+#             energy = self.geometry_bank.joint_energy_matrix(
+#                 replay["features"].detach(),
+#                 seen,
+#                 spectral_anchors=replay["spectral_anchors"],
+#                 rows=temporary_rows,
+#             )
+#         positions = {class_id: index for index, class_id in enumerate(seen)}
+#         selected: List[Tensor] = []
+#         replay_kind: List[Tensor] = []
+#         rivals: List[Tensor] = []
+#         margins: List[Tensor] = []
+
+#         for class_id in self.old_classes:
+#             global_indices = torch.nonzero(
+#                 replay["labels"].eq(class_id), as_tuple=False
+#             ).flatten()
+#             class_energy = energy.index_select(0, global_indices)
+#             true_position = positions[class_id]
+#             true_energy = class_energy[:, true_position]
+#             rival_energy = class_energy.clone()
+#             rival_energy[:, true_position] = float("inf")
+#             nearest_energy, nearest_position = rival_energy.min(dim=1)
+#             margin = nearest_energy - true_energy
+#             cutoff = torch.quantile(
+#                 true_energy,
+#                 float(min(max(typical_quantile, 0.50), 0.999)),
+#             )
+#             typical_mask = true_energy.le(cutoff)
+#             boundary_candidates = torch.nonzero(
+#                 typical_mask & margin.ge(0.0), as_tuple=False
+#             ).flatten()
+#             if boundary_candidates.numel() > 0:
+#                 boundary_order = torch.argsort(
+#                     margin.index_select(0, boundary_candidates)
+#                 )
+#                 boundary_local = boundary_candidates.index_select(
+#                     0, boundary_order
+#                 )[:boundary_count]
+#             else:
+#                 boundary_local = global_indices.new_empty((0,))
+
+#             typical_candidates = torch.nonzero(
+#                 typical_mask, as_tuple=False
+#             ).flatten()
+#             if boundary_local.numel() > 0:
+#                 keep = torch.ones(
+#                     typical_candidates.numel(),
+#                     device=self.device,
+#                     dtype=torch.bool,
+#                 )
+#                 for chosen in boundary_local.tolist():
+#                     keep &= typical_candidates.ne(int(chosen))
+#                 typical_candidates = typical_candidates[keep]
+#             if generator is not None and typical_candidates.numel() > 0:
+#                 permutation = torch.randperm(
+#                     typical_candidates.numel(),
+#                     device=self.device,
+#                     generator=generator,
+#                 )
+#                 typical_candidates = typical_candidates.index_select(
+#                     0, permutation
+#                 )
+#             typical_local = typical_candidates[:typical_count]
+
+#             if boundary_local.numel() < boundary_count:
+#                 missing = boundary_count - boundary_local.numel()
+#                 typical_by_margin = typical_candidates.index_select(
+#                     0, torch.argsort(margin.index_select(0, typical_candidates))
+#                 )
+#                 already = set(int(v) for v in boundary_local.tolist())
+#                 additions = [
+#                     int(v)
+#                     for v in typical_by_margin.tolist()
+#                     if int(v) not in already
+#                 ][:missing]
+#                 if additions:
+#                     boundary_local = torch.cat(
+#                         [
+#                             boundary_local,
+#                             torch.tensor(
+#                                 additions,
+#                                 device=self.device,
+#                                 dtype=torch.long,
+#                             ),
+#                         ]
+#                     )
+#             if typical_local.numel() < typical_count:
+#                 missing = typical_count - typical_local.numel()
+#                 typical_by_energy = typical_candidates.index_select(
+#                     0, torch.argsort(true_energy.index_select(0, typical_candidates))
+#                 )
+#                 already = set(
+#                     int(v)
+#                     for v in torch.cat(
+#                         [typical_local, boundary_local], dim=0
+#                     ).tolist()
+#                 )
+#                 additions = [
+#                     int(v)
+#                     for v in typical_by_energy.tolist()
+#                     if int(v) not in already
+#                 ][:missing]
+#                 if additions:
+#                     typical_local = torch.cat(
+#                         [
+#                             typical_local,
+#                             torch.tensor(
+#                                 additions,
+#                                 device=self.device,
+#                                 dtype=torch.long,
+#                             ),
+#                         ]
+#                     )
+#             if typical_local.numel() != typical_count or (
+#                 boundary_local.numel() != boundary_count
+#             ):
+#                 raise RuntimeError(
+#                     f"insufficient replay candidates for class {class_id}"
+#                 )
+
+#             local = torch.cat([typical_local, boundary_local], dim=0)
+#             chosen_global = global_indices.index_select(0, local)
+#             selected.append(chosen_global)
+#             replay_kind.append(
+#                 torch.cat(
+#                     [
+#                         torch.zeros(
+#                             typical_count,
+#                             device=self.device,
+#                             dtype=torch.long,
+#                         ),
+#                         torch.ones(
+#                             boundary_count,
+#                             device=self.device,
+#                             dtype=torch.long,
+#                         ),
+#                     ]
+#                 )
+#             )
+#             rivals.append(
+#                 torch.tensor(
+#                     seen,
+#                     device=self.device,
+#                     dtype=torch.long,
+#                 ).index_select(
+#                     0, nearest_position.index_select(0, local)
+#                 )
+#             )
+#             margins.append(margin.index_select(0, local))
+
+#         index = torch.cat(selected, dim=0)
+#         return {
+#             "features": replay["features"].index_select(0, index),
+#             "source_features": replay["source_features"].index_select(
+#                 0, index
+#             ),
+#             "spectral_anchors": replay["spectral_anchors"].index_select(
+#                 0, index
+#             ),
+#             "labels": replay["labels"].index_select(0, index),
+#             "replay_kind": torch.cat(replay_kind, dim=0),
+#             "rival_labels": torch.cat(rivals, dim=0),
+#             "margins": torch.cat(margins, dim=0),
+#         }
+
+#     @torch.no_grad()
+#     def commit_incremental_phase(
+#         self,
+#         *,
+#         new_rows: Mapping[int, Mapping[str, Any]],
+#         phase: Optional[int] = None,
+#     ) -> Dict[str, Any]:
+#         self._require_transport()
+#         phase_value = self.current_phase if phase is None else int(phase)
+#         if phase_value != self.current_phase:
+#             raise RuntimeError("phase value does not match active phase")
+#         if set(int(key) for key in new_rows) != set(self.new_classes):
+#             raise RuntimeError("new row IDs do not match active new classes")
+#         transported, transport_report = self.build_transported_old_rows()
+#         result = self.geometry_bank.commit_incremental_phase(
+#             transported_old_rows=transported,
+#             new_rows=new_rows,
+#             old_class_ids=self.old_classes,
+#             new_class_ids=self.new_classes,
+#             phase=phase_value,
+#             expected_old_digest=self.phase_old_digest,
+#         )
+#         if self.classifier.bound_bank_contract_digest != (
+#             self.geometry_bank.contract_digest()
+#         ):
+#             raise RuntimeError(
+#                 "row evolution unexpectedly changed the immutable bank contract"
+#             )
+#         self.seen_classes = [*self.old_classes, *self.new_classes]
+#         self.old_classes = list(self.seen_classes)
+#         self.new_classes = []
+#         self.phase_old_digest = None
+#         self.phase_transport = None
+#         self.phase_mode = "evaluation"
+#         self.backbone.freeze_all()
+#         result["transport_report"] = transport_report
+#         result["factorization"] = "p(s|c)p(z|s,c)"
+#         result["transport_absorbed"] = True
 #         return result
 
-#     def assert_pg_rga_contract(self, seen_classes: Iterable[int], *, phase: str = "base") -> None:
-#         seen = _ordered_unique_ints(seen_classes)
-#         self.assert_phase_ready(seen, mode="geometry", require_geometry=True)
-#         if str(phase).lower().startswith("base"):
-#             if self.incremental_mode_active:
-#                 raise RuntimeError("Base contract violation: incremental_mode_active=True during base phase.")
-#             if _module_has_trainable_params(self.geometry_plastic_adapter):
-#                 raise RuntimeError("Base contract violation: geometry_plastic_adapter is trainable during base phase.")
-#         else:
-#             self.assert_frozen_modules()
-#             if self.use_geometry_gated_adapter and not _module_has_trainable_params(self.geometry_plastic_adapter):
-#                 raise RuntimeError("PG-RGA incremental contract violation: geometry_plastic_adapter is not trainable.")
+#     def abort_incremental_phase(self) -> None:
+#         """Discard temporary transport; trainer must restore encoder checkpoint."""
+#         self.phase_transport = None
+#         self.phase_old_digest = None
+#         self.new_classes = []
+#         self.seen_classes = self.infer_seen_classes()
+#         self.old_classes = list(self.seen_classes)
+#         self.phase_mode = "evaluation"
+#         self.backbone.freeze_all()
 
 #     # ------------------------------------------------------------------
-#     # Assertions
+#     # Geometry wrappers and validation
 #     # ------------------------------------------------------------------
-#     def assert_phase_ready(self, seen_classes: Iterable[int], *, mode: str = "geometry", require_geometry: bool = True) -> None:
-#         seen = _ordered_unique_ints(seen_classes)
-#         if not seen:
-#             raise RuntimeError("seen_classes is empty.")
-#         if self.geometry_bank.d_model != self.d_model:
-#             raise RuntimeError(f"GeometryBank d_model={self.geometry_bank.d_model} != model d_model={self.d_model}")
-#         if _normalize_classifier_mode(mode, "geometry") in {"geometry", "calibrated_geometry"} and require_geometry:
-#             if hasattr(self.geometry_bank, "assert_bank_valid"):
-#                 self.geometry_bank.assert_bank_valid(seen_classes=seen, strict=True)
-#             else:
-#                 bank = self.get_subspace_bank()
-#                 missing = [c for c in seen if c >= bank["sample_counts"].numel() or float(bank["sample_counts"][c].item()) <= 0.0]
-#                 if missing:
-#                     raise RuntimeError(f"Missing class geometry for seen classes: {missing}")
-#         if self.incremental_mode_active:
-#             # In incremental mode, frozen feature modules must stay eval to avoid dropout drift.
-#             bad_train = []
-#             for name in ("backbone", "projection"):
-#                 m = getattr(self, name)
-#                 if m.training:
-#                     bad_train.append(name)
-#             if bad_train:
-#                 raise RuntimeError(f"Incremental frozen modules must be eval(), but these are train(): {bad_train}")
-#         self.classifier.expand_to_seen_classes(seen)
-
-#     def assert_no_missing_class_geometry(self, seen_classes: Iterable[int]) -> None:
-#         if hasattr(self.geometry_bank, "assert_bank_valid"):
-#             self.geometry_bank.assert_bank_valid(seen_classes=seen_classes, strict=True)
-
-#     # ------------------------------------------------------------------
-#     # Forward
-#     # ------------------------------------------------------------------
-#     def forward(self, x: torch.Tensor, **kwargs: Any) -> Dict[str, Any]:
-#         mode = _normalize_classifier_mode(kwargs.get("classifier_mode", kwargs.get("mode", "geometry")), "geometry")
-#         return_features_only = _to_bool(kwargs.get("return_features_only", False), False)
-#         seen_classes = kwargs.get("seen_classes", None)
-#         old_classes = kwargs.get("old_classes", None)
-#         new_classes = kwargs.get("new_classes", None)
-#         targets = kwargs.get("targets", kwargs.get("labels", None))
-#         targets_are_global = _to_bool(kwargs.get("targets_are_global", kwargs.get("labels_are_global", False)), False)
-#         return_energy = _to_bool(kwargs.get("return_energy", False), False)
-#         return_parts = _to_bool(kwargs.get("return_parts", False), False)
-#         return_diagnostics = _to_bool(kwargs.get("return_diagnostics", False), False)
-
-#         apply_adapter = kwargs.get("apply_adapter", None)
-#         if mode == "base_ce":
-#             apply_adapter = False
-#         features_out = self.forward_features(
-#             x,
-#             spectral_summary=kwargs.get("spectral_summary", None),
-#             band_weights=kwargs.get("band_weights", None),
-#             spectral_summary_is_physical=kwargs.get("spectral_summary_is_physical", None),
-#             apply_adapter=apply_adapter,
+#     @torch.no_grad()
+#     def update_geometry_statistics(
+#         self,
+#         *,
+#         features: Tensor,
+#         raw_center_spectra: Tensor,
+#         labels: Tensor,
+#         class_ids: Sequence[int],
+#     ) -> Dict[str, float]:
+#         return self.geometry_bank.update_statistics(
+#             features,
+#             labels,
+#             class_ids,
+#             raw_spectra=raw_center_spectra,
 #         )
-#         if return_features_only or mode == "base_ce":
-#             if mode == "base_ce" or "num_base_classes" in kwargs:
-#                 nbase = int(kwargs.get("num_base_classes", self.base_ce_num_classes))
-#                 if nbase <= 0:
-#                     raise RuntimeError("num_base_classes is required for base_ce mode.")
-#                 features_out = dict(features_out)
-#                 features_out["logits"] = self.base_ce_logits(features_out["features"], nbase)
-#             return features_out
 
-#         if seen_classes is None:
-#             seen_classes = self._infer_seen_classes(self.geometry_bank)
-#         logits_out = self.compute_logits_from_features(
-#             features_out["features"],
-#             seen_classes=seen_classes,
-#             geometry_bank=self.geometry_bank,
-#             mode=mode,
-#             targets=targets,
-#             targets_are_global=targets_are_global,
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             return_energy=return_energy,
-#             return_parts=return_parts,
-#             return_diagnostics=return_diagnostics,
+#     @torch.no_grad()
+#     def geometry_admission_report(
+#         self,
+#         class_ids: Optional[Sequence[int]] = None,
+#         *,
+#         minimum_effective_dimension: float = 1.25,
+#         require_statistics: bool = True,
+#     ) -> Dict[str, Any]:
+#         ids = (
+#             self.infer_seen_classes()
+#             if class_ids is None
+#             else _unique_ids(class_ids, name="class_ids")
 #         )
-#         out: Dict[str, Any] = dict(features_out)
-#         if isinstance(logits_out, dict):
-#             out.update(logits_out)
-#         else:
-#             out["logits"] = logits_out
-#         return out
+#         return self.geometry_bank.admission_report(
+#             ids,
+#             minimum_effective_dimension=minimum_effective_dimension,
+#             require_statistics=require_statistics,
+#         )
+
+#     @torch.no_grad()
+#     def memory_snapshot(self) -> Dict[str, Any]:
+#         return {
+#             "bank": self.geometry_bank.export_snapshot(),
+#             "bank_contract_digest": (
+#                 self.geometry_bank.contract_digest()
+#                 if bool(self.geometry_bank.anchor_ready.item())
+#                 else None
+#             ),
+#             "rows_digest": (
+#                 self.geometry_bank.rows_digest(self.infer_seen_classes())
+#                 if self.infer_seen_classes()
+#                 else None
+#             ),
+#             "phase": self.current_phase,
+#             "seen_classes": list(self.seen_classes),
+#             "factorization": "p(s|c)p(z|s,c)",
+#         }

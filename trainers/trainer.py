@@ -1,1249 +1,533 @@
 from __future__ import annotations
 
+"""Top-level orchestration for transport-verified factor-geometry NECIL.
+
+Phase 0 is executed by ``BasePhaseTrainer``.  Phases t>0 are executed by
+``IncrementalPhaseTrainer``.  Accepted checkpoints contain only the deployed
+backbone, aggregate GeometryBank, parameter-free classifier state, phase
+metadata, and diagnostics; temporary phase observers are never persisted in
+the model checkpoint.
+"""
+
+import copy
+import math
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
+from typing import Any, Dict, List, Mapping, Optional
 import torch
-import torch.nn.functional as F
-
-from trainers.trainer_helpers import TrainerHelper
 from trainers.base_phase_trainer import BasePhaseTrainer
 from trainers.incremental_phase_trainer import IncrementalPhaseTrainer
+from trainers.trainer_helpers import TrainerHelper
 
 
-STACK_BUILD_ID = "SCTGR-STACK-CONTRACT-2026-07-07-R6"
+class Trainer(IncrementalPhaseTrainer, BasePhaseTrainer, TrainerHelper):
+    CHECKPOINT_FORMAT_VERSION = 4
 
+    def __init__(self, model: torch.nn.Module, dataset: Any, args: Any) -> None:
+        if model is None:
+            raise TypeError("Trainer requires a model")
+        if dataset is None:
+            raise TypeError("Trainer requires a dataset")
+        if args is None:
+            raise TypeError("Trainer requires explicit configuration")
 
-class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
-    STACK_BUILD_ID = STACK_BUILD_ID
-
-    """Strict exemplar-free HSI class-incremental trainer.
-
-    Base phase learns one canonical projected feature space and a replay-ready
-    GeometryBank. Incremental phases freeze the encoder, projection, classifier,
-    and every old bank row. Old support is reconstructed only through
-    spectral-coupled tangent geometry replay; temporary residual parameters refine
-    current new rows and are committed after validation.
-
-    The main path contains no feature adapter, teacher/KD, raw exemplar memory,
-    prototype classifier, transport, score calibration, or adaptive-boundary head.
-    """
-
-    # ------------------------------------------------------------------
-    # Small config helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _as_bool(value: Any, default: bool = False) -> bool:
-        if value is None:
-            return bool(default)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            v = value.strip().lower()
-            if v in {"1", "true", "yes", "y", "on"}:
-                return True
-            if v in {"0", "false", "no", "n", "off", "none", "null", ""}:
-                return False
-        return bool(value)
-
-    def _arg_bool(self, name: str, default: bool = False) -> bool:
-        return self._as_bool(getattr(self.args, name, default), default=default)
-
-    def _set_arg_default(self, name: str, value: Any) -> None:
-        if not hasattr(self.args, name) or getattr(self.args, name) is None:
-            try:
-                setattr(self.args, name, value)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _freeze_module_if_present(module: Optional[torch.nn.Module]) -> None:
-        if module is None:
-            return
-        try:
-            for p in module.parameters():
-                p.requires_grad = False
-        except Exception:
-            pass
-        try:
-            module.eval()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Runtime defaults and architecture normalization
-    # ------------------------------------------------------------------
-    def _install_clean_runtime_defaults(self) -> None:
-        """Install defaults for the single SCTGR-RGA architecture."""
-        defaults = {
-            # Geometry-only classifier.
-            "base_classifier_mode": "geometry_only",
-            "incremental_classifier_mode": "geometry_only",
-            "eval_classifier_mode": "geometry_only",
-            "use_logdet_energy": False,
-            "logdet_energy_weight": 0.0,
-            "logdet_normalize_by_dim": False,
-            "center_logdet_energy": False,
-            "energy_normalize_by_dim": True,
-            "geometry_normalize_logits": False,
-            "residual_variance_scale": 1.0,
-            "use_reliability_penalty": False,
-            "reliability_energy_weight": 0.0,
-            "invalid_class_energy": 1e6,
-
-            # Base objective.
-            "base_class_balance": True,
-            "base_ce_weight": 1.0,
-            "base_srpgr_weight": 1.0,
-            "base_energy_margin_weight": 0.15,
-            "base_energy_margin": 0.25,
-            "base_gics_weight": 0.20,
-            "base_gics_temperature": 0.07,
-            "pgr_weight": 0.10,
-            "pgr_compact_weight": 0.15,
-            "pgr_center_weight": 0.25,
-            "pgr_subspace_weight": 0.20,
-            "pgr_band_weight": 0.10,
-            "pgr_volume_weight": 0.05,
-            "pgr_center_margin": 1.10,
-            "pgr_min_class_samples": 3,
-            "pgr_subspace_min_samples": 6,
-            "pgr_subspace_rank": 3,
-            "pgr_max_class_variance": 0.75,
-            "pgr_band_overlap_max": 0.60,
-            "base_spectral_shape_weight": 0.10,
-            "base_require_physical_spectral_shape": False,
-            "strict_base_component_coverage": True,
-
-            # Replay-ready GeometryBank.
-            "rank_energy_threshold": 0.90,
-            "rank_eigen_ratio_threshold": 1e-2,
-            "min_active_rank": 1,
-            "geometry_variance_shrinkage": 0.25,
-            "geom_var_floor": 5e-4,
-            "geometry_bank_feature_space": "canonical",
-            "spectral_geometry_rank": 5,
-            "spectral_rank_energy_threshold": 0.95,
-            "spectral_rank_eigen_ratio_threshold": 1e-3,
-            "spectral_variance_floor": 1e-6,
-            "coupling_ridge": 1e-3,
-            "coupling_min_reliability": 0.20,
-            "spectral_tangent_clip": 2.5,
-            "replay_candidate_multiplier": 4,
-
-            # Incremental architecture and replay policy.
-            "incremental_update_mode": "spectral_coupled_geometry_replay",
-            "use_spectral_coupled_replay": True,
-            "gfa_weight": 1.0,
-            "gfa_samples_per_class": 48,
-            "gfa_reliability_gated": True,
-            "replay_min_per_class": 24,
-            "replay_max_per_class": 64,
-            "core_replay_ratio": 0.85,
-            "directed_replay_min_ratio": 0.10,
-            "directed_replay_max_ratio": 0.40,
-            "pair_risk_topk": 3,
-            "pair_risk_temperature": 0.75,
-            "replay_energy_filter": True,
-            "joint_old_new_ce_weight": 1.0,
-            "geometry_energy_margin_weight": 0.30,
-            "geometry_energy_margin": 0.30,
-            "old_new_invasion_weight": 0.50,
-            "old_new_geometry_margin": 0.35,
-
-            # New-row residual refinement.
-            "refine_new_descriptors": True,
-            "use_descriptor_refinement": True,
-            "descriptor_refine_steps": 20,
-            "descriptor_refine_steps_per_epoch": 20,
-            "descriptor_refine_lr": 1e-3,
-            "descriptor_trust_weight": 0.80,
-            "descriptor_refine_max_mean_shift": 0.30,
-            "descriptor_refine_max_logvar_shift": 0.50,
-            "descriptor_subspace_collision_weight": 0.10,
-            "descriptor_subspace_overlap_max": 0.35,
-            "descriptor_center_margin_weight": 0.05,
-            "descriptor_center_collision_weight": 0.05,
-            "descriptor_center_margin": 0.50,
-            "descriptor_volume_weight": 0.03,
-            "descriptor_volume_control_weight": 0.03,
-            "descriptor_volume_margin": 0.0,
-
-            # Physical spectra guide replay but never classifier logits.
-            "use_spectral_geometry": False,
-            "spectral_energy_weight": 0.0,
-            "band_energy_weight": 0.0,
-            "spectral_require_physical_summary": True,
-            "spectral_summary_is_physical": False,
-            "raw_spectral_summary_is_physical": True,
-            "external_spectra_are_physical": True,
-
-            # Validation and checkpointing.
-            "best_state_metric": "geometry_score",
-            "refresh_before_validation": True,
-            "validation_refresh_every": 1,
-            "enforce_base_geometry_certificate": False,
-            "base_cert_min_geom_acc": 95.0,
-            "base_cert_min_reliability": 0.15,
-            "base_cert_min_mean_reliability": 0.35,
-            "base_cert_max_subspace_overlap": 0.55,
-            "base_cert_max_geometry_conflict": 1.35,
-            "base_cert_max_band_similarity": 0.90,
-            "strict_updated_stack": True,
-        }
-        for key, value in defaults.items():
-            self._set_arg_default(key, value)
-
-    def _incremental_update_mode(self) -> str:
-        raw = str(getattr(self.args, "incremental_update_mode", "spectral_coupled_geometry_replay")).lower().strip()
-        aliases = {
-            "": "spectral_coupled_geometry_replay",
-            "none": "spectral_coupled_geometry_replay",
-            "clean": "spectral_coupled_geometry_replay",
-            "main": "spectral_coupled_geometry_replay",
-            "descriptor": "spectral_coupled_geometry_replay",
-            "descriptor_only": "spectral_coupled_geometry_replay",
-            "descriptor_refinement": "spectral_coupled_geometry_replay",
-            "scbgr": "spectral_coupled_geometry_replay",
-            "sctgr": "spectral_coupled_geometry_replay",
-            "spectral_coupled": "spectral_coupled_geometry_replay",
-            "spectral_coupled_replay": "spectral_coupled_geometry_replay",
-            "spectral_coupled_geometry_replay": "spectral_coupled_geometry_replay",
-        }
-        forbidden = {
-            "adapter", "gated_adapter", "geometry_adapter", "geometry_gated_adapter",
-            "g2rpa", "g2-rpa", "transport", "geometry_transport",
-        }
-        if raw in forbidden:
-            raise RuntimeError(
-                f"incremental_update_mode={raw!r} selects a removed architecture. "
-                "Use spectral_coupled_geometry_replay."
-            )
-        mode = aliases.get(raw, raw)
-        if mode != "spectral_coupled_geometry_replay":
-            raise RuntimeError(f"Unsupported incremental_update_mode={raw!r}.")
-        setattr(self.args, "incremental_update_mode", mode)
-        if hasattr(self.model, "incremental_update_mode"):
-            self.model.incremental_update_mode = mode
-        return mode
-
-    def _adapter_mode_enabled(self) -> bool:
-        """Feature adapters are not part of SCTGR-RGA."""
-        return False
-
-    def _normalize_classifier_mode(self, mode: Optional[str], *, context: str = "runtime") -> str:
-        raw = str(mode or "geometry_only").lower().strip()
-        aliases = {
-            "": "geometry_only",
-            "none": "geometry_only",
-            "geo": "geometry_only",
-            "geometry": "geometry_only",
-            "geometry-only": "geometry_only",
-            "feature_geometry": "geometry_only",
-            "low_rank_geometry": "geometry_only",
-            "replay": "geometry_only",
-            "synthetic_replay": "geometry_only",
-            "srgp": "geometry_only",
-            "srgp_geometry": "geometry_only",
-        }
-        forbidden_aliases = {"spectral_geometry", "spectral_residual", "calibrated_geometry", "topology_calibrated_geometry", "base_ce"}
-        if raw in forbidden_aliases:
-            raise RuntimeError(
-                f"{context}: classifier mode {raw!r} is not allowed. The trainer has one inference path: geometry_only."
-            )
-        normalized = aliases.get(raw, raw)
-        if normalized != "geometry_only":
-            raise RuntimeError(f"{context}: unsupported classifier mode={raw!r}; use geometry_only.")
-        return normalized
-
-    def _force_clean_main_path_args(self) -> None:
-        """Force one coherent architecture and disable contradictory branches."""
-        mode = self._incremental_update_mode()
-        forced = {
-            "incremental_update_mode": mode,
-            "base_classifier_mode": "geometry_only",
-            "incremental_classifier_mode": "geometry_only",
-            "eval_classifier_mode": "geometry_only",
-            "geometry_normalize_logits": False,
-            "energy_normalize_by_dim": True,
-            "residual_variance_scale": 1.0,
-            "use_logdet_energy": False,
-            "logdet_energy_weight": 0.0,
-            "logdet_normalize_by_dim": False,
-            "center_logdet_energy": False,
-            "use_reliability_penalty": False,
-            "reliability_energy_weight": 0.0,
-            "use_spectral_coupled_replay": True,
-            "use_incremental_adapter": False,
-            "use_geometry_gated_adapter": False,
-            "disable_incremental_adapter": True,
-            "incremental_adapter_normalize": False,
-            "allow_incremental_projection_training": False,
-            "freeze_projection_during_incremental": True,
-            "use_geometry_calibrator": False,
-            "geometry_calibration_weight": 0.0,
-            "use_energy_calibrator": False,
-            "energy_calibration_weight": 0.0,
-            "use_bicyc_geometry_cycle": False,
-            "bicyc_geometry_cycle_weight": 0.0,
-            "bicyc_cycle_weight": 0.0,
-            "bss_weight": 0.0,
-            "sym_bss_weight": 0.0,
-            "gdr_weight": 0.0,
-            "anchor_consistency_weight": 0.0,
-            "use_sglat_transport": False,
-            "use_geometry_transport": False,
-            "allow_old_model_transport": False,
-            "allow_transport_without_adapter": False,
-            "use_boundary_geometry_replay": False,
-            "use_adaptive_boundary": False,
-            "use_boundary_projection": False,
-            "boundary_preserve_weight": 0.0,
-            "use_spectral_geometry": False,
-            "spectral_energy_weight": 0.0,
-            "band_energy_weight": 0.0,
-            "early_stop_patience": 0,
-            "base_early_stop_patience": 0,
-            "incremental_early_stop_patience": 0,
-        }
-        for key, value in forced.items():
-            setattr(self.args, key, value)
-
-        self.incremental_update_mode = mode
-        self.use_spectral_coupled_replay = True
-        self.energy_normalize_by_dim = True
-        self.residual_variance_scale = 1.0
-        self.use_logdet_energy = False
-        self.logdet_energy_weight = 0.0
-        self.logdet_normalize_by_dim = False
-        self.center_logdet_energy = False
-        self.reliability_energy_weight = 0.0
-        self.use_geometry_transport = False
-        self.use_sglat_transport = False
-        self.use_boundary_geometry_replay = False
-        self.use_adaptive_boundary = False
-        self.use_energy_calibrator = False
-        self.use_spectral_geometry = False
-        self.spectral_energy_weight = 0.0
-        self.band_energy_weight = 0.0
-
-        for attr, value in (
-            ("incremental_update_mode", mode),
-            ("use_incremental_adapter", False),
-            ("use_geometry_gated_adapter", False),
-            ("use_geometry_transport", False),
-            ("use_sglat_transport", False),
-            ("use_geometry_calibrator", False),
-            ("use_energy_calibrator", False),
-            ("use_adaptive_boundary", False),
-            ("use_bicyc_geometry_cycle", False),
-        ):
-            if hasattr(self.model, attr):
-                setattr(self.model, attr, value)
-        for name in ("disable_incremental_adapter", "freeze_geometry_calibrator", "freeze_energy_calibrator"):
-            fn = getattr(self.model, name, None)
-            if callable(fn):
-                fn()
-
-    def _propagate_clean_energy_config_to_model(self) -> None:
-        clf = getattr(self.model, "classifier", None)
-        if clf is not None:
-            pairs = {
-                "use_logdet_energy": bool(self.use_logdet_energy),
-                "logdet_energy_weight": float(self.logdet_energy_weight),
-                "logdet_normalize_by_dim": bool(self.logdet_normalize_by_dim),
-                "center_logdet_energy": bool(self.center_logdet_energy),
-                "energy_normalize_by_dim": bool(self.energy_normalize_by_dim),
-                "normalize_energy_by_dim": bool(self.energy_normalize_by_dim),
-                "use_reliability_penalty": False,
-                "reliability_energy_weight": float(self.reliability_energy_weight),
-                "residual_variance_scale": float(self.residual_variance_scale),
-                "invalid_class_energy": float(self.invalid_class_energy),
-                "use_spectral_geometry": False,
-                "spectral_energy_weight": 0.0,
-                "band_energy_weight": 0.0,
-                "use_adaptive_boundary": False,
-            }
-            for k, v in pairs.items():
-                if hasattr(clf, k):
-                    try:
-                        setattr(clf, k, v)
-                    except Exception:
-                        pass
-            if hasattr(clf, "normalize_logits"):
-                clf.normalize_logits = False
-            if hasattr(clf, "freeze_all_adaptation"):
-                clf.freeze_all_adaptation()
-        if hasattr(self.model, "use_adaptive_boundary"):
-            self.model.use_adaptive_boundary = False
-
-    def _assert_strict_energy_contract(self) -> None:
-        """Fail immediately if any component reactivates obsolete scoring terms."""
-        errors: List[str] = []
-        checks = {
-            "energy_normalize_by_dim": bool(self.energy_normalize_by_dim),
-            "residual_variance_scale": abs(float(self.residual_variance_scale) - 1.0) <= 1e-8,
-            "use_logdet_energy": not bool(self.use_logdet_energy),
-            "logdet_energy_weight": abs(float(self.logdet_energy_weight)) <= 1e-12,
-            "center_logdet_energy": not bool(self.center_logdet_energy),
-            "reliability_energy_weight": abs(float(self.reliability_energy_weight)) <= 1e-12,
-        }
-        errors.extend(name for name, ok in checks.items() if not ok)
-
-        clf = getattr(self.model, "classifier", None)
-        if clf is not None:
-            classifier_checks = {
-                "classifier.normalize_energy_by_dim": bool(
-                    getattr(clf, "normalize_energy_by_dim", getattr(clf, "energy_normalize_by_dim", True))
-                ),
-                "classifier.residual_variance_scale": abs(
-                    float(getattr(clf, "residual_variance_scale", 1.0)) - 1.0
-                ) <= 1e-8,
-                "classifier.use_logdet_energy": not bool(getattr(clf, "use_logdet_energy", False)),
-                "classifier.logdet_energy_weight": abs(
-                    float(getattr(clf, "logdet_energy_weight", 0.0))
-                ) <= 1e-12,
-                "classifier.center_logdet_energy": not bool(
-                    getattr(clf, "center_logdet_energy", False)
-                ),
-                "classifier.reliability_energy_weight": abs(
-                    float(getattr(clf, "reliability_energy_weight", 0.0))
-                ) <= 1e-12,
-            }
-            errors.extend(name for name, ok in classifier_checks.items() if not ok)
-
-        if errors:
-            raise RuntimeError(
-                "Strict SCTGR geometry-energy contract failed: "
-                + ", ".join(errors)
-                + ". Required: rank/dimension normalized energy, residual scale 1.0, "
-                  "no logdet, no centered logdet, and no reliability logit bias."
-            )
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
-    def __init__(self, model, dataset, args) -> None:
         self.args = args
-        self.device = torch.device(getattr(args, "device", "cpu"))
-        self.model = model.to(self.device)
-        self.dataset = dataset
-        self.save_dir = str(getattr(args, "save_dir", "./checkpoints"))
+        self.device = self._resolve_device(getattr(args, "device", "cpu"))
+        self.save_dir = os.path.abspath(
+            str(getattr(args, "save_dir", "./outputs"))
+        )
         os.makedirs(self.save_dir, exist_ok=True)
 
-        self.debug = self._arg_bool("debug_verbose", False) or os.environ.get("NECIL_DEBUG", "0") == "1"
-        self.base_only = self._arg_bool("base_only", False)
-        self.disable_incremental_training = self._arg_bool("disable_incremental_training", False)
-        self._last_incremental_preflight_signature: Optional[Tuple[int, Tuple[int, ...], Tuple[int, ...]]] = None
-
-        self._install_clean_runtime_defaults()
-        self.incremental_update_mode = self._incremental_update_mode()
-
-        # Core geometry/classifier settings.
-        self.subspace_rank = int(getattr(args, "subspace_rank", 5))
-        self.geom_var_floor = float(getattr(args, "geom_var_floor", 5e-4))
-        self.reliability_energy_weight = 0.0
-        self.energy_normalize_by_dim = self._arg_bool("energy_normalize_by_dim", True)
-        self.residual_variance_scale = 1.0
-        self.invalid_class_energy = float(getattr(args, "invalid_class_energy", 1e6))
-        self.use_logdet_energy = False
-        self.logdet_energy_weight = 0.0
-        self.logdet_normalize_by_dim = self._arg_bool("logdet_normalize_by_dim", True)
-        self.center_logdet_energy = False
-
-        # Mandatory base phase.
-        self.base_ce_weight = float(getattr(args, "base_ce_weight", 1.0))
-        self.base_srpgr_weight = float(getattr(args, "base_srpgr_weight", 1.0))
-        self.base_energy_margin_weight = float(getattr(args, "base_energy_margin_weight", 0.15))
-        self.base_energy_margin = float(getattr(args, "base_energy_margin", 0.25))
-        self.base_gics_weight = float(getattr(args, "base_gics_weight", 0.20))
-        self.pgr_weight = float(getattr(args, "pgr_weight", 0.10))
-        self.pgr_compact_weight = float(getattr(args, "pgr_compact_weight", 0.15))
-        self.pgr_center_weight = float(getattr(args, "pgr_center_weight", 0.25))
-        self.pgr_subspace_weight = float(getattr(args, "pgr_subspace_weight", 0.15))
-        self.pgr_band_weight = float(getattr(args, "pgr_band_weight", 0.05))
-        self.pgr_volume_weight = float(getattr(args, "pgr_volume_weight", 0.05))
-        self.pgr_center_margin = float(getattr(args, "pgr_center_margin", 1.10))
-        self.pgr_min_class_samples = int(getattr(args, "pgr_min_class_samples", 3))
-        self.pgr_subspace_min_samples = int(getattr(args, "pgr_subspace_min_samples", 6))
-        self.pgr_subspace_rank = int(getattr(args, "pgr_subspace_rank", 3))
-        self.pgr_max_class_variance = float(getattr(args, "pgr_max_class_variance", 0.75))
-        self.pgr_band_overlap_max = float(getattr(args, "pgr_band_overlap_max", 0.65))
-        self.pgr_normalize_features = self._arg_bool("pgr_normalize_features", True)
-
-        # GeometryBank extraction/rank.
-        self.rank_energy_threshold = float(getattr(args, "rank_energy_threshold", 0.90))
-        self.rank_eigen_ratio_threshold = float(getattr(args, "rank_eigen_ratio_threshold", 1e-2))
-        self.min_active_rank = int(getattr(args, "min_active_rank", 1))
-        self.geometry_variance_shrinkage = float(getattr(args, "geometry_variance_shrinkage", 0.25))
-
-        # Optimizer/checkpoint policy.
-        self.label_smoothing = float(getattr(args, "label_smoothing", 0.0))
-        self.ce_logit_clip = float(getattr(args, "ce_logit_clip", 50.0))
-        self.grad_clip_base = float(getattr(args, "grad_clip_base", 1.0))
-        self.grad_clip_inc = float(getattr(args, "grad_clip_inc", 0.5))
-        self.refresh_before_validation = self._arg_bool("refresh_before_validation", True)
-        self.validation_refresh_every = int(getattr(args, "validation_refresh_every", 1))
-        self.bank_refresh_every = int(getattr(args, "bank_refresh_every", 0))
-        self.best_state_metric = str(getattr(args, "best_state_metric", "geometry_score")).lower().strip() or "geometry_score"
-        self.early_stop_patience = 0
-
-        # Incremental Low-Rank Geometry Replay / Residual Geometry Adaptation objective.
-        self.gfa_weight = float(getattr(args, "gfa_weight", 1.0))
-        self.gfa_samples_per_class = int(getattr(args, "gfa_samples_per_class", 48))
-        self.gfa_parallel_scale = float(getattr(args, "gfa_parallel_scale", 0.95))
-        self.gfa_residual_scale = float(getattr(args, "gfa_residual_scale", 0.25))
-        self.gfa_reliability_gated = self._arg_bool("gfa_reliability_gated", True)
-        self.joint_old_new_ce_weight = float(getattr(args, "joint_old_new_ce_weight", 1.0))
-        self.geometry_energy_margin_weight = float(getattr(args, "geometry_energy_margin_weight", 0.30))
-        self.geometry_energy_margin = float(getattr(args, "geometry_energy_margin", 0.30))
-        self.old_new_invasion_weight = float(getattr(args, "old_new_invasion_weight", 0.50))
-        self.old_new_geometry_margin = float(getattr(args, "old_new_geometry_margin", 0.35))
-        self.use_pretrain_incremental_baseline = False
-
-        # Spectral-coupled replay policy.
-        self.use_spectral_coupled_replay = self._arg_bool("use_spectral_coupled_replay", True)
-        self.replay_min_per_class = int(getattr(args, "replay_min_per_class", 24))
-        self.replay_max_per_class = int(getattr(args, "replay_max_per_class", 64))
-        self.core_replay_ratio = float(getattr(args, "core_replay_ratio", 0.85))
-        self.directed_replay_min_ratio = float(getattr(args, "directed_replay_min_ratio", 0.10))
-        self.directed_replay_max_ratio = float(getattr(args, "directed_replay_max_ratio", 0.40))
-        self.pair_risk_topk = int(getattr(args, "pair_risk_topk", 3))
-        self.pair_risk_temperature = float(getattr(args, "pair_risk_temperature", 0.75))
-        self.spectral_tangent_clip = float(getattr(args, "spectral_tangent_clip", 2.5))
-        self.replay_candidate_multiplier = int(getattr(args, "replay_candidate_multiplier", 4))
-        self.coupling_min_reliability = float(getattr(args, "coupling_min_reliability", 0.20))
-
-        # New descriptor row refinement knobs consumed by IncrementalPhaseTrainer.
-        self.refine_new_descriptors = self._arg_bool("refine_new_descriptors", True)
-        self.use_descriptor_refinement = self._arg_bool("use_descriptor_refinement", self.refine_new_descriptors)
-        self.descriptor_refine_steps = int(getattr(args, "descriptor_refine_steps", 5))
-        self.descriptor_refine_lr = float(getattr(args, "descriptor_refine_lr", 1e-3))
-        self.descriptor_trust_weight = float(getattr(args, "descriptor_trust_weight", 0.80))
-        self.descriptor_refine_max_mean_shift = float(getattr(args, "descriptor_refine_max_mean_shift", 0.30))
-        self.descriptor_refine_max_logvar_shift = float(getattr(args, "descriptor_refine_max_logvar_shift", 0.50))
-        self.descriptor_refine_steps_per_epoch = int(getattr(args, "descriptor_refine_steps_per_epoch", self.descriptor_refine_steps))
-        if self.descriptor_refine_steps_per_epoch <= 0:
-            self.descriptor_refine_steps_per_epoch = self.descriptor_refine_steps
-        self.descriptor_refine_grad_clip = float(getattr(args, "descriptor_refine_grad_clip", 1.0))
-        self.descriptor_subspace_collision_weight = float(getattr(args, "descriptor_subspace_collision_weight", 0.10))
-        self.descriptor_subspace_overlap_max = float(getattr(args, "descriptor_subspace_overlap_max", 0.35))
-        self.descriptor_center_margin_weight = float(getattr(args, "descriptor_center_margin_weight", 0.05))
-        self.descriptor_center_collision_weight = float(getattr(args, "descriptor_center_collision_weight", self.descriptor_center_margin_weight))
-        self.descriptor_center_margin = float(getattr(args, "descriptor_center_margin", 0.50))
-        self.descriptor_volume_weight = float(getattr(args, "descriptor_volume_weight", 0.03))
-        self.descriptor_volume_control_weight = float(getattr(args, "descriptor_volume_control_weight", self.descriptor_volume_weight))
-        self.descriptor_volume_margin = float(getattr(args, "descriptor_volume_margin", 0.0))
-
-        # Explicitly inactive legacy branches. Attributes remain for compatibility only.
-        self.use_boundary_geometry_replay = False
-        self.use_risk_weighted_replay = True
-        self.use_energy_calibrator = False
-        self.use_adaptive_boundary = False
-        self.use_geometry_transport = False
-        self.use_sglat_transport = False
-        self.allow_incremental_projection_training = False
-        self.freeze_projection_during_incremental = True
-        self.use_spectral_geometry = False
-        self.spectral_energy_weight = 0.0
-        self.band_energy_weight = 0.0
-        self.bss_weight = 0.0
-        self.sym_bss_weight = 0.0
-        self.gdr_weight = 0.0
-        self.anchor_consistency_weight = 0.0
-        self.geometry_calibration_weight = 0.0
-        self.energy_calibration_weight = 0.0
-        self.boundary_preserve_weight = 0.0
-        self.use_boundary_projection = False
-
-        self._force_clean_main_path_args()
-        self._propagate_clean_energy_config_to_model()
-        self._assert_strict_energy_contract()
-        self._assert_global_architecture_contract()
-        self._assert_updated_stack_contract(phase=0)
-        self._set_base_trainable_params()
-
-    # ------------------------------------------------------------------
-    # Stack contract and trainability
-    # ------------------------------------------------------------------
-    def _assert_updated_stack_contract(self, phase: Optional[int] = None) -> None:
-        """Validate the exact APIs required by the current phase."""
-        strict = self._arg_bool("strict_updated_stack", True)
-        phase_i = 0 if phase is None else int(phase)
-        missing: List[str] = []
-
-        expected_incremental_build = "SCTGR-DIRECT-INVASION-2026-07-07-R5"
-        actual_incremental_build = getattr(IncrementalPhaseTrainer, "STACK_BUILD_ID", None)
-        if actual_incremental_build != expected_incremental_build:
-            missing.append(
-                "incremental_phase_trainer build mismatch "
-                f"(expected={expected_incremental_build}, actual={actual_incremental_build})"
-            )
-        if getattr(IncrementalPhaseTrainer, "USES_LEGACY_BOUNDARY_HELPER", None) is not False:
-            missing.append("IncrementalPhaseTrainer.USES_LEGACY_BOUNDARY_HELPER must be False")
-        if getattr(IncrementalPhaseTrainer, "REFINES_NEW_BASES", None) is not False:
-            missing.append("IncrementalPhaseTrainer.REFINES_NEW_BASES must be False")
-
-        for attr in ("extract_projected_features", "compute_logits_from_features", "get_subspace_bank"):
-            if not hasattr(self.model, attr):
-                missing.append(f"model.{attr}")
-        if not hasattr(self.model, "assert_method_identity"):
-            missing.append("model.assert_method_identity")
-
-        classifier = getattr(self.model, "classifier", None)
-        if classifier is None or not hasattr(classifier, "forward"):
-            missing.append("model.classifier")
-
-        bank = getattr(self.model, "geometry_bank", None)
-        if bank is None:
-            missing.append("model.geometry_bank")
-        else:
-            for attr in ("get_valid_mask", "assert_bank_valid", "build_candidate_geometry_rows", "commit_candidate_geometry_rows"):
-                if not hasattr(bank, attr):
-                    missing.append(f"geometry_bank.{attr}")
-            if phase_i > 0 and not hasattr(bank, "sample_replay"):
-                missing.append("geometry_bank.sample_replay")
-
-        for attr in (
-            "_safe_get_subspace_bank", "global_to_seen_local", "assert_bank_ready_for_seen_classes",
-            "snapshot_bank_rows", "assert_bank_rows_unchanged",
-        ):
-            if not hasattr(self, attr):
-                missing.append(f"TrainerHelper.{attr}")
-
-        if missing:
-            message = "Strict SCTGR-RGA stack contract failed: " + ", ".join(missing)
-            if strict:
-                raise RuntimeError(message)
-            print(f"[WARN] {message}")
-        if hasattr(self.model, "assert_method_identity"):
-            self.model.assert_method_identity()
-
-    def _assert_global_architecture_contract(self) -> None:
-        mode = self._incremental_update_mode()
-        if mode != "spectral_coupled_geometry_replay":
-            raise RuntimeError(f"Unexpected incremental mode {mode!r}.")
-        for key in ("base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode"):
-            self._normalize_classifier_mode(getattr(self.args, key, "geometry_only"), context=key)
-
-        forbidden_true = (
-            "use_geometry_calibrator", "use_incremental_adapter", "use_geometry_gated_adapter",
-            "use_bicyc_geometry_cycle", "allow_incremental_projection_training",
-            "use_sglat_transport", "use_geometry_transport", "allow_old_model_transport",
-            "use_boundary_geometry_replay", "use_adaptive_boundary", "use_energy_calibrator",
-            "geometry_normalize_logits",
+        self.model = model.to(self.device)
+        self.dataset = dataset
+        self.debug = self._parse_bool(
+            getattr(args, "debug_verbose", False), "debug_verbose"
         )
-        bad = [key for key in forbidden_true if self._arg_bool(key, False)]
-        if bad:
-            raise RuntimeError(f"Forbidden architecture switches are active: {bad}")
-        for key in (
-            "bss_weight", "sym_bss_weight", "gdr_weight", "anchor_consistency_weight",
-            "geometry_calibration_weight", "energy_calibration_weight",
-        ):
-            if abs(float(getattr(self.args, key, 0.0))) > 0.0:
-                raise RuntimeError(f"{key} must be 0.0 in SCTGR-RGA.")
-        if not self._arg_bool("use_spectral_coupled_replay", True):
-            raise RuntimeError("use_spectral_coupled_replay must be true.")
-        self._assert_strict_energy_contract()
-        if hasattr(self.model, "assert_method_identity"):
-            self.model.assert_method_identity()
+        self._last_base_geometry_report: Optional[Dict[str, Any]] = None
+        self._last_phase_history: Optional[Dict[str, Any]] = None
 
-    def _set_base_trainable_params(self) -> None:
-        self._force_clean_main_path_args()
-        self._propagate_clean_energy_config_to_model()
-        for name, p in self.model.named_parameters():
-            blocked = (
-                name.startswith("classifier.") or name.startswith("geometry_bank.")
-                or name.startswith("geometry_calibrator.") or name.startswith("geometry_cycle_calibrator.")
-                or name.startswith("incremental_adapter.") or name.startswith("geometry_plastic_adapter.")
-                or name.startswith("base_ce_head.")
-            )
-            p.requires_grad = not blocked
-        if hasattr(self.model, "freeze_energy_calibrator"):
-            self.model.freeze_energy_calibrator()
-        if hasattr(self.model, "freeze_geometry_calibrator"):
-            self.model.freeze_geometry_calibrator()
-        if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-            self.model.freeze_geometry_plastic_adapter()
-
-    def _set_incremental_trainable_params(
-        self,
-        old_classes: Iterable[int] | int = 0,
-        new_classes: Optional[Iterable[int]] = None,
-    ) -> List[torch.nn.Parameter]:
-        """Freeze every model parameter; refinement uses temporary descriptor tensors."""
-        self._force_clean_main_path_args()
-        self._propagate_clean_energy_config_to_model()
-        if isinstance(old_classes, int):
-            old_ids = list(range(max(int(old_classes), 0)))
-        else:
-            old_ids = [int(c) for c in old_classes]
-        new_ids = [int(c) for c in (new_classes or [])]
-        for _, parameter in self.model.named_parameters():
-            parameter.requires_grad = False
-        if hasattr(self.model, "set_incremental_mode"):
-            self.model.set_incremental_mode(
-                phase=int(getattr(self.model, "current_phase", 1)),
-                old_classes=old_ids,
-                old_class_count=len(old_ids),
-                train_classifier_calibration=False,
-                train_geometry_adapter=False,
-            )
-        for name in (
-            "freeze_backbone_only", "freeze_projection_head", "freeze_classifier",
-            "freeze_energy_calibrator", "freeze_geometry_calibrator", "disable_incremental_adapter",
-        ):
-            fn = getattr(self.model, name, None)
-            if callable(fn):
-                fn()
-        bad = [name for name, parameter in self.model.named_parameters() if parameter.requires_grad]
-        if bad:
-            raise RuntimeError(f"No model parameters may be trainable incrementally: {bad[:30]}")
-        return []
-
-    def _set_clean_incremental_trainable_params(self, old_class_count: int) -> List[torch.nn.Parameter]:
-        return self._set_incremental_trainable_params(int(old_class_count), [])
-
-    def _has_feature_plasticity(self) -> bool:
-        return False
-
-    def _has_descriptor_plasticity(self) -> bool:
-        return bool(getattr(self, "refine_new_descriptors", False))
-
-    def _has_energy_calibration_plasticity(self) -> bool:
-        return False
-
-    def _has_adaptive_boundary_plasticity(self) -> bool:
-        return False
+        self.assert_architecture_contract()
+        dataset_contract = self.assert_dataset_contract()
+        self.phase_schedule = dict(dataset_contract["schedule"])
+        self.base_classes = list(dataset_contract["base_classes"])
+        self._prepare_initial_state()
 
     # ------------------------------------------------------------------
-    # Phase/mode helpers
+    # Device and accepted phase state
     # ------------------------------------------------------------------
-    def _base_classifier_mode(self) -> str:
-        return "geometry_only"
 
-    def _inc_classifier_mode(self) -> str:
-        return "geometry_only"
+    @staticmethod
+    def _parse_bool(value: Any, name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in {"1", "true", "yes", "y", "on"}:
+                return True
+            if token in {"0", "false", "no", "n", "off"}:
+                return False
+        raise RuntimeError(f"{name} must be an explicit boolean")
 
-    def _eval_classifier_mode(self) -> str:
-        return "geometry_only"
+    @staticmethod
+    def _resolve_device(value: Any) -> torch.device:
+        token = str(value).strip().lower()
+        if token == "gpu":
+            token = "cuda"
+        requested = torch.device(token)
+        if requested.type == "cpu":
+            return requested
+        if requested.type != "cuda":
+            raise RuntimeError(f"unsupported device type {requested.type!r}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable")
+        index = (
+            torch.cuda.current_device()
+            if requested.index is None
+            else requested.index
+        )
+        if not 0 <= index < torch.cuda.device_count():
+            raise RuntimeError(f"invalid CUDA device index {index}")
+        torch.cuda.set_device(index)
+        return torch.device(f"cuda:{index}")
 
-    def _set_model_phase_and_old_count(self, phase: int, old_class_count: int) -> None:
-        """Set phase state before training or after committing a phase.
+    def _cumulative_classes(self, phase: int) -> List[int]:
+        if phase not in self.phase_schedule:
+            raise RuntimeError(f"phase {phase} is outside the schedule")
+        output: List[int] = []
+        for index in range(phase + 1):
+            output.extend(int(value) for value in self.phase_schedule[index])
+        return output
 
-        Before phase ``t`` the old set is classes through ``t-1``. After phase
-        ``t`` is committed, callers promote all classes through ``t`` to the old
-        set for the next phase. Both transitions are valid and explicit.
-        """
-        phase = int(phase)
-        old_class_count = int(old_class_count)
-        if phase == 0:
-            if old_class_count != 0:
-                raise RuntimeError("Base phase old_class_count must be zero.")
-            if hasattr(self.model, "set_base_mode"):
-                self.model.set_base_mode(train_backbone=True, train_projection=True)
-            self.model.current_phase = 0
-            self.model.old_class_count = 0
+    def _phase_for_valid_rows(self, valid_rows: List[int]) -> Optional[int]:
+        valid_set = set(int(value) for value in valid_rows)
+        for phase in sorted(self.phase_schedule):
+            if valid_set == set(self._cumulative_classes(phase)):
+                return int(phase)
+        return None
+
+    def _prepare_initial_state(self) -> None:
+        bank = self.model.geometry_bank
+        valid = self.model.infer_seen_classes()
+        if not valid:
+            partial_contract = any(
+                (
+                    bool(bank.global_priors_ready.item()),
+                    bool(bank.overlap_temperatures_ready.item()),
+                    bool(self.model.classifier.require_bound_contract),
+                    len(bank) > 0,
+                )
+            )
+            if partial_contract:
+                raise RuntimeError(
+                    "the model contains a partial geometry state without valid "
+                    "committed rows; start fresh or load an accepted checkpoint"
+                )
+            self.model.set_base_mode()
             return
 
-        before_ids: List[int] = []
-        through_ids: List[int] = []
-        if hasattr(self.dataset, "get_classes_up_to_phase"):
-            try:
-                before_ids = [int(c) for c in self.dataset.get_classes_up_to_phase(phase - 1)]
-                through_ids = [int(c) for c in self.dataset.get_classes_up_to_phase(phase)]
-            except Exception:
-                before_ids, through_ids = [], []
-        if not before_ids:
-            before_ids = self._seen_classes_for_phase(phase - 1)
-        if not through_ids:
-            through_ids = self._seen_classes_for_phase(phase)
-
-        if old_class_count == len(before_ids):
-            old_ids = before_ids
-        elif old_class_count == len(through_ids):
-            old_ids = through_ids
-        else:
+        phase = self._phase_for_valid_rows(valid)
+        if phase is None:
             raise RuntimeError(
-                f"old_class_count={old_class_count} matches neither pre-phase ({len(before_ids)}) "
-                f"nor post-phase ({len(through_ids)}) state for phase {phase}."
+                f"existing rows {valid} do not match any cumulative phase schedule"
             )
-        if hasattr(self.model, "set_incremental_mode"):
-            self.model.set_incremental_mode(
-                phase=phase,
-                old_class_count=len(old_ids),
-                old_classes=old_ids,
-                train_classifier_calibration=False,
-                train_geometry_adapter=False,
-            )
-        self.model.current_phase = phase
-        self.model.old_class_count = len(old_ids)
+        self._set_accepted_phase_state(phase)
+        self._assert_final_phase_memory(phase)
 
-    def _stable_ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if logits is None or not torch.is_tensor(logits) or logits.numel() == 0:
-            return self._zero(logits)
-        labels = labels.long().view(-1).to(logits.device)
-        if labels.numel() != logits.size(0):
-            raise RuntimeError(f"CE batch mismatch: logits={logits.size(0)}, labels={labels.numel()}")
-        if labels.numel() == 0:
-            return logits.sum() * 0.0
-        lo = int(labels.min().detach().item())
-        hi = int(labels.max().detach().item())
-        if lo < 0 or hi >= logits.size(1):
-            raise RuntimeError(f"CE label range [{lo},{hi}] incompatible with logits width={logits.size(1)}")
-        clip = float(getattr(self, "ce_logit_clip", getattr(self.args, "ce_logit_clip", 50.0)))
-        smoothing = float(getattr(self, "label_smoothing", getattr(self.args, "label_smoothing", 0.0)))
-        return F.cross_entropy(logits.clamp(-clip, clip), labels, label_smoothing=smoothing)
-
-    def _classes_tensor(self, class_ids: Iterable[int], *, device=None) -> torch.Tensor:
-        ids = [int(c) for c in class_ids]
-        if not ids:
-            raise RuntimeError("class_ids must be non-empty.")
-        if len(set(ids)) != len(ids):
-            raise RuntimeError(f"class_ids contains duplicates: {ids}")
-        if min(ids) < 0:
-            raise RuntimeError(f"class_ids must be non-negative global IDs, got {ids}")
-        return torch.as_tensor(ids, device=device if device is not None else self.device, dtype=torch.long)
-
-    def _seen_classes_for_phase(self, phase: int, fallback_labels: Optional[torch.Tensor] = None) -> List[int]:
-        if hasattr(self.dataset, "get_classes_up_to_phase"):
-            try:
-                seen = [int(c) for c in self.dataset.get_classes_up_to_phase(int(phase))]
-                if seen:
-                    return list(dict.fromkeys(seen))
-            except Exception:
-                pass
-        seen: List[int] = []
-        if hasattr(self.dataset, "phase_to_classes"):
-            for p in range(int(phase) + 1):
-                try:
-                    seen.extend(int(c) for c in self.dataset.phase_to_classes[p])
-                except Exception:
-                    pass
-        if not seen and torch.is_tensor(fallback_labels) and fallback_labels.numel() > 0:
-            seen = [int(c) for c in fallback_labels.detach().cpu().unique(sorted=True).tolist()]
-        if not seen:
-            raise RuntimeError(f"Cannot resolve seen classes for phase={phase}")
-        return list(dict.fromkeys(seen))
-
-    def _assert_labels_in_seen_classes(self, labels: torch.Tensor, seen_classes: Iterable[int], *, context: str) -> None:
-        if hasattr(self, "assert_global_labels_in_set"):
-            return self.assert_global_labels_in_set(labels, seen_classes, context)
-        y = labels.to(self.device).long().view(-1)
-        seen = set(int(c) for c in seen_classes)
-        bad = sorted(set(int(v) for v in y.detach().cpu().tolist()) - seen)
-        if bad:
-            raise RuntimeError(f"{context}: labels outside seen classes. bad={bad}, seen={sorted(seen)}")
-
-    def _global_to_seen_local_safe(self, labels_global: torch.Tensor, seen_classes: Iterable[int], *, context: str) -> torch.Tensor:
-        if hasattr(self, "global_to_seen_local"):
-            return self.global_to_seen_local(labels_global, seen_classes, context=context)
-        y = labels_global.to(self.device).long().view(-1)
-        seen = [int(c) for c in seen_classes]
-        mapping = {c: i for i, c in enumerate(seen)}
-        local = torch.full_like(y, -1)
-        for c, i in mapping.items():
-            local[y == int(c)] = int(i)
-        if bool((local < 0).any().item()):
-            bad = sorted(set(int(v) for v in y[local < 0].detach().cpu().tolist()))
-            raise RuntimeError(f"{context}: labels not in seen_classes: {bad}; seen={seen}")
-        return local
-
-    def _seen_local_to_global_safe(self, preds_local: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-        if hasattr(self, "seen_local_to_global"):
-            return self.seen_local_to_global(preds_local, seen_classes, context="seen_local_to_global")
-        seen = torch.as_tensor([int(c) for c in seen_classes], device=preds_local.device, dtype=torch.long)
-        return seen.index_select(0, preds_local.long().view(-1))
-
-    def _mask_logits_to_seen_classes(self, logits: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-        """Validate and return strict seen-local logits.
-
-        The cleaned classifier has one output contract: [B, len(seen_classes)].
-        Full-global logits are not accepted because silently slicing them hides
-        class-order bugs during incremental learning.
-        """
-        if logits is None or not torch.is_tensor(logits) or logits.dim() != 2:
-            raise RuntimeError(f"logits must be [B,C], got {None if logits is None else tuple(logits.shape)}")
-        seen = [int(c) for c in seen_classes]
-        if logits.size(1) != len(seen):
-            raise RuntimeError(
-                f"Strict classifier contract violation: logits width={logits.size(1)} but len(seen_classes)={len(seen)}. "
-                "Return seen-local logits from the model/classifier instead of global-full logits."
-            )
-        if not torch.isfinite(logits).all():
-            raise RuntimeError("Strict classifier contract violation: logits contain NaN/Inf.")
-        return logits
-
-    def _old_new_classes_for_validation(self, phase: int, old_class_count: int, seen_classes: Iterable[int]) -> Tuple[List[int], List[int]]:
-        seen = [int(c) for c in seen_classes]
-        old: List[int] = []
-        if int(old_class_count) > 0 and int(phase) > 0 and hasattr(self.dataset, "get_classes_up_to_phase"):
-            try:
-                old = [int(c) for c in self.dataset.get_classes_up_to_phase(int(phase) - 1)]
-            except Exception:
-                old = []
-        if not old and int(old_class_count) > 0:
-            old = seen[: int(old_class_count)]
-        old_set = set(old)
-        new = [c for c in seen if c not in old_set]
-        return [c for c in seen if c in old_set], new
-
-    def _label_membership_mask(self, labels: torch.Tensor, class_ids: Iterable[int]) -> torch.Tensor:
-        mask = torch.zeros_like(labels, dtype=torch.bool)
-        for c in [int(x) for x in class_ids]:
-            mask |= labels.eq(int(c))
-        return mask
-
-    def _prepare_batch_spectral_summary(self, batch_spectra: Optional[torch.Tensor], x: torch.Tensor) -> Tuple[Optional[torch.Tensor], bool]:
-        if torch.is_tensor(batch_spectra) and batch_spectra.numel() > 0:
-            s = batch_spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
-            if s.dim() == 4:
-                s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-            elif s.dim() == 3:
-                s = s[:, :, s.size(-1) // 2] if s.size(0) == x.size(0) and s.size(2) > 1 else s.flatten(1)
-            elif s.dim() == 1:
-                s = s.view(x.size(0), -1)
-            elif s.dim() > 4:
-                s = s.flatten(1)
-            if s.size(0) != x.size(0):
-                raise RuntimeError(f"Batch spectral summary mismatch: {tuple(s.shape)} vs input {tuple(x.shape)}")
-            return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), bool(getattr(self.args, "raw_spectral_summary_is_physical", True))
-        return None, False
-
-    def _forward_real_batch(
-        self,
-        x: torch.Tensor,
-        batch_spectra: Optional[torch.Tensor] = None,
-        *,
-        classifier_mode: Optional[str] = None,
-        seen_classes: Optional[Iterable[int]] = None,
-        old_classes: Optional[Iterable[int]] = None,
-        new_classes: Optional[Iterable[int]] = None,
-        return_energy: bool = True,
-        return_parts: bool = False,
-    ) -> Dict[str, Any]:
-        mode = self._normalize_classifier_mode(classifier_mode or self._eval_classifier_mode(), context="real_batch_forward")
-        spectral_summary, is_physical = self._prepare_batch_spectral_summary(batch_spectra, x)
-        kwargs = dict(
-            classifier_mode=mode,
-            mode=mode,
-            seen_classes=list(seen_classes) if seen_classes is not None else None,
-            old_classes=list(old_classes) if old_classes is not None else None,
-            new_classes=list(new_classes) if new_classes is not None else None,
-            return_energy=return_energy,
-            return_parts=return_parts,
-            spectral_summary=spectral_summary,
-            spectral_summary_is_physical=bool(is_physical),
-        )
-        try:
-            out = self.model(x, **kwargs)
-        except TypeError:
-            # Compatibility fallback for older model.forward; strict classifier/model should not hit this.
-            fallback = {k: v for k, v in kwargs.items() if k in {"classifier_mode", "return_energy", "return_parts"}}
-            out = self.model(x, **fallback)
-        if not isinstance(out, dict):
-            out = {"logits": out}
-        out["spectral_summary"] = spectral_summary
-        out["spectral_summary_is_physical"] = bool(is_physical)
-        return out
-
-    @torch.no_grad()
-    def _validate_split_metrics(self, loader, old_class_count: int) -> Dict[str, Any]:
-        self._assert_global_architecture_contract()
+    def _set_accepted_phase_state(self, phase: int) -> None:
+        seen = self._cumulative_classes(phase)
+        self.model.current_phase = int(phase)
+        self.model.phase_mode = "evaluation"
+        self.model.seen_classes = list(seen)
+        self.model.old_classes = list(seen)
+        self.model.new_classes = []
+        self.model.phase_old_digest = None
+        self.model.backbone.freeze_all()
+        self.model.classifier.require_bound_contract = True
         self.model.eval()
-        old_class_count = int(old_class_count)
-        phase = int(getattr(self.model, "current_phase", 0))
-        seen_classes = self._seen_classes_for_phase(phase)
-        old_classes, new_classes = self._old_new_classes_for_validation(phase, old_class_count, seen_classes)
-        old_pos = [seen_classes.index(c) for c in old_classes if c in seen_classes]
-        new_pos = [seen_classes.index(c) for c in new_classes if c in seen_classes]
 
-        total_loss = total_correct = total = batches = 0
-        old_correct = old_total = new_correct = new_total = 0
-        new_into_old_sum = old_into_new_sum = old_new_gap_sum = 0.0
-        old_new_diag_batches = 0
+    def _accepted_phase(self) -> int:
+        valid = self.model.infer_seen_classes()
+        if not valid:
+            return -1
+        phase = self._phase_for_valid_rows(valid)
+        if phase is None:
+            raise RuntimeError("committed rows do not match the phase schedule")
+        return phase
 
-        for batch in loader:
-            x, y, batch_spectra, _ = self._unpack_hsi_batch(batch)
-            x = x.to(self.device, non_blocking=True).float()
-            y = y.to(self.device, non_blocking=True).long().view(-1)
-            self._assert_labels_in_seen_classes(y, seen_classes, context=f"phase_{phase}_validation")
-            y_local = self._global_to_seen_local_safe(y, seen_classes, context=f"phase_{phase}_validation")
-            out = self._forward_real_batch(
-                x,
-                batch_spectra,
-                classifier_mode="geometry_only",
-                seen_classes=seen_classes,
-                old_classes=old_classes,
-                new_classes=new_classes,
-                return_energy=True,
-                return_parts=False,
+    def _assert_final_phase_memory(self, phase: int) -> Dict[str, Any]:
+        seen = self._cumulative_classes(phase)
+        bank = self.model.geometry_bank
+        validity = bank.assert_valid(seen, strict=False)
+        if not validity.get("ok", False):
+            raise RuntimeError(
+                "accepted GeometryBank is invalid: "
+                + "; ".join(validity.get("errors", []))
             )
-            logits_seen = self._mask_logits_to_seen_classes(out["logits"], seen_classes)
-            if logits_seen.size(0) != y_local.numel():
-                raise RuntimeError(f"Validation logits/labels mismatch: {logits_seen.size(0)} vs {y_local.numel()}")
-            loss = self._stable_ce(logits_seen, y_local)
-            pred_local = logits_seen.argmax(dim=1)
-            pred_global = self._seen_local_to_global_safe(pred_local, seen_classes)
-            correct = pred_global.eq(y)
-
-            total_loss += float(loss.detach().item())
-            total_correct += int(correct.sum().item())
-            total += int(y.numel())
-            batches += 1
-
-            if old_class_count > 0 and old_classes and new_classes:
-                old_mask = self._label_membership_mask(y, old_classes)
-                new_mask = self._label_membership_mask(y, new_classes)
-                if bool(old_mask.any().item()):
-                    old_correct += int(correct[old_mask].sum().item())
-                    old_total += int(old_mask.sum().item())
-                if bool(new_mask.any().item()):
-                    new_correct += int(correct[new_mask].sum().item())
-                    new_total += int(new_mask.sum().item())
-
-            energy = out.get("energy", None) if isinstance(out, dict) else None
-            if torch.is_tensor(energy) and energy.dim() == 2 and old_pos and new_pos:
-                if energy.size(1) != len(seen_classes):
-                    raise RuntimeError(
-                        f"Strict energy contract violation: energy width={energy.size(1)} but len(seen_classes)={len(seen_classes)}."
-                    )
-                e_seen = energy
-                old_idx = torch.as_tensor(old_pos, device=e_seen.device, dtype=torch.long)
-                new_idx = torch.as_tensor(new_pos, device=e_seen.device, dtype=torch.long)
-                old_min = e_seen.index_select(1, old_idx).min(dim=1).values
-                new_min = e_seen.index_select(1, new_idx).min(dim=1).values
-                old_mask_e = self._label_membership_mask(y, old_classes)
-                new_mask_e = self._label_membership_mask(y, new_classes)
-                if bool(new_mask_e.any().item()):
-                    new_into_old_sum += float((old_min[new_mask_e] < new_min[new_mask_e]).float().mean().detach().item())
-                if bool(old_mask_e.any().item()):
-                    old_into_new_sum += float((new_min[old_mask_e] < old_min[old_mask_e]).float().mean().detach().item())
-                old_new_gap_sum += float((new_min - old_min).mean().detach().item())
-                old_new_diag_batches += 1
-
-        acc = 100.0 * total_correct / max(total, 1)
-        split = old_class_count > 0 and bool(old_classes) and bool(new_classes)
-        old_acc = 100.0 * old_correct / max(old_total, 1) if split else 0.0
-        new_acc = 100.0 * new_correct / max(new_total, 1) if split else acc
-        hm = 2.0 * old_acc * new_acc / max(old_acc + new_acc, 1e-8) if split else acc
+        actual = self.model.infer_seen_classes()
+        if set(actual) != set(seen):
+            raise RuntimeError(
+                f"accepted rows {actual} do not match expected phase-{phase} rows {seen}"
+            )
+        bank.assert_global_priors_ready()
+        if not bool(bank.global_priors_frozen.item()):
+            raise RuntimeError("global priors are not frozen")
+        if not bool(bank.overlap_temperatures_ready.item()):
+            raise RuntimeError("pair-risk temperatures are absent")
+        if not bool(bank.overlap_temperatures_frozen.item()):
+            raise RuntimeError("pair-risk temperatures are not frozen")
+        contract = self.model.classifier.bank_contract_digest(bank)
+        if self.model.classifier.bound_bank_contract_digest != contract:
+            raise RuntimeError("classifier is not bound to the static bank contract")
+        if not self.model.classifier.require_bound_contract:
+            raise RuntimeError("classifier contract enforcement is disabled")
+        if self.model.phase_mode != "evaluation":
+            raise RuntimeError("accepted model must be in evaluation mode")
+        if self.model.new_classes:
+            raise RuntimeError("accepted model retains active new classes")
+        if any(parameter.requires_grad for parameter in self.model.backbone.parameters()):
+            raise RuntimeError("accepted backbone must be frozen")
         return {
-            "loss": total_loss / max(batches, 1),
-            "acc": acc,
-            "old_acc": old_acc,
-            "new_acc": new_acc,
-            "hm": hm,
-            "old_new_split_available": bool(split),
-            "predicted_unseen": 0.0,
-            "new_into_old_rate": float(new_into_old_sum / max(old_new_diag_batches, 1)),
-            "old_into_new_rate": float(old_into_new_sum / max(old_new_diag_batches, 1)),
-            "mean_old_new_energy_gap": float(old_new_gap_sum / max(old_new_diag_batches, 1)),
-            "seen_classes": seen_classes,
-            "old_classes": old_classes,
-            "new_classes": new_classes,
+            "ok": True,
+            "phase": int(phase),
+            "seen_classes": list(seen),
+            "valid_rows": actual,
+            "rows_digest": bank.rows_digest(seen),
+            "bank_contract_digest": contract,
+            "classification_factorization": "p(z|c)",
+            "spectral_relation_factorization": "p(h|c)",
+            "stores_sample_level_memory": False,
         }
 
     # ------------------------------------------------------------------
-    # Scoring/checkpoint helpers
+    # Phase routing
     # ------------------------------------------------------------------
-    def _base_geometry_global_metrics(self) -> Dict[str, float]:
-        """Use the base trainer's cleaned geometry-state aliases.
 
-        Keeping a second local implementation here would override the stricter
-        base-phase scoring logic and lose the base geometry-energy margin fields.
-        """
-        return BasePhaseTrainer._base_geometry_global_metrics(self)
-
-    def _select_score(self, val_stats: Dict[str, float], phase: int) -> float:
-        if int(phase) > 0:
-            metric = str(getattr(self, "best_state_metric", getattr(self.args, "best_state_metric", "hm"))).lower().strip()
-            if metric in {"acc", "oa"}:
-                return float(val_stats.get("acc", 0.0))
-            if metric in {"old_new_min", "min"}:
-                return min(float(val_stats.get("old_acc", 0.0)), float(val_stats.get("new_acc", 0.0)))
-            if metric in {"loss", "val_loss"}:
-                return -float(val_stats.get("loss", 0.0))
-            return float(val_stats.get("hm", 0.0))
-        return self._select_base_checkpoint_score(val_stats, getattr(self, "_last_base_geom_stats", None))
-
-    def _select_base_checkpoint_score(self, val_stats: Dict[str, float], geom_stats: Optional[Dict[str, float]] = None) -> float:
-        """Delegate to BasePhaseTrainer so base energy-margin health affects checkpoint selection."""
-        return BasePhaseTrainer._select_base_checkpoint_score(self, val_stats, geom_stats)
-
-    def _capture_state(self) -> Dict[str, torch.Tensor]:
-        return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-
-    def _print_trainable_summary(self, phase: int) -> None:
-        trainable = [(name, int(parameter.numel())) for name, parameter in self.model.named_parameters() if parameter.requires_grad]
-        total = sum(count for _, count in trainable)
-        if int(phase) == 0:
-            print(f"[Trainable] Base phase: {total:,} params | backbone/projection + temporary CE head")
-            print("[Base Objective] balanced CE + GICS + geometry reserve + base geometry-energy margin")
-        else:
-            if total != 0:
-                raise RuntimeError(f"Incremental model parameters must be frozen, found {total:,} trainable.")
-            print(f"[Trainable] Incremental phase {phase}: 0 model params | temporary new-row residuals only")
-            print("[Incremental Objective] spectral-coupled core/directed replay + class-balanced CE + energy margin + bidirectional invasion + trust")
-        if self.debug:
-            for name, count in trainable[:150]:
-                print(f"  {name}: {count:,}")
-
-    def _current_runtime_contract(self) -> Dict[str, object]:
-        trainable = [name for name, parameter in self.model.named_parameters() if parameter.requires_grad]
-        return {
-            "method": "Spectral-Coupled Tangent Geometry Replay and New-Row Residual Adaptation for HSI NECIL",
-            "feature_space": "one frozen canonical projected z-space",
-            "classifier": "strict seen-local low-rank GeometryBank energy",
-            "classifier_output": "[B, len(seen_classes)]",
-            "incremental_update_mode": self._incremental_update_mode(),
-            "model_trainable_parameters": trainable,
-            "descriptor_plasticity": "temporary new mean/eigenvalue/residual-variance residuals",
-            "old_memory": "frozen feature geometry + compact spectral tangent/coupling statistics",
-            "replay": "spectral-consistent core + risk-directed spectral tangent replay",
-            "shell_replay": False,
-            "raw_exemplars": False,
-            "kd_teacher": False,
-            "feature_adapter": False,
-            "transport": False,
-            "adaptive_boundary": False,
-            "energy_calibrator": False,
-            "spectral_classifier_branch": False,
-            "uses_logdet_energy": bool(self.use_logdet_energy),
-            "logdet_energy_weight": float(self.logdet_energy_weight),
-        }
-
-    def _assert_incremental_preflight(
+    def train_phase(
         self,
         phase: int,
-        old_classes: Optional[Iterable[int]] = None,
-        new_classes: Optional[Iterable[int]] = None,
-        seen_classes: Optional[Iterable[int]] = None,
-    ) -> None:
+        epochs: int,
+        batch_size: int,
+        lr: float,
+    ) -> Dict[str, Any]:
         phase = int(phase)
-        if phase <= 0:
-            raise RuntimeError("Incremental preflight requires phase > 0.")
-        self._assert_updated_stack_contract(phase=phase)
-        if old_classes is None or new_classes is None or seen_classes is None:
-            old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
-        old_ids = [int(c) for c in old_classes]
-        new_ids = [int(c) for c in new_classes]
-        seen_ids = [int(c) for c in seen_classes]
-        signature = (phase, tuple(old_ids), tuple(new_ids))
-        if self._last_incremental_preflight_signature == signature:
-            return
-        if not old_ids or not new_ids:
-            raise RuntimeError(f"Invalid phase split: old={old_ids}, new={new_ids}")
-        if set(old_ids).intersection(new_ids):
-            raise RuntimeError(f"Old/new overlap: {sorted(set(old_ids).intersection(new_ids))}")
-        if seen_ids != list(dict.fromkeys([*old_ids, *new_ids])):
-            raise RuntimeError("seen_classes must equal old_classes + new_classes in order.")
-        self.assert_clean_incremental_contract(
-            phase=phase, old_classes=old_ids, new_classes=new_ids, seen_classes=seen_ids
-        )
-        bank = self._safe_get_subspace_bank(require_ready=True)
-        self.assert_bank_ready_for_seen_classes(bank, old_ids)
-        self.assert_bank_has_only_allowed_valid_rows(bank, old_ids)
-        gb = getattr(self.model, "geometry_bank", None)
-        if gb is None or not hasattr(gb, "sample_replay"):
-            raise RuntimeError("Updated GeometryBank.sample_replay is required.")
-        if hasattr(gb, "freeze_classes"):
-            gb.freeze_classes(old_ids)
-        if hasattr(gb, "assert_bank_valid"):
-            gb.assert_bank_valid(seen_classes=old_ids, strict=True)
-        self._set_incremental_trainable_params(old_ids, new_ids)
-        self._last_incremental_preflight_signature = signature
-        print(
-            f"[Incremental Preflight] phase={phase} | old={old_ids} | new={new_ids} | "
-            f"seen={seen_ids} | model_frozen=True | replay=spectral_coupled"
+        if phase not in self.phase_schedule:
+            raise ValueError(
+                f"phase {phase} is outside dataset schedule {sorted(self.phase_schedule)}"
+            )
+        if int(epochs) <= 0:
+            raise ValueError("epochs must be positive")
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        if not math.isfinite(float(lr)) or float(lr) <= 0.0:
+            raise ValueError("learning rate must be finite and positive")
+
+        self.assert_architecture_contract()
+        self.assert_dataset_contract()
+        accepted = self._accepted_phase()
+        if phase == 0:
+            if accepted >= 0:
+                raise RuntimeError("phase 0 is already finalized")
+            self.model.set_base_mode()
+            self._print_execution_summary(phase=0)
+            return self.train_base_phase(
+                phase=0,
+                epochs=int(epochs),
+                batch_size=int(batch_size),
+                lr=float(lr),
+            )
+
+        if accepted != phase - 1:
+            raise RuntimeError(
+                f"phase {phase} requires accepted phase {phase - 1}; "
+                f"current accepted phase is {accepted}"
+            )
+        self._print_execution_summary(phase=phase)
+        return self.train_incremental_phase(
+            phase=phase,
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            lr=float(lr),
         )
 
-    def train_phase(self, phase, epochs, batch_size: int = 64, lr: float = 1e-4):
-        """Dispatch a phase under the single SCTGR-RGA contract."""
+    def _print_execution_summary(self, *, phase: int) -> None:
+        bank = self.model.geometry_bank
+        parameters = sum(int(p.numel()) for p in self.model.parameters())
+        print(
+            "[Trainer] "
+            f"phase={phase} | device={self.device} | parameters={parameters:,} | "
+            f"token_dim={self.model.backbone.token_dim} | "
+            f"spectral_dim={self.model.spectral_dim} | "
+            f"spatial_dim={self.model.spatial_dim} | "
+            f"feature_dim={self.model.feature_dim} | "
+            f"maximum_rank={bank.maximum_rank} | raw_bands={bank.raw_spectral_dim}"
+        )
+        if phase == 0:
+            print(
+                "[Base objective] CE warm-up + bidirectional cross-fitted "
+                "risk-guided factor-energy shaping."
+            )
+        else:
+            print(
+                "[Incremental objective] current-query factor-energy separation + "
+                "coordinate consistency under analytical branch transport."
+            )
+            print(
+                "[Incremental memory] exact old-row pushforward + new aggregate "
+                "rows; no old samples, feature replay, teacher, or trainable transport."
+            )
+
+    # ------------------------------------------------------------------
+    # Checkpoint contract
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clone(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+        if isinstance(value, Mapping):
+            return {str(key): Trainer._clone(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(Trainer._clone(item) for item in value)
+        if isinstance(value, list):
+            return [Trainer._clone(item) for item in value]
+        return copy.deepcopy(value)
+
+    def _runtime_contract(self) -> Dict[str, Any]:
+        model = self.model
+        bank = model.geometry_bank
+        backbone = model.backbone
+        return {
+            "format_version": self.CHECKPOINT_FORMAT_VERSION,
+            "classification_factorization": self.CLASSIFICATION_FACTORIZATION,
+            "spectral_relation_factorization": self.SPECTRAL_RELATION_FACTORIZATION,
+            "architecture_version": int(model.ARCHITECTURE_VERSION),
+            "backbone_contract_version": int(backbone.CONTRACT_VERSION),
+            "bank_schema_version": int(bank.SCHEMA_VERSION),
+            "model_input_bands": int(backbone.model_input_bands),
+            "raw_spectral_dim": int(bank.raw_spectral_dim),
+            "patch_size": int(backbone.patch_size),
+            "token_dim": int(backbone.token_dim),
+            "spectral_dim": int(model.spectral_dim),
+            "spatial_dim": int(model.spatial_dim),
+            "feature_dim": int(model.feature_dim),
+            "maximum_rank": int(bank.maximum_rank),
+            "spectral_shape_dim": int(bank.spectral_shape_dim),
+            "spectral_resample_length": int(bank.spectral_resample_length),
+            "volume_weight": float(bank.volume_weight),
+            "variance_floor_absolute": float(bank.variance_floor_absolute),
+            "variance_floor_relative": float(bank.variance_floor_relative),
+            "classifier_temperature": float(model.classifier.temperature),
+            "joint_feature": "direct_[z_s;z_p]",
+            "trainable_transport_network": False,
+            "geometry_replay_training": False,
+            "stores_exemplars": False,
+            "stores_old_features": False,
+            "stores_old_spectra": False,
+            "uses_knowledge_distillation": False,
+        }
+
+    def _assert_runtime_contract(self, runtime: Mapping[str, Any]) -> None:
+        current = self._runtime_contract()
+        errors = []
+        for key, current_value in current.items():
+            saved = runtime.get(key)
+            if isinstance(current_value, float):
+                try:
+                    equal = math.isclose(
+                        float(saved), current_value, rel_tol=0.0, abs_tol=1e-12
+                    )
+                except (TypeError, ValueError):
+                    equal = False
+            else:
+                equal = saved == current_value
+            if not equal:
+                errors.append(
+                    f"{key}: checkpoint={saved!r}, current={current_value!r}"
+                )
+        if errors:
+            raise RuntimeError("checkpoint runtime contract mismatch: " + "; ".join(errors))
+
+    def _compact_memory_audit(self) -> Dict[str, Any]:
+        snapshot = dict(self.model.memory_snapshot())
+        snapshot.pop("bank", None)
+        snapshot["memory_cost"] = self.model.geometry_bank.memory_cost_summary()
+        return snapshot
+
+    def _preload_geometry_bank_buffers(
+        self,
+        model_state: Mapping[str, Any],
+    ) -> None:
+        bank = self.model.geometry_bank
+        snapshot: Dict[str, torch.Tensor] = {}
+        missing = []
+        for name in bank._buffers:
+            key = f"geometry_bank.{name}"
+            value = model_state.get(key)
+            if not torch.is_tensor(value):
+                missing.append(key)
+            else:
+                snapshot[name] = value
+        if missing:
+            raise RuntimeError(
+                "checkpoint GeometryBank buffers are incomplete: "
+                f"{missing[:12]}"
+            )
+        bank.load_snapshot(snapshot, strict=True)
+
+    def save_checkpoint(
+        self,
+        phase: int,
+        history: Mapping[str, Any],
+        evaluator_metrics: Optional[Mapping[str, Any]] = None,
+    ) -> str:
         phase = int(phase)
-        self.early_stop_patience = 0
-        for key in ("early_stop_patience", "base_early_stop_patience", "incremental_early_stop_patience"):
-            setattr(self.args, key, 0)
-        self._force_clean_main_path_args()
-        self._propagate_clean_energy_config_to_model()
-        self._assert_strict_energy_contract()
-        self._assert_global_architecture_contract()
+        if phase not in self.phase_schedule:
+            raise RuntimeError(f"cannot save unknown phase {phase}")
+        if not isinstance(history, Mapping):
+            raise TypeError("history must be a mapping")
+        if self._accepted_phase() != phase:
+            raise RuntimeError("only the currently accepted phase can be checkpointed")
+        memory_report = self._assert_final_phase_memory(phase)
 
         if phase == 0:
-            self._set_model_phase_and_old_count(0, 0)
-            self._set_base_trainable_params()
-            self._assert_updated_stack_contract(phase=0)
-            self._print_trainable_summary(phase=0)
-            return self.train_base_phase(phase=0, epochs=epochs, batch_size=batch_size, lr=lr)
+            final_report = history.get("base_geometry_report")
+            if not isinstance(final_report, Mapping):
+                raise RuntimeError("history.base_geometry_report is missing")
+            certificate = self.base_geometry_certificate(final_report)
+            if not certificate["checks"]["structural_geometry_valid"]:
+                raise RuntimeError("refusing to save structurally invalid base geometry")
+        else:
+            admission = history.get("admission")
+            if not isinstance(admission, Mapping) or not bool(admission.get("valid", False)):
+                raise RuntimeError("incremental checkpoint lacks a valid admission record")
+            certificate = dict(admission)
 
-        if self.base_only or self.disable_incremental_training:
-            raise RuntimeError("Incremental training is disabled by configuration.")
-        old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
-        self._set_model_phase_and_old_count(phase, len(old_classes))
-        self._assert_incremental_preflight(
-            phase, old_classes=old_classes, new_classes=new_classes, seen_classes=seen_classes
-        )
-        self._print_trainable_summary(phase=phase)
-        return self.train_incremental_phase(
-            phase=phase, epochs=epochs, batch_size=batch_size, lr=lr
-        )
-
-    def _adaptive_boundary_loss_from_current_bank(self, *args, **kwargs):
-        """Adaptive-boundary remains disabled through IncrementalPhaseTrainer."""
-        return IncrementalPhaseTrainer._adaptive_boundary_loss_from_current_bank(self, *args, **kwargs)
-
-    def _adaptive_boundary_enabled(self) -> bool:
-        return False
-
-    def _adaptive_boundary_state(self, old_class_count: int = 0) -> Dict[str, float]:
-        return {"adaptive_boundary_enabled": 0.0, "boundary_radius_mean": 0.0, "old_boundary_radius_mean": 0.0, "new_boundary_radius_mean": 0.0}
-
-    def _adaptive_boundary_trainable_params(self) -> List[torch.nn.Parameter]:
-        return []
-
-    # ------------------------------------------------------------------
-    # Checkpointing
-    # ------------------------------------------------------------------
-    def save_checkpoint(self, phase, history, evaluator_metrics: Optional[Dict] = None) -> None:
-        phase = int(phase)
         phase_dir = os.path.join(self.save_dir, f"phase_{phase}")
         os.makedirs(phase_dir, exist_ok=True)
-        ckpt = {
-            "phase": phase,
-            "base_only": self._as_bool(self.base_only),
-            "incremental_enabled": not self._as_bool(self.disable_incremental_training),
-            "base_objective": "balanced CE + GICS + geometry reserve + base geometry-energy margin",
-            "incremental_objective": "spectral-coupled core/directed replay + class-balanced CE + energy margin + bidirectional invasion + descriptor trust",
-            "runtime_contract": self._current_runtime_contract(),
-            "architecture_contract": {
-                "method": "Spectral-Coupled Tangent Geometry Replay and New-Row Residual Adaptation for HSI NECIL",
-                "classifier_mode": "geometry_only",
-                "bank": "feature geometry + physical spectral tangent + spectral-to-feature coupling + reliability/quantiles",
-                "old_memory": "frozen GeometryBank statistics only",
-                "replay": "spectral-consistent core + risk-directed spectral tangent replay; no raw old patches/features",
-                "incremental_update_mode": self._incremental_update_mode(),
-                "residual_adaptation": "temporary new-row mean/eigenvalue/residual-variance residuals only",
-                "forbidden_components": ["KD", "teacher", "prototypes", "feature_adapter", "shell_replay", "transport", "adaptive_boundary", "measured_calibration", "BSS/GDR"],
-            },
-            "model_state_dict": self.model.state_dict(),
-            "memory_snapshot": self.model.export_memory_snapshot() if hasattr(self.model, "export_memory_snapshot") else None,
-            "current_num_classes": int(getattr(self.model, "current_num_classes", 0)),
-            "old_class_count": int(getattr(self.model, "old_class_count", 0)),
-            "history": history,
-            "base_geometry_certificate": getattr(self, "_last_base_geometry_certificate", getattr(self.model, "base_geometry_certificate", None)),
-            "args": vars(self.args) if hasattr(self.args, "__dict__") else {},
-        }
-        diag = getattr(self, f"_last_phase_{phase}_geometry_diagnostics", None)
-        if diag is None:
-            diag = getattr(self, "_last_base_geometry_diagnostics", None)
-        if diag is not None:
-            ckpt["geometry_diagnostics"] = diag
-        if evaluator_metrics is not None:
-            ckpt["evaluator_metrics"] = evaluator_metrics
         path = os.path.join(phase_dir, "checkpoint.pth")
-        torch.save(ckpt, path)
-        print(f"[Saved] {path}")
+        temporary = path + ".tmp"
+        seen = self._cumulative_classes(phase)
+        checkpoint: Dict[str, Any] = {
+            "format_version": self.CHECKPOINT_FORMAT_VERSION,
+            "checkpoint_kind": "accepted_necil_phase",
+            "phase": phase,
+            "runtime_contract": self._runtime_contract(),
+            "model_state_dict": {
+                key: self._clone(value)
+                for key, value in self.model.state_dict().items()
+            },
+            "memory_audit": self._clone(self._compact_memory_audit()),
+            "base_classes": list(self.base_classes),
+            "seen_classes": list(seen),
+            "memory_report": self._clone(memory_report),
+            "geometry_certificate": self._clone(certificate),
+            "history": self._clone(dict(history)),
+            "args": dict(vars(self.args)) if hasattr(self.args, "__dict__") else {},
+            "torch_rng_state": torch.get_rng_state().cpu(),
+        }
+        if torch.cuda.is_available():
+            checkpoint["cuda_rng_state_all"] = [
+                state.cpu() for state in torch.cuda.get_rng_state_all()
+            ]
+        if evaluator_metrics is not None:
+            checkpoint["evaluator_metrics"] = self._clone(dict(evaluator_metrics))
+
+        try:
+            with open(temporary, "wb") as stream:
+                torch.save(checkpoint, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except Exception:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+            raise
+        print(f"[Saved accepted phase checkpoint] {path}")
+        return path
+
+    def load_checkpoint(
+        self,
+        path: str,
+        *,
+        strict: bool = True,
+        restore_rng: bool = True,
+    ) -> Dict[str, Any]:
+        path = os.path.abspath(str(path))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        try:
+            checkpoint = torch.load(
+                path, map_location=self.device, weights_only=False
+            )
+        except TypeError:
+            checkpoint = torch.load(path, map_location=self.device)
+        if not isinstance(checkpoint, Mapping):
+            raise RuntimeError("checkpoint payload must be a mapping")
+        phase = int(checkpoint.get("phase", -1))
+        if phase not in self.phase_schedule:
+            raise RuntimeError(f"checkpoint phase {phase} is outside the dataset schedule")
+        if int(checkpoint.get("format_version", -1)) != self.CHECKPOINT_FORMAT_VERSION:
+            raise RuntimeError("unsupported checkpoint format")
+        runtime = checkpoint.get("runtime_contract")
+        if not isinstance(runtime, Mapping):
+            raise RuntimeError("checkpoint runtime contract is missing")
+        if strict:
+            self._assert_runtime_contract(runtime)
+
+        model_state = checkpoint.get("model_state_dict")
+        if not isinstance(model_state, Mapping):
+            raise RuntimeError("checkpoint model_state_dict is missing")
+        self._preload_geometry_bank_buffers(model_state)
+        self.model.load_state_dict(model_state, strict=strict)
+
+        expected_seen = self._cumulative_classes(phase)
+        saved_seen = [int(value) for value in checkpoint.get("seen_classes", [])]
+        if strict and saved_seen != expected_seen:
+            raise RuntimeError(
+                f"checkpoint seen classes {saved_seen} do not match schedule {expected_seen}"
+            )
+        self._set_accepted_phase_state(phase)
+        memory_report = self._assert_final_phase_memory(phase)
+
+        audit = checkpoint.get("memory_audit")
+        if isinstance(audit, Mapping):
+            saved_rows_digest = audit.get("rows_digest")
+            current_rows_digest = self.model.geometry_bank.rows_digest(expected_seen)
+            if strict and saved_rows_digest != current_rows_digest:
+                raise RuntimeError("checkpoint row digest failed after loading")
+            saved_contract = audit.get("bank_contract_digest")
+            current_contract = self.model.classifier.bank_contract_digest(
+                self.model.geometry_bank
+            )
+            if strict and saved_contract != current_contract:
+                raise RuntimeError("checkpoint static bank contract failed after loading")
+
+        history = checkpoint.get("history")
+        if isinstance(history, Mapping):
+            self._last_phase_history = copy.deepcopy(dict(history))
+            if phase == 0:
+                final_report = history.get("base_geometry_report")
+                if isinstance(final_report, Mapping):
+                    self._last_base_geometry_report = dict(final_report)
+                handoff = history.get("base_handoff")
+                if isinstance(handoff, Mapping):
+                    self.model.base_handoff = copy.deepcopy(dict(handoff))
+
+        if restore_rng:
+            cpu_rng = checkpoint.get("torch_rng_state")
+            if torch.is_tensor(cpu_rng):
+                torch.set_rng_state(cpu_rng.cpu())
+            cuda_rng = checkpoint.get("cuda_rng_state_all")
+            if torch.cuda.is_available() and isinstance(cuda_rng, (list, tuple)):
+                torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
+        checkpoint = dict(checkpoint)
+        checkpoint["loaded_memory_report"] = memory_report
+        return checkpoint
+
+
+
+
 
 
 
@@ -1254,1217 +538,1717 @@ class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
 
 # from __future__ import annotations
 
+# """Top-level trainer and checkpoint orchestration for factor-geometry NECIL.
+
+# The class executes phase 0 through ``BasePhaseTrainer``. It is intentionally
+# future-ready: a later incremental mixin may provide ``train_incremental_phase``
+# without changing the accepted checkpoint format or architecture contract.
+# """
+
+# import copy
+# import math
 # import os
-# from typing import Any, Dict, Iterable, List, Optional, Tuple
+# from typing import Any, Dict, Mapping, Optional
 
 # import torch
-# import torch.nn.functional as F
 
+# from trainers.base_phase_trainer import BasePhaseTrainer
 # from trainers.trainer_helpers import TrainerHelper
+
+
+
+# class Trainer(BasePhaseTrainer, TrainerHelper):
+#     CHECKPOINT_FORMAT_VERSION = 3
+
+#     def __init__(self, model: torch.nn.Module, dataset: Any, args: Any) -> None:
+#         if model is None:
+#             raise TypeError("Trainer requires a model")
+#         if dataset is None:
+#             raise TypeError("Trainer requires a dataset")
+#         if args is None:
+#             raise TypeError("Trainer requires explicit configuration")
+
+#         self.args = args
+#         self.device = self._resolve_device(getattr(args, "device", "cpu"))
+#         self.save_dir = os.path.abspath(
+#             str(getattr(args, "save_dir", "./outputs"))
+#         )
+#         os.makedirs(self.save_dir, exist_ok=True)
+
+#         self.model = model.to(self.device)
+#         self.dataset = dataset
+#         self.debug = self._parse_bool(
+#             getattr(args, "debug_verbose", False), "debug_verbose"
+#         )
+#         self._last_base_geometry_report: Optional[Dict[str, Any]] = None
+#         self._last_base_stats: Dict[str, float] = {}
+
+#         self.assert_architecture_contract()
+#         dataset_contract = self.assert_dataset_contract()
+#         self.phase_schedule = dict(dataset_contract["schedule"])
+#         self.base_classes = list(dataset_contract["base_classes"])
+#         self._prepare_initial_state()
+
+#     # ------------------------------------------------------------------
+#     # Device and accepted state
+#     # ------------------------------------------------------------------
+
+#     @staticmethod
+#     def _parse_bool(value: Any, name: str) -> bool:
+#         if isinstance(value, bool):
+#             return value
+#         if isinstance(value, int) and value in (0, 1):
+#             return bool(value)
+#         if isinstance(value, str):
+#             token = value.strip().lower()
+#             if token in {"1", "true", "yes", "y", "on"}:
+#                 return True
+#             if token in {"0", "false", "no", "n", "off"}:
+#                 return False
+#         raise RuntimeError(f"{name} must be an explicit boolean")
+
+#     @staticmethod
+#     def _resolve_device(value: Any) -> torch.device:
+#         token = str(value).strip().lower()
+#         if token == "gpu":
+#             token = "cuda"
+#         requested = torch.device(token)
+#         if requested.type == "cpu":
+#             return requested
+#         if requested.type != "cuda":
+#             raise RuntimeError(f"unsupported device type {requested.type!r}")
+#         if not torch.cuda.is_available():
+#             raise RuntimeError("CUDA was requested but is unavailable")
+#         index = (
+#             torch.cuda.current_device()
+#             if requested.index is None
+#             else requested.index
+#         )
+#         if not 0 <= index < torch.cuda.device_count():
+#             raise RuntimeError(f"invalid CUDA device index {index}")
+#         torch.cuda.set_device(index)
+#         return torch.device(f"cuda:{index}")
+
+#     def _prepare_initial_state(self) -> None:
+#         bank = self.model.geometry_bank
+#         valid = self.model.infer_seen_classes()
+#         if not valid:
+#             partial_contract = any(
+#                 (
+#                     bool(bank.global_priors_ready.item()),
+#                     bool(bank.overlap_temperatures_ready.item()),
+#                     bool(self.model.classifier.require_bound_contract),
+#                     len(bank) > 0,
+#                 )
+#             )
+#             if partial_contract:
+#                 raise RuntimeError(
+#                     "the model contains a partial base geometry state without "
+#                     "valid committed rows; start fresh or load an accepted checkpoint"
+#                 )
+#             self.model.set_base_mode()
+#             return
+
+#         if set(valid) != set(self.base_classes):
+#             raise RuntimeError(
+#                 f"existing rows {valid} do not match base classes {self.base_classes}"
+#             )
+#         self._set_final_base_state()
+#         self.assert_final_base_memory(self.base_classes)
+
+#     def _set_final_base_state(self) -> None:
+#         ids = list(self.base_classes)
+#         self.model.current_phase = 0
+#         self.model.phase_mode = "evaluation"
+#         self.model.seen_classes = list(ids)
+#         self.model.old_classes = list(ids)
+#         self.model.new_classes = []
+#         self.model.phase_old_digest = None
+#         self.model.backbone.freeze_all()
+#         self.model.classifier.require_bound_contract = True
+#         self.model.eval()
+
+#     # ------------------------------------------------------------------
+#     # Phase routing
+#     # ------------------------------------------------------------------
+
+#     def train_phase(
+#         self,
+#         phase: int,
+#         epochs: int,
+#         batch_size: int,
+#         lr: float,
+#     ) -> Dict[str, Any]:
+#         phase = int(phase)
+#         if phase not in self.phase_schedule:
+#             raise ValueError(
+#                 f"phase {phase} is outside dataset schedule {sorted(self.phase_schedule)}"
+#             )
+#         if int(epochs) <= 0:
+#             raise ValueError("epochs must be positive")
+#         if int(batch_size) <= 0:
+#             raise ValueError("batch_size must be positive")
+#         if not math.isfinite(float(lr)) or float(lr) <= 0.0:
+#             raise ValueError("learning rate must be finite and positive")
+
+#         self.assert_architecture_contract()
+#         self.assert_dataset_contract()
+
+#         if phase == 0:
+#             if bool(self.model.geometry_bank.valid_mask().any().item()):
+#                 raise RuntimeError("phase 0 is already finalized")
+#             self.model.set_base_mode()
+#             self._print_execution_summary(phase=0)
+#             return self.train_base_phase(
+#                 phase=0,
+#                 epochs=int(epochs),
+#                 batch_size=int(batch_size),
+#                 lr=float(lr),
+#             )
+
+#         incremental = getattr(self, "train_incremental_phase", None)
+#         if not callable(incremental):
+#             raise RuntimeError(
+#                 "incremental phase routing is ready, but no coherent "
+#                 "IncrementalPhaseTrainer is installed. Do not fall back to "
+#                 "the retired trainable-transport/replay trainer."
+#             )
+#         self._print_execution_summary(phase=phase)
+#         return incremental(
+#             phase=phase,
+#             epochs=int(epochs),
+#             batch_size=int(batch_size),
+#             lr=float(lr),
+#         )
+
+#     def _print_execution_summary(self, *, phase: int) -> None:
+#         bank = self.model.geometry_bank
+#         parameters = sum(
+#             int(parameter.numel()) for parameter in self.model.parameters()
+#         )
+#         print(
+#             "[Trainer] "
+#             f"phase={phase} | device={self.device} | parameters={parameters:,} | "
+#             f"token_dim={self.model.backbone.token_dim} | "
+#             f"spectral_dim={self.model.spectral_dim} | "
+#             f"spatial_dim={self.model.spatial_dim} | "
+#             f"feature_dim={self.model.feature_dim} | "
+#             f"maximum_rank={bank.maximum_rank} | "
+#             f"raw_bands={bank.raw_spectral_dim}"
+#         )
+#         if phase == 0:
+#             print(
+#                 "[Base objective] class-balanced CE warm-up + bidirectional "
+#                 "cross-fitted risk-guided factor-energy shaping."
+#             )
+#             print(
+#                 "[Base memory] zero persistent class rows during optimization; "
+#                 "one atomic p(z|c) handoff."
+#             )
+#         else:
+#             print(
+#                 "[Incremental contract] temporary phase-start observer + "
+#                 "analytical branch transport + real-current-query geometry; "
+#                 "no feature replay or trainable transport."
+#             )
+
+#     # ------------------------------------------------------------------
+#     # Checkpoint contract
+#     # ------------------------------------------------------------------
+
+#     @staticmethod
+#     def _clone(value: Any) -> Any:
+#         if torch.is_tensor(value):
+#             return value.detach().cpu().clone()
+#         if isinstance(value, Mapping):
+#             return {str(key): Trainer._clone(item) for key, item in value.items()}
+#         if isinstance(value, tuple):
+#             return tuple(Trainer._clone(item) for item in value)
+#         if isinstance(value, list):
+#             return [Trainer._clone(item) for item in value]
+#         return copy.deepcopy(value)
+
+#     def _runtime_contract(self) -> Dict[str, Any]:
+#         model = self.model
+#         bank = model.geometry_bank
+#         backbone = model.backbone
+#         return {
+#             "format_version": self.CHECKPOINT_FORMAT_VERSION,
+#             "classification_factorization": self.CLASSIFICATION_FACTORIZATION,
+#             "spectral_relation_factorization": self.SPECTRAL_RELATION_FACTORIZATION,
+#             "architecture_version": int(model.ARCHITECTURE_VERSION),
+#             "backbone_contract_version": int(backbone.CONTRACT_VERSION),
+#             "bank_schema_version": int(bank.SCHEMA_VERSION),
+#             "model_input_bands": int(backbone.model_input_bands),
+#             "raw_spectral_dim": int(bank.raw_spectral_dim),
+#             "patch_size": int(backbone.patch_size),
+#             "token_dim": int(backbone.token_dim),
+#             "spectral_dim": int(model.spectral_dim),
+#             "spatial_dim": int(model.spatial_dim),
+#             "feature_dim": int(model.feature_dim),
+#             "maximum_rank": int(bank.maximum_rank),
+#             "spectral_shape_dim": int(bank.spectral_shape_dim),
+#             "spectral_resample_length": int(bank.spectral_resample_length),
+#             "volume_weight": float(bank.volume_weight),
+#             "variance_floor_absolute": float(bank.variance_floor_absolute),
+#             "variance_floor_relative": float(bank.variance_floor_relative),
+#             "classifier_temperature": float(model.classifier.temperature),
+#             "joint_feature": "direct_[z_s;z_p]",
+#             "trainable_transport_network": False,
+#             "geometry_replay_training": False,
+#             "stores_exemplars": False,
+#             "stores_old_features": False,
+#             "stores_old_spectra": False,
+#             "uses_knowledge_distillation": False,
+#             "future_encoder_policy": "frozen_baseline_or_controlled_plasticity",
+#         }
+
+#     def _assert_runtime_contract(self, runtime: Mapping[str, Any]) -> None:
+#         current = self._runtime_contract()
+#         errors = []
+#         for key, current_value in current.items():
+#             saved = runtime.get(key)
+#             if isinstance(current_value, float):
+#                 try:
+#                     equal = math.isclose(
+#                         float(saved), current_value, rel_tol=0.0, abs_tol=1e-12
+#                     )
+#                 except (TypeError, ValueError):
+#                     equal = False
+#             else:
+#                 equal = saved == current_value
+#             if not equal:
+#                 errors.append(
+#                     f"{key}: checkpoint={saved!r}, current={current_value!r}"
+#                 )
+#         if errors:
+#             raise RuntimeError("checkpoint runtime contract mismatch: " + "; ".join(errors))
+
+#     def _compact_memory_audit(self) -> Dict[str, Any]:
+#         snapshot = dict(self.model.memory_snapshot())
+#         snapshot.pop("bank", None)  # model_state_dict already contains the bank.
+#         snapshot["memory_cost"] = self.model.geometry_bank.memory_cost_summary()
+#         return snapshot
+
+#     def _preload_geometry_bank_buffers(
+#         self,
+#         model_state: Mapping[str, Any],
+#     ) -> None:
+#         """Resize dynamic row buffers before strict ``load_state_dict``.
+
+#         Sparse global class IDs make row buffers phase-dependent. A fresh bank
+#         has zero rows, so normal PyTorch copying would report shape mismatches.
+#         ``load_snapshot`` replaces all buffers first; strict model loading then
+#         validates the complete state normally.
+#         """
+#         bank = self.model.geometry_bank
+#         snapshot: Dict[str, torch.Tensor] = {}
+#         missing = []
+#         for name in bank._buffers:
+#             key = f"geometry_bank.{name}"
+#             value = model_state.get(key)
+#             if not torch.is_tensor(value):
+#                 missing.append(key)
+#             else:
+#                 snapshot[name] = value
+#         if missing:
+#             raise RuntimeError(
+#                 "checkpoint GeometryBank buffers are incomplete: "
+#                 f"{missing[:12]}"
+#             )
+#         bank.load_snapshot(snapshot, strict=True)
+
+#     def save_checkpoint(
+#         self,
+#         phase: int,
+#         history: Mapping[str, Any],
+#         evaluator_metrics: Optional[Mapping[str, Any]] = None,
+#     ) -> str:
+#         if int(phase) != 0:
+#             raise RuntimeError(
+#                 "this checkpoint writer currently accepts only a finalized base phase"
+#             )
+#         if not isinstance(history, Mapping):
+#             raise TypeError("history must be a mapping")
+
+#         memory_report = self.assert_final_base_memory(self.base_classes)
+#         final_report = history.get("base_geometry_report")
+#         if not isinstance(final_report, Mapping):
+#             raise RuntimeError("history.base_geometry_report is missing")
+#         certificate = self.base_geometry_certificate(final_report)
+#         if not certificate["checks"]["structural_geometry_valid"]:
+#             raise RuntimeError("refusing to save structurally invalid base geometry")
+#         enforce = self._parse_bool(
+#             getattr(self.args, "base_admission_enforce", False),
+#             "base_admission_enforce",
+#         )
+#         if enforce and not bool(certificate["passed"]):
+#             raise RuntimeError(
+#                 "refusing to save a base checkpoint that failed enforced gates: "
+#                 f"{certificate['failed_checks']}"
+#             )
+
+#         phase_dir = os.path.join(self.save_dir, "phase_0")
+#         os.makedirs(phase_dir, exist_ok=True)
+#         path = os.path.join(phase_dir, "checkpoint.pth")
+#         temporary = path + ".tmp"
+#         checkpoint: Dict[str, Any] = {
+#             "format_version": self.CHECKPOINT_FORMAT_VERSION,
+#             "checkpoint_kind": "accepted_base_phase",
+#             "phase": 0,
+#             "runtime_contract": self._runtime_contract(),
+#             "model_state_dict": {
+#                 key: self._clone(value)
+#                 for key, value in self.model.state_dict().items()
+#             },
+#             "memory_audit": self._clone(self._compact_memory_audit()),
+#             "base_classes": list(self.base_classes),
+#             "memory_report": self._clone(memory_report),
+#             "geometry_certificate": self._clone(certificate),
+#             "history": self._clone(dict(history)),
+#             "args": dict(vars(self.args)) if hasattr(self.args, "__dict__") else {},
+#             "torch_rng_state": torch.get_rng_state().cpu(),
+#         }
+#         if torch.cuda.is_available():
+#             checkpoint["cuda_rng_state_all"] = [
+#                 state.cpu() for state in torch.cuda.get_rng_state_all()
+#             ]
+#         if evaluator_metrics is not None:
+#             checkpoint["evaluator_metrics"] = self._clone(dict(evaluator_metrics))
+
+#         try:
+#             with open(temporary, "wb") as stream:
+#                 torch.save(checkpoint, stream)
+#                 stream.flush()
+#                 os.fsync(stream.fileno())
+#             os.replace(temporary, path)
+#         except Exception:
+#             if os.path.exists(temporary):
+#                 os.remove(temporary)
+#             raise
+#         print(f"[Saved base checkpoint] {path}")
+#         return path
+
+#     def load_checkpoint(
+#         self,
+#         path: str,
+#         *,
+#         strict: bool = True,
+#         restore_rng: bool = True,
+#     ) -> Dict[str, Any]:
+#         path = os.path.abspath(str(path))
+#         if not os.path.isfile(path):
+#             raise FileNotFoundError(path)
+#         try:
+#             checkpoint = torch.load(
+#                 path, map_location=self.device, weights_only=False
+#             )
+#         except TypeError:
+#             checkpoint = torch.load(path, map_location=self.device)
+#         if not isinstance(checkpoint, Mapping):
+#             raise RuntimeError("checkpoint payload must be a mapping")
+#         if int(checkpoint.get("phase", -1)) != 0:
+#             raise RuntimeError("this loader expects an accepted base checkpoint")
+#         if int(checkpoint.get("format_version", -1)) != self.CHECKPOINT_FORMAT_VERSION:
+#             raise RuntimeError("unsupported checkpoint format")
+#         runtime = checkpoint.get("runtime_contract")
+#         if not isinstance(runtime, Mapping):
+#             raise RuntimeError("checkpoint runtime contract is missing")
+#         if strict:
+#             self._assert_runtime_contract(runtime)
+
+#         model_state = checkpoint.get("model_state_dict")
+#         if not isinstance(model_state, Mapping):
+#             raise RuntimeError("checkpoint model_state_dict is missing")
+#         self._preload_geometry_bank_buffers(model_state)
+#         self.model.load_state_dict(model_state, strict=strict)
+
+#         saved_classes = [int(value) for value in checkpoint.get("base_classes", [])]
+#         if strict and saved_classes != list(self.base_classes):
+#             raise RuntimeError(
+#                 f"checkpoint classes {saved_classes} do not match dataset classes "
+#                 f"{self.base_classes}"
+#             )
+#         self._set_final_base_state()
+#         memory_report = self.assert_final_base_memory(self.base_classes)
+
+#         audit = checkpoint.get("memory_audit")
+#         if isinstance(audit, Mapping):
+#             saved_rows_digest = audit.get("rows_digest")
+#             current_rows_digest = self.model.geometry_bank.rows_digest(
+#                 self.base_classes
+#             )
+#             if strict and saved_rows_digest != current_rows_digest:
+#                 raise RuntimeError("checkpoint row digest failed after loading")
+#             saved_contract = audit.get("bank_contract_digest")
+#             current_contract = self.model.classifier.bank_contract_digest(
+#                 self.model.geometry_bank
+#             )
+#             if strict and saved_contract != current_contract:
+#                 raise RuntimeError("checkpoint static bank contract failed after loading")
+
+#         history = checkpoint.get("history")
+#         if isinstance(history, Mapping):
+#             final_report = history.get("base_geometry_report")
+#             if isinstance(final_report, Mapping):
+#                 self._last_base_geometry_report = dict(final_report)
+#             handoff = history.get("base_handoff")
+#             if isinstance(handoff, Mapping):
+#                 self.model.base_handoff = copy.deepcopy(dict(handoff))
+#         self._last_base_stats = {
+#             "valid_rows": float(len(memory_report["valid_rows"])),
+#         }
+
+#         if restore_rng:
+#             cpu_rng = checkpoint.get("torch_rng_state")
+#             if torch.is_tensor(cpu_rng):
+#                 torch.set_rng_state(cpu_rng.cpu())
+#             cuda_rng = checkpoint.get("cuda_rng_state_all")
+#             if torch.cuda.is_available() and isinstance(cuda_rng, (list, tuple)):
+#                 torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
+#         return dict(checkpoint)
+
+
+
+
+
+
+# from __future__ import annotations
+
+# import hashlib
+# import json
+# import math
+# import os
+# import tempfile
+# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+
+# import torch
+
 # from trainers.base_phase_trainer import BasePhaseTrainer
 # from trainers.incremental_phase_trainer import IncrementalPhaseTrainer
+# from trainers.trainer_helpers import TrainerHelper
 
-# try:
-#     from losses.loss import unified_spectral_geometry_loss
-# except Exception:  # pragma: no cover
-#     unified_spectral_geometry_loss = None
+
+# _MISSING = object()
 
 
 # class Trainer(TrainerHelper, BasePhaseTrainer, IncrementalPhaseTrainer):
-#     """Trainer for strict non-exemplar HSI class-incremental learning with Low-Rank Geometry Replay and Residual Geometry Adaptation.
+#     """Strict PC-STGB phase orchestrator and checkpoint authority.
 
-#     Active architecture:
-#         Base phase:
-#             Balanced CE + GICS + geometry reserve + base geometry-energy margin
-#             in canonical projected z-space.
+#     The class routes phase 0 to the validated base trainer and later phases to
+#     the schema-v5 conditional incremental trainer.  It is the checkpoint and
+#     runtime-contract authority for the complete strict non-exemplar run.
 
-#         Incremental phase:
-#             Frozen old GeometryBank + new rows + synthetic GeometryBank replay
-#             + bounded residual geometry adaptation + joint old/new CE
-#             + geometry energy margins.
-
-#     Deliberately inactive in the main path:
-#         KD/teacher, prototypes, raw exemplars, transport, adaptive boundary,
-#         measured energy calibration, BiCyc/BSS/GDR, prompt/token memory.
+#     The trainer owns orchestration and persistence.  Geometry estimation remains
+#     in :class:`GeometryBank`, scoring remains in
+#     :class:`GeometryEnergyClassifier`, and phase-specific objectives remain in
+#     the base/incremental trainer classes.
 #     """
 
-#     # ------------------------------------------------------------------
-#     # Small config helpers
-#     # ------------------------------------------------------------------
-#     @staticmethod
-#     def _as_bool(value: Any, default: bool = False) -> bool:
-#         if value is None:
-#             return bool(default)
-#         if isinstance(value, bool):
-#             return value
-#         if isinstance(value, (int, float)):
-#             return bool(value)
-#         if isinstance(value, str):
-#             v = value.strip().lower()
-#             if v in {"1", "true", "yes", "y", "on"}:
-#                 return True
-#             if v in {"0", "false", "no", "n", "off", "none", "null", ""}:
-#                 return False
-#         return bool(value)
+#     CHECKPOINT_FORMAT_VERSION = 2
+#     ARCHITECTURE_ID = "pc_stgb_conditional_joint_necil_v5"
+#     METHOD_NAME = "PC-STGB"
+#     BANK_SCHEMA_VERSION = 5
+#     JOINT_FACTORIZATION = "p(z|c)prod_k p(g_k|z,c)"
 
-#     def _arg_bool(self, name: str, default: bool = False) -> bool:
-#         return self._as_bool(getattr(self.args, name, default), default=default)
+#     def __init__(self, model: torch.nn.Module, dataset: Any, args: Any) -> None:
+#         if args is None:
+#             raise TypeError("Trainer requires an explicit configuration object")
+#         if model is None:
+#             raise TypeError("Trainer requires a model")
+#         if dataset is None:
+#             raise TypeError("Trainer requires a dataset")
 
-#     def _set_arg_default(self, name: str, value: Any) -> None:
-#         if not hasattr(self.args, name) or getattr(self.args, name) is None:
-#             try:
-#                 setattr(self.args, name, value)
-#             except Exception:
-#                 pass
-
-#     @staticmethod
-#     def _freeze_module_if_present(module: Optional[torch.nn.Module]) -> None:
-#         if module is None:
-#             return
-#         try:
-#             for p in module.parameters():
-#                 p.requires_grad = False
-#         except Exception:
-#             pass
-#         try:
-#             module.eval()
-#         except Exception:
-#             pass
-
-#     # ------------------------------------------------------------------
-#     # Runtime defaults and architecture normalization
-#     # ------------------------------------------------------------------
-#     def _install_clean_runtime_defaults(self) -> None:
-#         """Install only defaults needed by the Low-Rank Geometry Replay / Residual Geometry Adaptation stack.
-
-#         Defaults are set only when the user/main.py did not provide a value.
-#         Forbidden legacy branches are then force-disabled in
-#         _force_clean_main_path_args().
-#         """
-#         defaults = {
-#             # Classifier energy contract.
-#             "base_classifier_mode": "geometry_only",
-#             "incremental_classifier_mode": "geometry_only",
-#             "eval_classifier_mode": "geometry_only",
-#             "use_logdet_energy": True,
-#             "logdet_energy_weight": 0.05,
-#             "logdet_normalize_by_dim": True,
-#             "center_logdet_energy": True,
-#             "energy_normalize_by_dim": True,
-#             "geometry_normalize_logits": False,
-#             "residual_variance_scale": 0.75,
-#             "reliability_energy_weight": 0.03,
-#             "invalid_class_energy": 1e6,
-
-#             # Mandatory base objective.
-#             "base_class_balance": True,
-#             "base_ce_weight": 1.0,
-#             "base_srpgr_weight": 1.0,
-#             "base_energy_margin_weight": 0.15,
-#             "base_energy_margin": 0.25,
-#             "base_gics_weight": 0.20,
-#             "base_gics_temperature": 0.07,
-#             "pgr_weight": 0.10,
-#             "pgr_compact_weight": 0.15,
-#             "pgr_center_weight": 0.25,
-#             "pgr_subspace_weight": 0.20,
-#             "pgr_band_weight": 0.10,
-#             "pgr_volume_weight": 0.05,
-#             "pgr_center_margin": 1.10,
-#             "pgr_min_class_samples": 3,
-#             "pgr_subspace_min_samples": 6,
-#             "pgr_subspace_rank": 3,
-#             "pgr_max_class_variance": 0.75,
-#             "pgr_band_overlap_max": 0.60,
-#             "base_spectral_shape_weight": 0.10,
-#             "base_require_physical_spectral_shape": False,
-#             "strict_base_component_coverage": True,
-
-#             # GeometryBank extraction.
-#             "rank_energy_threshold": 0.90,
-#             "rank_eigen_ratio_threshold": 1e-2,
-#             "min_active_rank": 1,
-#             "geometry_variance_shrinkage": 0.25,
-#             "geom_var_floor": 5e-4,
-#             "geometry_bank_feature_space": "canonical",
-
-#             # Incremental Low-Rank Geometry Replay + Residual Geometry Adaptation path.
-#             "incremental_update_mode": "geometry_gated_adapter",
-#             "gfa_weight": 1.0,
-#             "gfa_samples_per_class": 48,
-#             "gfa_parallel_scale": 1.0,
-#             "gfa_residual_scale": 0.25,
-#             "gfa_reliability_gated": True,
-#             "joint_old_new_ce_weight": 1.0,
-#             "geometry_energy_margin_weight": 0.30,
-#             "geometry_energy_margin": 0.30,
-#             "old_new_invasion_weight": 0.50,
-#             "old_new_geometry_margin": 0.35,
-#             "adapter_lr": 1e-4,
-#             "adapter_weight_decay": 0.0,
-#             "adapter_bottleneck": 32,
-#             "adapter_max_scale": 0.35,
-#             "adapter_dropout": 0.0,
-#             "adapter_gate_bias_init": -3.0,
-#             "residual_geometry_adapter_weight": 1.0,
-#             "g2rpa_adapter_weight": 1.0,  # compatibility alias consumed by older incremental trainer code
-#             "adapter_old_delta_weight": 1.0,
-#             "adapter_old_gate_weight": 0.75,
-#             "adapter_old_energy_weight": 0.25,
-#             "adapter_old_margin_weight": 0.25,
-#             "adapter_delta_weight": 0.10,
-#             "adapter_new_gate_weight": 0.05,
-#             "adapter_new_gate_target": 0.25,
-#             "adapter_new_gate_max_target": 0.75,
-
-#             # Descriptor/new-row refinement kept for incremental row quality.
-#             "refine_new_descriptors": True,
-#             "use_descriptor_refinement": True,
-#             "descriptor_refine_steps": 5,
-#             "descriptor_refine_lr": 1e-3,
-#             "descriptor_trust_weight": 0.80,
-#             "descriptor_refine_max_mean_shift": 0.30,
-#             "descriptor_refine_max_logvar_shift": 0.50,
-#             "descriptor_subspace_collision_weight": 0.10,
-#             "descriptor_subspace_overlap_max": 0.35,
-#             "descriptor_center_margin_weight": 0.05,
-#             "descriptor_center_collision_weight": 0.05,
-#             "descriptor_center_margin": 0.50,
-#             "descriptor_volume_weight": 0.03,
-#             "descriptor_volume_control_weight": 0.03,
-#             "descriptor_volume_margin": 0.0,
-
-#             # Spectral summaries can shape base loss/bank but classifier remains geometry-only.
-#             "use_spectral_geometry": False,
-#             "spectral_energy_weight": 0.0,
-#             "band_energy_weight": 0.0,
-#             "spectral_require_physical_summary": True,
-#             "spectral_summary_is_physical": False,
-#             "raw_spectral_summary_is_physical": True,
-#             "external_spectra_are_physical": True,
-
-#             # Checkpoint/validation.
-#             "best_state_metric": "geometry_score",
-#             "refresh_before_validation": True,
-#             "validation_refresh_every": 1,
-#             "enforce_base_geometry_certificate": False,
-#             "base_cert_min_geom_acc": 95.0,
-#             "base_cert_min_reliability": 0.15,
-#             "base_cert_min_mean_reliability": 0.35,
-#             "base_cert_max_subspace_overlap": 0.55,
-#             "base_cert_max_geometry_conflict": 1.35,
-#             "base_cert_max_band_similarity": 0.90,
-#             "strict_updated_stack": True,
-#         }
-#         for k, v in defaults.items():
-#             self._set_arg_default(k, v)
-
-#     def _incremental_update_mode(self) -> str:
-#         raw = str(getattr(self.args, "incremental_update_mode", "geometry_gated_adapter")).lower().strip()
-#         aliases = {
-#             "": "geometry_gated_adapter",
-#             "none": "geometry_gated_adapter",
-#             "clean": "geometry_gated_adapter",
-#             "residual_geometry_adaptation": "geometry_gated_adapter",
-#             # Backward-compatible CLI aliases are accepted, but they all resolve to the single residual adaptation path.
-#             "adapter": "geometry_gated_adapter",
-#             "gated_adapter": "geometry_gated_adapter",
-#             "geometry_adapter": "geometry_gated_adapter",
-#             "geometry_gated_adapter": "geometry_gated_adapter",
-#             "descriptor": "geometry_gated_adapter",
-#             "descriptor_only": "geometry_gated_adapter",
-#         }
-#         mode = aliases.get(raw, raw)
-#         if mode != "geometry_gated_adapter":
-#             raise RuntimeError(
-#                 f"Unsupported incremental_update_mode={raw!r}. The trainer has one incremental path: "
-#                 "Low-Rank Geometry Replay + Residual Geometry Adaptation."
-#             )
-#         try:
-#             setattr(self.args, "incremental_update_mode", mode)
-#         except Exception:
-#             pass
-#         if hasattr(self.model, "incremental_update_mode"):
-#             self.model.incremental_update_mode = mode
-#         return mode
-
-#     def _adapter_mode_enabled(self) -> bool:
-#         return self._incremental_update_mode() == "geometry_gated_adapter"
-
-#     def _normalize_classifier_mode(self, mode: Optional[str], *, context: str = "runtime") -> str:
-#         raw = str(mode or "geometry_only").lower().strip()
-#         aliases = {
-#             "": "geometry_only",
-#             "none": "geometry_only",
-#             "geo": "geometry_only",
-#             "geometry": "geometry_only",
-#             "geometry-only": "geometry_only",
-#             "feature_geometry": "geometry_only",
-#             "low_rank_geometry": "geometry_only",
-#             "replay": "geometry_only",
-#             "synthetic_replay": "geometry_only",
-#             "srgp": "geometry_only",
-#             "srgp_geometry": "geometry_only",
-#         }
-#         forbidden_aliases = {"spectral_geometry", "spectral_residual", "calibrated_geometry", "topology_calibrated_geometry", "base_ce"}
-#         if raw in forbidden_aliases:
-#             raise RuntimeError(
-#                 f"{context}: classifier mode {raw!r} is not allowed. The trainer has one inference path: geometry_only."
-#             )
-#         normalized = aliases.get(raw, raw)
-#         if normalized != "geometry_only":
-#             raise RuntimeError(f"{context}: unsupported classifier mode={raw!r}; use geometry_only.")
-#         return normalized
-
-#     def _force_clean_main_path_args(self) -> None:
-#         """Disable unused/forbidden branches and align public args."""
-#         mode = self._incremental_update_mode()
-#         forced = {
-#             "incremental_update_mode": mode,
-#             "base_classifier_mode": "geometry_only",
-#             "incremental_classifier_mode": "geometry_only",
-#             "eval_classifier_mode": "geometry_only",
-#             "geometry_normalize_logits": False,
-#             "use_incremental_adapter": False,   # legacy flag; Residual Geometry Adaptation uses geometry_plastic_adapter as the bounded residual module.
-#             "disable_incremental_adapter": False,
-#             "incremental_adapter_normalize": False,
-#             "allow_incremental_projection_training": False,
-#             "freeze_projection_during_incremental": True,
-#             "use_geometry_calibrator": False,
-#             "geometry_calibration_weight": 0.0,
-#             "use_energy_calibrator": False,
-#             "energy_calibration_weight": 0.0,
-#             "use_bicyc_geometry_cycle": False,
-#             "bicyc_geometry_cycle_weight": 0.0,
-#             "bicyc_cycle_weight": 0.0,
-#             "bss_weight": 0.0,
-#             "sym_bss_weight": 0.0,
-#             "gdr_weight": 0.0,
-#             "anchor_consistency_weight": 0.0,
-#             "use_sglat_transport": False,
-#             "use_geometry_transport": False,
-#             "allow_old_model_transport": False,
-#             "allow_transport_without_adapter": False,
-#             "use_boundary_geometry_replay": False,
-#             "use_adaptive_boundary": False,
-#             "use_boundary_projection": False,
-#             "boundary_preserve_weight": 0.0,
-#             "use_spectral_geometry": False,
-#             "spectral_energy_weight": 0.0,
-#             "band_energy_weight": 0.0,
-#             "early_stop_patience": 0,
-#             "base_early_stop_patience": 0,
-#             "incremental_early_stop_patience": 0,
-#         }
-#         for k, v in forced.items():
-#             try:
-#                 setattr(self.args, k, v)
-#             except Exception:
-#                 pass
-
-#         self.incremental_update_mode = mode
-#         self.use_geometry_transport = False
-#         self.use_sglat_transport = False
-#         self.use_boundary_geometry_replay = False
-#         self.use_adaptive_boundary = False
-#         self.use_energy_calibrator = False
-#         self.use_spectral_geometry = False
-#         self.spectral_energy_weight = 0.0
-#         self.band_energy_weight = 0.0
-
-#         if hasattr(self.model, "use_geometry_gated_adapter"):
-#             self.model.use_geometry_gated_adapter = bool(mode == "geometry_gated_adapter")
-#         if hasattr(self.model, "incremental_update_mode"):
-#             self.model.incremental_update_mode = mode
-#         for attr in ("use_geometry_transport", "use_sglat_transport", "use_geometry_calibrator", "use_bicyc_geometry_cycle", "use_incremental_adapter"):
-#             if hasattr(self.model, attr):
-#                 setattr(self.model, attr, False)
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-
-#     def _propagate_clean_energy_config_to_model(self) -> None:
-#         clf = getattr(self.model, "classifier", None)
-#         if clf is not None:
-#             pairs = {
-#                 "use_logdet_energy": bool(self.use_logdet_energy),
-#                 "logdet_energy_weight": float(self.logdet_energy_weight),
-#                 "logdet_normalize_by_dim": bool(self.logdet_normalize_by_dim),
-#                 "center_logdet_energy": bool(self.center_logdet_energy),
-#                 "energy_normalize_by_dim": bool(self.energy_normalize_by_dim),
-#                 "normalize_energy_by_dim": bool(self.energy_normalize_by_dim),
-#                 "reliability_energy_weight": float(self.reliability_energy_weight),
-#                 "residual_variance_scale": float(self.residual_variance_scale),
-#                 "invalid_class_energy": float(self.invalid_class_energy),
-#                 "use_spectral_geometry": False,
-#                 "spectral_energy_weight": 0.0,
-#                 "band_energy_weight": 0.0,
-#                 "use_adaptive_boundary": False,
-#             }
-#             for k, v in pairs.items():
-#                 if hasattr(clf, k):
-#                     try:
-#                         setattr(clf, k, v)
-#                     except Exception:
-#                         pass
-#             if hasattr(clf, "normalize_logits"):
-#                 clf.normalize_logits = False
-#             if hasattr(clf, "freeze_all_adaptation"):
-#                 clf.freeze_all_adaptation()
-#         if hasattr(self.model, "use_adaptive_boundary"):
-#             self.model.use_adaptive_boundary = False
-
-#     # ------------------------------------------------------------------
-#     # Construction
-#     # ------------------------------------------------------------------
-#     def __init__(self, model, dataset, args) -> None:
 #         self.args = args
-#         self.device = torch.device(getattr(args, "device", "cpu"))
+#         self.device = self._resolve_device(self._require_arg("device"))
+#         self.save_dir = os.path.abspath(str(self._require_arg("save_dir")))
+#         self.debug = self._parse_bool(
+#             self._optional_arg("debug_verbose", False), "debug_verbose"
+#         )
 #         self.model = model.to(self.device)
 #         self.dataset = dataset
-#         self.save_dir = str(getattr(args, "save_dir", "./checkpoints"))
 #         os.makedirs(self.save_dir, exist_ok=True)
 
-#         self.debug = self._arg_bool("debug_verbose", False) or os.environ.get("NECIL_DEBUG", "0") == "1"
-#         self.base_only = self._arg_bool("base_only", False)
-#         self.disable_incremental_training = self._arg_bool("disable_incremental_training", False)
+#         self._last_base_geometry_report: Optional[Dict[str, Any]] = None
+#         self._last_base_geometry_certificate: Optional[Dict[str, Any]] = None
+#         self._last_base_stats: Dict[str, float] = {}
+#         self._base_ce_head: Optional[torch.nn.Module] = None
 
-#         self._install_clean_runtime_defaults()
-#         self.incremental_update_mode = self._incremental_update_mode()
-
-#         # Core geometry/classifier settings.
-#         self.subspace_rank = int(getattr(args, "subspace_rank", 5))
-#         self.geom_var_floor = float(getattr(args, "geom_var_floor", 5e-4))
-#         self.reliability_energy_weight = float(getattr(args, "reliability_energy_weight", 0.03))
-#         self.energy_normalize_by_dim = self._arg_bool("energy_normalize_by_dim", True)
-#         self.residual_variance_scale = float(getattr(args, "residual_variance_scale", 0.75))
-#         self.invalid_class_energy = float(getattr(args, "invalid_class_energy", 1e6))
-#         self.use_logdet_energy = self._arg_bool("use_logdet_energy", True)
-#         self.logdet_energy_weight = float(getattr(args, "logdet_energy_weight", 0.05))
-#         self.logdet_normalize_by_dim = self._arg_bool("logdet_normalize_by_dim", True)
-#         self.center_logdet_energy = self._arg_bool("center_logdet_energy", True)
-
-#         # Mandatory base phase.
-#         self.base_ce_weight = float(getattr(args, "base_ce_weight", 1.0))
-#         self.base_srpgr_weight = float(getattr(args, "base_srpgr_weight", 1.0))
-#         self.base_energy_margin_weight = float(getattr(args, "base_energy_margin_weight", 0.15))
-#         self.base_energy_margin = float(getattr(args, "base_energy_margin", 0.25))
-#         self.base_gics_weight = float(getattr(args, "base_gics_weight", 0.20))
-#         self.pgr_weight = float(getattr(args, "pgr_weight", 0.10))
-#         self.pgr_compact_weight = float(getattr(args, "pgr_compact_weight", 0.15))
-#         self.pgr_center_weight = float(getattr(args, "pgr_center_weight", 0.25))
-#         self.pgr_subspace_weight = float(getattr(args, "pgr_subspace_weight", 0.15))
-#         self.pgr_band_weight = float(getattr(args, "pgr_band_weight", 0.05))
-#         self.pgr_volume_weight = float(getattr(args, "pgr_volume_weight", 0.05))
-#         self.pgr_center_margin = float(getattr(args, "pgr_center_margin", 1.10))
-#         self.pgr_min_class_samples = int(getattr(args, "pgr_min_class_samples", 3))
-#         self.pgr_subspace_min_samples = int(getattr(args, "pgr_subspace_min_samples", 6))
-#         self.pgr_subspace_rank = int(getattr(args, "pgr_subspace_rank", 3))
-#         self.pgr_max_class_variance = float(getattr(args, "pgr_max_class_variance", 0.75))
-#         self.pgr_band_overlap_max = float(getattr(args, "pgr_band_overlap_max", 0.65))
-#         self.pgr_normalize_features = self._arg_bool("pgr_normalize_features", True)
-
-#         # GeometryBank extraction/rank.
-#         self.rank_energy_threshold = float(getattr(args, "rank_energy_threshold", 0.90))
-#         self.rank_eigen_ratio_threshold = float(getattr(args, "rank_eigen_ratio_threshold", 1e-2))
-#         self.min_active_rank = int(getattr(args, "min_active_rank", 1))
-#         self.geometry_variance_shrinkage = float(getattr(args, "geometry_variance_shrinkage", 0.25))
-
-#         # Optimizer/checkpoint policy.
-#         self.label_smoothing = float(getattr(args, "label_smoothing", 0.0))
-#         self.ce_logit_clip = float(getattr(args, "ce_logit_clip", 50.0))
-#         self.grad_clip_base = float(getattr(args, "grad_clip_base", 1.0))
-#         self.grad_clip_inc = float(getattr(args, "grad_clip_inc", 0.5))
-#         self.refresh_before_validation = self._arg_bool("refresh_before_validation", True)
-#         self.validation_refresh_every = int(getattr(args, "validation_refresh_every", 1))
-#         self.bank_refresh_every = int(getattr(args, "bank_refresh_every", 0))
-#         self.best_state_metric = str(getattr(args, "best_state_metric", "geometry_score")).lower().strip() or "geometry_score"
-#         self.early_stop_patience = 0
-
-#         # Incremental Low-Rank Geometry Replay / Residual Geometry Adaptation objective.
-#         self.gfa_weight = float(getattr(args, "gfa_weight", 1.0))
-#         self.gfa_samples_per_class = int(getattr(args, "gfa_samples_per_class", 48))
-#         self.gfa_parallel_scale = float(getattr(args, "gfa_parallel_scale", 0.95))
-#         self.gfa_residual_scale = float(getattr(args, "gfa_residual_scale", 0.25))
-#         self.gfa_reliability_gated = self._arg_bool("gfa_reliability_gated", True)
-#         self.joint_old_new_ce_weight = float(getattr(args, "joint_old_new_ce_weight", 1.0))
-#         self.geometry_energy_margin_weight = float(getattr(args, "geometry_energy_margin_weight", 0.30))
-#         self.geometry_energy_margin = float(getattr(args, "geometry_energy_margin", 0.30))
-#         self.old_new_invasion_weight = float(getattr(args, "old_new_invasion_weight", 0.50))
-#         self.old_new_geometry_margin = float(getattr(args, "old_new_geometry_margin", 0.35))
-#         self.use_pretrain_incremental_baseline = self._arg_bool("use_pretrain_incremental_baseline", True)
-
-#         # Adapter controls.
-#         self.adapter_lr = float(getattr(args, "adapter_lr", 1e-4))
-#         self.adapter_weight_decay = float(getattr(args, "adapter_weight_decay", 0.0))
-#         self.residual_geometry_adapter_weight = float(getattr(args, "residual_geometry_adapter_weight", getattr(args, "g2rpa_adapter_weight", 1.0)))
-#         self.g2rpa_adapter_weight = self.residual_geometry_adapter_weight  # compatibility alias for older incremental trainer code
-#         self.adapter_old_delta_weight = float(getattr(args, "adapter_old_delta_weight", 1.0))
-#         self.adapter_old_gate_weight = float(getattr(args, "adapter_old_gate_weight", 0.75))
-#         self.adapter_old_energy_weight = float(getattr(args, "adapter_old_energy_weight", 0.25))
-#         self.adapter_old_margin_weight = float(getattr(args, "adapter_old_margin_weight", 0.25))
-#         self.adapter_delta_weight = float(getattr(args, "adapter_delta_weight", 0.10))
-#         self.adapter_new_gate_weight = float(getattr(args, "adapter_new_gate_weight", 0.05))
-#         self.adapter_new_gate_target = float(getattr(args, "adapter_new_gate_target", 0.25))
-#         self.adapter_new_gate_max_target = float(getattr(args, "adapter_new_gate_max_target", 0.75))
-
-#         # New descriptor row refinement knobs consumed by IncrementalPhaseTrainer.
-#         self.refine_new_descriptors = self._arg_bool("refine_new_descriptors", True)
-#         self.use_descriptor_refinement = self._arg_bool("use_descriptor_refinement", self.refine_new_descriptors)
-#         self.descriptor_refine_steps = int(getattr(args, "descriptor_refine_steps", 5))
-#         self.descriptor_refine_lr = float(getattr(args, "descriptor_refine_lr", 1e-3))
-#         self.descriptor_trust_weight = float(getattr(args, "descriptor_trust_weight", 0.80))
-#         self.descriptor_refine_max_mean_shift = float(getattr(args, "descriptor_refine_max_mean_shift", 0.30))
-#         self.descriptor_refine_max_logvar_shift = float(getattr(args, "descriptor_refine_max_logvar_shift", 0.50))
-#         self.descriptor_refine_steps_per_epoch = int(getattr(args, "descriptor_refine_steps_per_epoch", 0))
-#         self.descriptor_refine_grad_clip = float(getattr(args, "descriptor_refine_grad_clip", 1.0))
-#         self.descriptor_subspace_collision_weight = float(getattr(args, "descriptor_subspace_collision_weight", 0.10))
-#         self.descriptor_subspace_overlap_max = float(getattr(args, "descriptor_subspace_overlap_max", 0.35))
-#         self.descriptor_center_margin_weight = float(getattr(args, "descriptor_center_margin_weight", 0.05))
-#         self.descriptor_center_collision_weight = float(getattr(args, "descriptor_center_collision_weight", self.descriptor_center_margin_weight))
-#         self.descriptor_center_margin = float(getattr(args, "descriptor_center_margin", 0.50))
-#         self.descriptor_volume_weight = float(getattr(args, "descriptor_volume_weight", 0.03))
-#         self.descriptor_volume_control_weight = float(getattr(args, "descriptor_volume_control_weight", self.descriptor_volume_weight))
-#         self.descriptor_volume_margin = float(getattr(args, "descriptor_volume_margin", 0.0))
-
-#         # Explicitly inactive legacy branches. Attributes remain for compatibility only.
-#         self.use_boundary_geometry_replay = False
-#         self.use_risk_weighted_replay = False
-#         self.use_energy_calibrator = False
-#         self.use_adaptive_boundary = False
-#         self.use_geometry_transport = False
-#         self.use_sglat_transport = False
-#         self.allow_incremental_projection_training = False
-#         self.freeze_projection_during_incremental = True
-#         self.use_spectral_geometry = False
-#         self.spectral_energy_weight = 0.0
-#         self.band_energy_weight = 0.0
-#         self.bss_weight = 0.0
-#         self.sym_bss_weight = 0.0
-#         self.gdr_weight = 0.0
-#         self.anchor_consistency_weight = 0.0
-#         self.geometry_calibration_weight = 0.0
-#         self.energy_calibration_weight = 0.0
-#         self.boundary_preserve_weight = 0.0
-#         self.use_boundary_projection = False
-
-#         self._force_clean_main_path_args()
-#         self._propagate_clean_energy_config_to_model()
-#         self._assert_global_architecture_contract()
-#         self._assert_updated_stack_contract(phase=0)
-#         self._set_base_trainable_params()
+#         self.assert_architecture_contract()
+#         self._assert_dataset_response_contract()
+#         self._assert_base_stack_contract()
+#         self._prepare_initial_model_state()
 
 #     # ------------------------------------------------------------------
-#     # Stack contract and trainability
+#     # Shared configuration dispatch
 #     # ------------------------------------------------------------------
-#     def _assert_updated_stack_contract(self, phase: Optional[int] = None) -> None:
-#         """Validate only the components required by the clean Low-Rank Geometry Replay / Residual Geometry Adaptation path.
+#     # BasePhaseTrainer accepts one or more option aliases and a keyword
+#     # default. TrainerHelper historically passes the default positionally.
+#     # These wrappers support both forms without MRO-dependent behavior.
+#     @staticmethod
+#     def _split_cfg_call(
+#         names: Sequence[Any], default: Any
+#     ) -> tuple[tuple[str, ...], Any]:
+#         values = list(names)
+#         if values and not isinstance(values[-1], str):
+#             if default is not _MISSING:
+#                 raise RuntimeError("configuration default was supplied twice")
+#             default = values.pop()
+#         if not values or not all(isinstance(name, str) for name in values):
+#             raise RuntimeError("configuration option names must be strings")
+#         return tuple(values), default
 
-#         This check intentionally does not require transport, calibration,
-#         adaptive-boundary, or GeometryBank-native replay APIs. The cleaned
-#         incremental trainer samples replay from frozen bank snapshots, so
-#         requiring ``geometry_bank.sample_replay`` here would create a false
-#         failure on a valid implementation.
-#         """
-#         strict = self._arg_bool("strict_updated_stack", True)
-#         phase_i = 0 if phase is None else int(phase)
-#         missing: List[str] = []
-
-#         for attr in ("extract_projected_features", "get_subspace_bank"):
-#             if not hasattr(self.model, attr):
-#                 missing.append(f"model.{attr}")
-
-#         if phase_i > 0:
-#             if not hasattr(self.model, "compute_logits_from_features") and not hasattr(self.model, "classifier"):
-#                 missing.append("model.compute_logits_from_features or model.classifier")
-#             if self._incremental_update_mode() == "geometry_gated_adapter":
-#                 if not hasattr(self.model, "geometry_plastic_adapter"):
-#                     missing.append("model.geometry_plastic_adapter")
-#                 if not hasattr(self.model, "adapt_projected_features"):
-#                     # The adapter trainer has a safe identity fallback for replay,
-#                     # but real new-sample adapter training needs this method to
-#                     # expose adapted features. Keep this as a strict contract.
-#                     missing.append("model.adapt_projected_features")
-
-#         clf = getattr(self.model, "classifier", None)
-#         if clf is None or not (
-#             hasattr(clf, "forward")
-#             or hasattr(clf, "compute_geometry_energy")
-#             or hasattr(clf, "geometry_energy_from_bank")
-#         ):
-#             missing.append("model.classifier strict GeometryEnergyClassifier")
-
-#         gb = getattr(self.model, "geometry_bank", None)
-#         if gb is None:
-#             missing.append("model.geometry_bank")
-#         else:
-#             for attr in ("get_valid_mask", "assert_bank_valid"):
-#                 if not hasattr(gb, attr):
-#                     missing.append(f"geometry_bank.{attr}")
-#             if phase_i > 0 and not any(hasattr(gb, a) for a in ("add_or_update_class_geometry", "update_class_geometry", "update_class")):
-#                 missing.append("geometry_bank.add_or_update_class_geometry/update_class_geometry/update_class")
-
-#         for attr in ("_safe_get_subspace_bank", "global_to_seen_local", "assert_bank_ready_for_seen_classes"):
-#             if not hasattr(self, attr):
-#                 missing.append(f"TrainerHelper.{attr}")
-
-#         if missing:
-#             msg = "Strict architecture stack contract failed; stale/missing component(s): " + ", ".join(missing)
-#             if strict:
-#                 raise RuntimeError(msg)
-#             print(f"[WARN] {msg}")
-
-#     def _assert_global_architecture_contract(self) -> None:
-#         mode = self._incremental_update_mode()
-#         for key in ("base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode"):
-#             self._normalize_classifier_mode(getattr(self.args, key, "geometry_only"), context=key)
-
-#         forbidden_true = [
-#             "use_geometry_calibrator", "use_incremental_adapter", "use_bicyc_geometry_cycle",
-#             "allow_incremental_projection_training", "use_sglat_transport", "use_geometry_transport",
-#             "allow_old_model_transport", "use_boundary_geometry_replay", "use_adaptive_boundary",
-#             "use_energy_calibrator", "geometry_normalize_logits",
-#         ]
-#         bad = [k for k in forbidden_true if self._arg_bool(k, False)]
-#         if bad:
-#             raise RuntimeError(f"Forbidden architecture switches are active: {bad}")
-#         for key in ("bss_weight", "sym_bss_weight", "gdr_weight", "anchor_consistency_weight", "geometry_calibration_weight", "energy_calibration_weight"):
-#             if abs(float(getattr(self.args, key, 0.0))) > 0.0:
-#                 raise RuntimeError(f"{key} must be 0.0 in the strict geometry-replay/adaptation architecture path.")
-#         if mode == "geometry_gated_adapter":
-#             if not hasattr(self.model, "geometry_plastic_adapter"):
-#                 raise RuntimeError("Residual Geometry Adaptation requires NECILModel.geometry_plastic_adapter.")
-#             max_scale = float(getattr(getattr(self.model, "geometry_plastic_adapter", None), "max_scale", getattr(self.args, "adapter_max_scale", 0.0)) or 0.0)
-#             if max_scale <= 0.0:
-#                 raise RuntimeError("geometry_gated_adapter selected but adapter_max_scale <= 0.")
-
-#     def _set_base_trainable_params(self) -> None:
-#         self._force_clean_main_path_args()
-#         self._propagate_clean_energy_config_to_model()
-#         for name, p in self.model.named_parameters():
-#             blocked = (
-#                 name.startswith("classifier.") or name.startswith("geometry_bank.")
-#                 or name.startswith("geometry_calibrator.") or name.startswith("geometry_cycle_calibrator.")
-#                 or name.startswith("incremental_adapter.") or name.startswith("geometry_plastic_adapter.")
-#                 or name.startswith("base_ce_head.")
-#             )
-#             p.requires_grad = not blocked
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-#         if hasattr(self.model, "freeze_geometry_plastic_adapter"):
-#             self.model.freeze_geometry_plastic_adapter()
-
-#     def _set_incremental_trainable_params(self, old_class_count: int = 0) -> List[torch.nn.Parameter]:
-#         old_class_count = int(old_class_count)
-#         self._force_clean_main_path_args()
-#         self._propagate_clean_energy_config_to_model()
-#         self._incremental_update_mode()
-
-#         for _, p in self.model.named_parameters():
-#             p.requires_grad = False
-#         if hasattr(self.model, "set_incremental_mode"):
-#             try:
-#                 self.model.set_incremental_mode(
-#                     phase=int(getattr(self.model, "current_phase", 1)),
-#                     old_class_count=old_class_count,
-#                     train_classifier_calibration=False,
-#                     train_geometry_adapter=True,
-#                 )
-#             except TypeError:
-#                 self.model.set_incremental_mode(phase=int(getattr(self.model, "current_phase", 1)), old_class_count=old_class_count)
-#         if hasattr(self.model, "enable_incremental_adapter"):
-#             self.model.enable_incremental_adapter()
-#         if hasattr(self.model, "unfreeze_geometry_plastic_adapter"):
-#             self.model.unfreeze_geometry_plastic_adapter()
-#         elif hasattr(self.model, "geometry_plastic_adapter"):
-#             for p in self.model.geometry_plastic_adapter.parameters():
-#                 p.requires_grad = True
-
-#         if hasattr(self.model, "freeze_backbone_only"):
-#             self.model.freeze_backbone_only()
-#         if hasattr(self.model, "freeze_projection_head"):
-#             self.model.freeze_projection_head()
-#         if hasattr(self.model, "freeze_classifier"):
-#             self.model.freeze_classifier()
-#         if hasattr(self.model, "freeze_energy_calibrator"):
-#             self.model.freeze_energy_calibrator()
-#         if hasattr(self.model, "freeze_geometry_calibrator"):
-#             self.model.freeze_geometry_calibrator()
-
-#         allowed = ("geometry_plastic_adapter",)
-#         bad = [name for name, p in self.model.named_parameters() if p.requires_grad and not any(a in name for a in allowed)]
-#         if bad:
-#             raise RuntimeError(f"Incremental residual geometry adaptation allows only geometry_plastic_adapter parameters, got: {bad[:30]}")
-#         params = [p for p in self.model.parameters() if p.requires_grad]
-#         if not params:
-#             raise RuntimeError("Incremental residual geometry adaptation selected but no geometry_plastic_adapter parameters are trainable.")
-#         return params
-
-#     def _set_clean_incremental_trainable_params(self, old_class_count: int) -> List[torch.nn.Parameter]:
-#         return self._set_incremental_trainable_params(old_class_count)
-
-#     def _has_feature_plasticity(self) -> bool:
-#         return bool(self._adapter_mode_enabled())
-
-#     def _has_descriptor_plasticity(self) -> bool:
-#         return bool(getattr(self, "refine_new_descriptors", False))
-
-#     def _has_energy_calibration_plasticity(self) -> bool:
-#         return False
-
-#     def _has_adaptive_boundary_plasticity(self) -> bool:
-#         return False
-
-#     # ------------------------------------------------------------------
-#     # Phase/mode helpers
-#     # ------------------------------------------------------------------
-#     def _base_classifier_mode(self) -> str:
-#         return "geometry_only"
-
-#     def _inc_classifier_mode(self) -> str:
-#         return "geometry_only"
-
-#     def _eval_classifier_mode(self) -> str:
-#         return "geometry_only"
-
-#     def _set_model_phase_and_old_count(self, phase: int, old_class_count: int) -> None:
-#         phase = int(phase)
-#         old_class_count = int(old_class_count)
-#         if phase == 0 and hasattr(self.model, "set_base_mode"):
-#             try:
-#                 self.model.set_base_mode(train_backbone=True, train_projection=True)
-#             except TypeError:
-#                 self.model.set_base_mode()
-#         elif phase > 0 and hasattr(self.model, "set_incremental_mode"):
-#             try:
-#                 self.model.set_incremental_mode(phase=phase, old_class_count=old_class_count, train_geometry_adapter=True)
-#             except TypeError:
-#                 self.model.set_incremental_mode(phase=phase, old_class_count=old_class_count)
-#         else:
-#             self.model.current_phase = phase
-#             self.model.old_class_count = old_class_count
-#         if hasattr(self.model, "current_phase"):
-#             self.model.current_phase = phase
-#         if hasattr(self.model, "old_class_count"):
-#             self.model.old_class_count = old_class_count
-
-#     # ------------------------------------------------------------------
-#     # Validation/scoring helpers
-#     # ------------------------------------------------------------------
-#     def _stable_ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-#         if logits is None or not torch.is_tensor(logits) or logits.numel() == 0:
-#             return self._zero(logits)
-#         labels = labels.long().view(-1).to(logits.device)
-#         if labels.numel() != logits.size(0):
-#             raise RuntimeError(f"CE batch mismatch: logits={logits.size(0)}, labels={labels.numel()}")
-#         if labels.numel() == 0:
-#             return logits.sum() * 0.0
-#         lo = int(labels.min().detach().item())
-#         hi = int(labels.max().detach().item())
-#         if lo < 0 or hi >= logits.size(1):
-#             raise RuntimeError(f"CE label range [{lo},{hi}] incompatible with logits width={logits.size(1)}")
-#         clip = float(getattr(self, "ce_logit_clip", getattr(self.args, "ce_logit_clip", 50.0)))
-#         smoothing = float(getattr(self, "label_smoothing", getattr(self.args, "label_smoothing", 0.0)))
-#         return F.cross_entropy(logits.clamp(-clip, clip), labels, label_smoothing=smoothing)
-
-#     def _classes_tensor(self, class_ids: Iterable[int], *, device=None) -> torch.Tensor:
-#         ids = [int(c) for c in class_ids]
-#         if not ids:
-#             raise RuntimeError("class_ids must be non-empty.")
-#         if len(set(ids)) != len(ids):
-#             raise RuntimeError(f"class_ids contains duplicates: {ids}")
-#         if min(ids) < 0:
-#             raise RuntimeError(f"class_ids must be non-negative global IDs, got {ids}")
-#         return torch.as_tensor(ids, device=device if device is not None else self.device, dtype=torch.long)
-
-#     def _seen_classes_for_phase(self, phase: int, fallback_labels: Optional[torch.Tensor] = None) -> List[int]:
-#         if hasattr(self.dataset, "get_classes_up_to_phase"):
-#             try:
-#                 seen = [int(c) for c in self.dataset.get_classes_up_to_phase(int(phase))]
-#                 if seen:
-#                     return list(dict.fromkeys(seen))
-#             except Exception:
-#                 pass
-#         seen: List[int] = []
-#         if hasattr(self.dataset, "phase_to_classes"):
-#             for p in range(int(phase) + 1):
-#                 try:
-#                     seen.extend(int(c) for c in self.dataset.phase_to_classes[p])
-#                 except Exception:
-#                     pass
-#         if not seen and torch.is_tensor(fallback_labels) and fallback_labels.numel() > 0:
-#             seen = [int(c) for c in fallback_labels.detach().cpu().unique(sorted=True).tolist()]
-#         if not seen:
-#             raise RuntimeError(f"Cannot resolve seen classes for phase={phase}")
-#         return list(dict.fromkeys(seen))
-
-#     def _assert_labels_in_seen_classes(self, labels: torch.Tensor, seen_classes: Iterable[int], *, context: str) -> None:
-#         if hasattr(self, "assert_global_labels_in_set"):
-#             return self.assert_global_labels_in_set(labels, seen_classes, context)
-#         y = labels.to(self.device).long().view(-1)
-#         seen = set(int(c) for c in seen_classes)
-#         bad = sorted(set(int(v) for v in y.detach().cpu().tolist()) - seen)
-#         if bad:
-#             raise RuntimeError(f"{context}: labels outside seen classes. bad={bad}, seen={sorted(seen)}")
-
-#     def _global_to_seen_local_safe(self, labels_global: torch.Tensor, seen_classes: Iterable[int], *, context: str) -> torch.Tensor:
-#         if hasattr(self, "global_to_seen_local"):
-#             return self.global_to_seen_local(labels_global, seen_classes, context=context)
-#         y = labels_global.to(self.device).long().view(-1)
-#         seen = [int(c) for c in seen_classes]
-#         mapping = {c: i for i, c in enumerate(seen)}
-#         local = torch.full_like(y, -1)
-#         for c, i in mapping.items():
-#             local[y == int(c)] = int(i)
-#         if bool((local < 0).any().item()):
-#             bad = sorted(set(int(v) for v in y[local < 0].detach().cpu().tolist()))
-#             raise RuntimeError(f"{context}: labels not in seen_classes: {bad}; seen={seen}")
-#         return local
-
-#     def _seen_local_to_global_safe(self, preds_local: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-#         if hasattr(self, "seen_local_to_global"):
-#             return self.seen_local_to_global(preds_local, seen_classes, context="seen_local_to_global")
-#         seen = torch.as_tensor([int(c) for c in seen_classes], device=preds_local.device, dtype=torch.long)
-#         return seen.index_select(0, preds_local.long().view(-1))
-
-#     def _mask_logits_to_seen_classes(self, logits: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-#         """Validate and return strict seen-local logits.
-
-#         The cleaned classifier has one output contract: [B, len(seen_classes)].
-#         Full-global logits are not accepted because silently slicing them hides
-#         class-order bugs during incremental learning.
-#         """
-#         if logits is None or not torch.is_tensor(logits) or logits.dim() != 2:
-#             raise RuntimeError(f"logits must be [B,C], got {None if logits is None else tuple(logits.shape)}")
-#         seen = [int(c) for c in seen_classes]
-#         if logits.size(1) != len(seen):
-#             raise RuntimeError(
-#                 f"Strict classifier contract violation: logits width={logits.size(1)} but len(seen_classes)={len(seen)}. "
-#                 "Return seen-local logits from the model/classifier instead of global-full logits."
-#             )
-#         if not torch.isfinite(logits).all():
-#             raise RuntimeError("Strict classifier contract violation: logits contain NaN/Inf.")
-#         return logits
-
-#     def _old_new_classes_for_validation(self, phase: int, old_class_count: int, seen_classes: Iterable[int]) -> Tuple[List[int], List[int]]:
-#         seen = [int(c) for c in seen_classes]
-#         old: List[int] = []
-#         if int(old_class_count) > 0 and int(phase) > 0 and hasattr(self.dataset, "get_classes_up_to_phase"):
-#             try:
-#                 old = [int(c) for c in self.dataset.get_classes_up_to_phase(int(phase) - 1)]
-#             except Exception:
-#                 old = []
-#         if not old and int(old_class_count) > 0:
-#             old = seen[: int(old_class_count)]
-#         old_set = set(old)
-#         new = [c for c in seen if c not in old_set]
-#         return [c for c in seen if c in old_set], new
-
-#     def _label_membership_mask(self, labels: torch.Tensor, class_ids: Iterable[int]) -> torch.Tensor:
-#         mask = torch.zeros_like(labels, dtype=torch.bool)
-#         for c in [int(x) for x in class_ids]:
-#             mask |= labels.eq(int(c))
-#         return mask
-
-#     def _prepare_batch_spectral_summary(self, batch_spectra: Optional[torch.Tensor], x: torch.Tensor) -> Tuple[Optional[torch.Tensor], bool]:
-#         if torch.is_tensor(batch_spectra) and batch_spectra.numel() > 0:
-#             s = batch_spectra.to(device=x.device, dtype=x.dtype, non_blocking=True)
-#             if s.dim() == 4:
-#                 s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#             elif s.dim() == 3:
-#                 s = s[:, :, s.size(-1) // 2] if s.size(0) == x.size(0) and s.size(2) > 1 else s.flatten(1)
-#             elif s.dim() == 1:
-#                 s = s.view(x.size(0), -1)
-#             elif s.dim() > 4:
-#                 s = s.flatten(1)
-#             if s.size(0) != x.size(0):
-#                 raise RuntimeError(f"Batch spectral summary mismatch: {tuple(s.shape)} vs input {tuple(x.shape)}")
-#             return torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), bool(getattr(self.args, "raw_spectral_summary_is_physical", True))
-#         return None, False
-
-#     def _forward_real_batch(
-#         self,
-#         x: torch.Tensor,
-#         batch_spectra: Optional[torch.Tensor] = None,
-#         *,
-#         classifier_mode: Optional[str] = None,
-#         seen_classes: Optional[Iterable[int]] = None,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
-#         return_energy: bool = True,
-#         return_parts: bool = False,
-#     ) -> Dict[str, Any]:
-#         mode = self._normalize_classifier_mode(classifier_mode or self._eval_classifier_mode(), context="real_batch_forward")
-#         spectral_summary, is_physical = self._prepare_batch_spectral_summary(batch_spectra, x)
-#         kwargs = dict(
-#             classifier_mode=mode,
-#             mode=mode,
-#             seen_classes=list(seen_classes) if seen_classes is not None else None,
-#             old_classes=list(old_classes) if old_classes is not None else None,
-#             new_classes=list(new_classes) if new_classes is not None else None,
-#             return_energy=return_energy,
-#             return_parts=return_parts,
-#             spectral_summary=spectral_summary,
-#             spectral_summary_is_physical=bool(is_physical),
+#     def _cfg_bool(self, *names: Any, default: Any = _MISSING) -> bool:
+#         resolved_names, resolved_default = self._split_cfg_call(names, default)
+#         value = BasePhaseTrainer._cfg_any(
+#             self, resolved_names, default=resolved_default
 #         )
-#         try:
-#             out = self.model(x, **kwargs)
-#         except TypeError:
-#             # Compatibility fallback for older model.forward; strict classifier/model should not hit this.
-#             fallback = {k: v for k, v in kwargs.items() if k in {"classifier_mode", "return_energy", "return_parts"}}
-#             out = self.model(x, **fallback)
-#         if not isinstance(out, dict):
-#             out = {"logits": out}
-#         out["spectral_summary"] = spectral_summary
-#         out["spectral_summary_is_physical"] = bool(is_physical)
-#         return out
+#         return self._parse_bool(value, resolved_names[0])
 
-#     @torch.no_grad()
-#     def _validate_split_metrics(self, loader, old_class_count: int) -> Dict[str, Any]:
-#         self._assert_global_architecture_contract()
-#         self.model.eval()
-#         old_class_count = int(old_class_count)
-#         phase = int(getattr(self.model, "current_phase", 0))
-#         seen_classes = self._seen_classes_for_phase(phase)
-#         old_classes, new_classes = self._old_new_classes_for_validation(phase, old_class_count, seen_classes)
-#         old_pos = [seen_classes.index(c) for c in old_classes if c in seen_classes]
-#         new_pos = [seen_classes.index(c) for c in new_classes if c in seen_classes]
+#     def _cfg_float(self, *names: Any, default: Any = _MISSING) -> float:
+#         resolved_names, resolved_default = self._split_cfg_call(names, default)
+#         value = BasePhaseTrainer._cfg_any(
+#             self, resolved_names, default=resolved_default
+#         )
+#         result = float(value)
+#         if not math.isfinite(result):
+#             raise RuntimeError(f"{resolved_names[0]} must be finite")
+#         return result
 
-#         total_loss = total_correct = total = batches = 0
-#         old_correct = old_total = new_correct = new_total = 0
-#         new_into_old_sum = old_into_new_sum = old_new_gap_sum = 0.0
-#         old_new_diag_batches = 0
-
-#         for batch in loader:
-#             x, y, batch_spectra, _ = self._unpack_hsi_batch(batch)
-#             x = x.to(self.device, non_blocking=True).float()
-#             y = y.to(self.device, non_blocking=True).long().view(-1)
-#             self._assert_labels_in_seen_classes(y, seen_classes, context=f"phase_{phase}_validation")
-#             y_local = self._global_to_seen_local_safe(y, seen_classes, context=f"phase_{phase}_validation")
-#             out = self._forward_real_batch(
-#                 x,
-#                 batch_spectra,
-#                 classifier_mode="geometry_only",
-#                 seen_classes=seen_classes,
-#                 old_classes=old_classes,
-#                 new_classes=new_classes,
-#                 return_energy=True,
-#                 return_parts=False,
+#     def _cfg_int(self, *names: Any, default: Any = _MISSING) -> int:
+#         resolved_names, resolved_default = self._split_cfg_call(names, default)
+#         value = BasePhaseTrainer._cfg_any(
+#             self, resolved_names, default=resolved_default
+#         )
+#         if isinstance(value, bool):
+#             raise RuntimeError(
+#                 f"{resolved_names[0]} must be an integer, not bool"
 #             )
-#             logits_seen = self._mask_logits_to_seen_classes(out["logits"], seen_classes)
-#             if logits_seen.size(0) != y_local.numel():
-#                 raise RuntimeError(f"Validation logits/labels mismatch: {logits_seen.size(0)} vs {y_local.numel()}")
-#             loss = self._stable_ce(logits_seen, y_local)
-#             pred_local = logits_seen.argmax(dim=1)
-#             pred_global = self._seen_local_to_global_safe(pred_local, seen_classes)
-#             correct = pred_global.eq(y)
-
-#             total_loss += float(loss.detach().item())
-#             total_correct += int(correct.sum().item())
-#             total += int(y.numel())
-#             batches += 1
-
-#             if old_class_count > 0 and old_classes and new_classes:
-#                 old_mask = self._label_membership_mask(y, old_classes)
-#                 new_mask = self._label_membership_mask(y, new_classes)
-#                 if bool(old_mask.any().item()):
-#                     old_correct += int(correct[old_mask].sum().item())
-#                     old_total += int(old_mask.sum().item())
-#                 if bool(new_mask.any().item()):
-#                     new_correct += int(correct[new_mask].sum().item())
-#                     new_total += int(new_mask.sum().item())
-
-#             energy = out.get("energy", None) if isinstance(out, dict) else None
-#             if torch.is_tensor(energy) and energy.dim() == 2 and old_pos and new_pos:
-#                 if energy.size(1) != len(seen_classes):
-#                     raise RuntimeError(
-#                         f"Strict energy contract violation: energy width={energy.size(1)} but len(seen_classes)={len(seen_classes)}."
-#                     )
-#                 e_seen = energy
-#                 old_idx = torch.as_tensor(old_pos, device=e_seen.device, dtype=torch.long)
-#                 new_idx = torch.as_tensor(new_pos, device=e_seen.device, dtype=torch.long)
-#                 old_min = e_seen.index_select(1, old_idx).min(dim=1).values
-#                 new_min = e_seen.index_select(1, new_idx).min(dim=1).values
-#                 old_mask_e = self._label_membership_mask(y, old_classes)
-#                 new_mask_e = self._label_membership_mask(y, new_classes)
-#                 if bool(new_mask_e.any().item()):
-#                     new_into_old_sum += float((old_min[new_mask_e] < new_min[new_mask_e]).float().mean().detach().item())
-#                 if bool(old_mask_e.any().item()):
-#                     old_into_new_sum += float((new_min[old_mask_e] < old_min[old_mask_e]).float().mean().detach().item())
-#                 old_new_gap_sum += float((new_min - old_min).mean().detach().item())
-#                 old_new_diag_batches += 1
-
-#         acc = 100.0 * total_correct / max(total, 1)
-#         split = old_class_count > 0 and bool(old_classes) and bool(new_classes)
-#         old_acc = 100.0 * old_correct / max(old_total, 1) if split else 0.0
-#         new_acc = 100.0 * new_correct / max(new_total, 1) if split else acc
-#         hm = 2.0 * old_acc * new_acc / max(old_acc + new_acc, 1e-8) if split else acc
-#         return {
-#             "loss": total_loss / max(batches, 1),
-#             "acc": acc,
-#             "old_acc": old_acc,
-#             "new_acc": new_acc,
-#             "hm": hm,
-#             "old_new_split_available": bool(split),
-#             "predicted_unseen": 0.0,
-#             "new_into_old_rate": float(new_into_old_sum / max(old_new_diag_batches, 1)),
-#             "old_into_new_rate": float(old_into_new_sum / max(old_new_diag_batches, 1)),
-#             "mean_old_new_energy_gap": float(old_new_gap_sum / max(old_new_diag_batches, 1)),
-#             "seen_classes": seen_classes,
-#             "old_classes": old_classes,
-#             "new_classes": new_classes,
-#         }
+#         result = int(value)
+#         if float(value) != float(result):
+#             raise RuntimeError(f"{resolved_names[0]} must be an integer")
+#         return result
 
 #     # ------------------------------------------------------------------
-#     # Scoring/checkpoint helpers
+#     # Configuration and device
 #     # ------------------------------------------------------------------
-#     def _base_geometry_global_metrics(self) -> Dict[str, float]:
-#         """Use the base trainer's cleaned geometry-state aliases.
+#     def _require_arg(self, name: str) -> Any:
+#         if not hasattr(self.args, name):
+#             raise RuntimeError(f"Missing required trainer option {name!r}")
+#         value = getattr(self.args, name)
+#         if value is None:
+#             raise RuntimeError(f"Trainer option {name!r} cannot be None")
+#         return value
 
-#         Keeping a second local implementation here would override the stricter
-#         base-phase scoring logic and lose the base geometry-energy margin fields.
+#     def _optional_arg(self, name: str, default: Any) -> Any:
+#         value = getattr(self.args, name, _MISSING)
+#         return default if value is _MISSING or value is None else value
+
+#     @staticmethod
+#     def _resolve_device(value: Any) -> torch.device:
+#         token = str(value).strip().lower()
+#         if token == "gpu":
+#             token = "cuda"
+#         try:
+#             requested = torch.device(token)
+#         except (TypeError, RuntimeError, ValueError) as exc:
+#             raise RuntimeError(
+#                 f"Invalid device {value!r}; use cpu, cuda, or cuda:<index>"
+#             ) from exc
+#         if requested.type == "cpu":
+#             return torch.device("cpu")
+#         if requested.type != "cuda":
+#             raise RuntimeError(f"Unsupported device type {requested.type!r}")
+#         if not torch.cuda.is_available():
+#             raise RuntimeError(
+#                 f"device={value!r} requests CUDA, but CUDA is unavailable"
+#             )
+#         count = int(torch.cuda.device_count())
+#         index = (
+#             int(torch.cuda.current_device())
+#             if requested.index is None
+#             else int(requested.index)
+#         )
+#         if index < 0 or index >= count:
+#             raise RuntimeError(
+#                 f"Requested cuda:{index}, but only {count} device(s) are visible"
+#             )
+#         torch.cuda.set_device(index)
+#         return torch.device(f"cuda:{index}")
+
+#     @staticmethod
+#     def _parse_bool(value: Any, name: str) -> bool:
+#         if isinstance(value, bool):
+#             return value
+#         if isinstance(value, int) and value in {0, 1}:
+#             return bool(value)
+#         if isinstance(value, str):
+#             token = value.strip().lower()
+#             if token in {"1", "true", "yes", "y", "on"}:
+#                 return True
+#             if token in {"0", "false", "no", "n", "off", "none", "null", ""}:
+#                 return False
+#         raise RuntimeError(f"{name} must be an explicit boolean, got {value!r}")
+
+#     @staticmethod
+#     def _require_object_attr(owner: Any, name: str, owner_name: str) -> Any:
+#         if owner is None or not hasattr(owner, name):
+#             raise RuntimeError(f"{owner_name} must expose {name!r}")
+#         value = getattr(owner, name)
+#         if value is None:
+#             raise RuntimeError(f"{owner_name}.{name} cannot be None")
+#         return value
+
+#     def _optional_bool(self, name: str, default: bool) -> bool:
+#         return self._parse_bool(self._optional_arg(name, default), name)
+
+#     def _optional_float(self, name: str, default: float) -> float:
+#         value = float(self._optional_arg(name, default))
+#         if not math.isfinite(value):
+#             raise RuntimeError(f"{name} must be finite, got {value!r}")
+#         return value
+
+#     @staticmethod
+#     def _normalized_mode(value: Any) -> str:
+#         token = str(value or "pc_stgb_row_replay").strip().lower().replace("-", "_")
+#         if token in {"pc_sirg", "pc_sirg_row_replay", "joint_geometry"}:
+#             return "pc_stgb_row_replay"
+#         return token
+
+#     def _response_views_from_batch(
+#         self,
+#         batch: Any,
+#         x: torch.Tensor,
+#         *,
+#         fine: bool = False,
+#         required: bool = True,
+#         context: str = "response_views",
+#     ):
+#         """Unified base/helper intervention-view parser.
+
+#         Base training requests optional fine h/2 views, while shared helper
+#         extraction supplies a diagnostic context.  One method supports both
+#         contracts and validates the intervention-definition version.
 #         """
-#         return BasePhaseTrainer._base_geometry_global_metrics(self)
+#         result = BasePhaseTrainer._response_views_from_batch(
+#             self, batch, x, fine=bool(fine), required=bool(required)
+#         )
+#         if result is None or fine or not isinstance(batch, Mapping):
+#             return result
+#         version = None
+#         for source in self._view_sources(batch):
+#             if version is None:
+#                 version = source.get(
+#                     "intervention_definition_version",
+#                     source.get(
+#                         "pc_stgb_intervention_version",
+#                         source.get("pc_sirg_intervention_version"),
+#                     ),
+#                 )
+#         if version is not None:
+#             observed = int(torch.as_tensor(version).reshape(-1)[0].item())
+#             expected = int(self.model.intervention_definition_version)
+#             if observed != expected:
+#                 raise RuntimeError(
+#                     f"{context}: intervention version={observed} "
+#                     f"!= model version={expected}"
+#                 )
+#         return result
 
-#     def _select_score(self, val_stats: Dict[str, float], phase: int) -> float:
-#         if int(phase) > 0:
-#             metric = str(getattr(self, "best_state_metric", getattr(self.args, "best_state_metric", "hm"))).lower().strip()
-#             if metric in {"acc", "oa"}:
-#                 return float(val_stats.get("acc", 0.0))
-#             if metric in {"old_new_min", "min"}:
-#                 return min(float(val_stats.get("old_acc", 0.0)), float(val_stats.get("new_acc", 0.0)))
-#             if metric in {"loss", "val_loss"}:
-#                 return -float(val_stats.get("loss", 0.0))
-#             return float(val_stats.get("hm", 0.0))
-#         return self._select_base_checkpoint_score(val_stats, getattr(self, "_last_base_geom_stats", None))
+#     # ------------------------------------------------------------------
+#     # Architecture contract
+#     # ------------------------------------------------------------------
+#     def assert_architecture_contract(self) -> None:
+#         checker = getattr(self.model, "assert_architecture_contract", None)
+#         if not callable(checker):
+#             raise RuntimeError("Model must expose assert_architecture_contract()")
+#         checker()
 
-#     def _select_base_checkpoint_score(self, val_stats: Dict[str, float], geom_stats: Optional[Dict[str, float]] = None) -> float:
-#         """Delegate to BasePhaseTrainer so base energy-margin health affects checkpoint selection."""
-#         return BasePhaseTrainer._select_base_checkpoint_score(self, val_stats, geom_stats)
+#         contract_method = getattr(self.model, "feature_contract", None)
+#         if not callable(contract_method):
+#             raise RuntimeError("Model must expose feature_contract()")
+#         contract = contract_method()
+#         if not isinstance(contract, Mapping):
+#             raise RuntimeError("model.feature_contract() must return a mapping")
 
-#     def _capture_state(self) -> Dict[str, torch.Tensor]:
-#         return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-
-#     def _print_trainable_summary(self, phase: int) -> None:
-#         trainable = [(n, int(p.numel())) for n, p in self.model.named_parameters() if p.requires_grad]
-#         total = sum(n for _, n in trainable)
-#         if int(phase) == 0:
-#             print(f"[Trainable] Base phase: {total:,} params | backbone/projection + temporary CE head")
-#             print("[Base Objective] balanced CE + GICS + geometry reserve(compact,center,subspace,band,volume) + base geometry-energy margin")
-#         else:
-#             print(f"[Trainable] Incremental phase {phase}: {total:,} params | residual geometry adapter only")
-#             print("[Incremental Objective] low-rank GeometryBank replay + residual geometry adaptation + joint CE + old/new energy margins")
-#         if self.debug:
-#             for name, count in trainable[:150]:
-#                 print(f"  {name}: {count:,}")
-
-#     def _current_runtime_contract(self) -> Dict[str, object]:
-#         adapter_trainable = any(p.requires_grad and "geometry_plastic_adapter" in n for n, p in self.model.named_parameters())
-#         return {
-#             "method": "Low-Rank Geometry Replay and Residual Geometry Adaptation for HSI NECIL",
-#             "feature_space": "canonical projected z; incremental residual adaptation is bounded and old rows stay frozen",
-#             "classifier": "strict seen-class low-rank GeometryBank energy",
-#             "classifier_output": "[B, len(seen_classes)]",
-#             "incremental_update_mode": self._incremental_update_mode(),
-#             "residual_geometry_adapter_present": bool(hasattr(self.model, "geometry_plastic_adapter")),
-#             "residual_geometry_adapter_trainable": bool(adapter_trainable),
-#             "old_memory": "frozen GeometryBank statistics only",
-#             "raw_exemplars": False,
-#             "kd_teacher": False,
-#             "transport": False,
-#             "adaptive_boundary": False,
-#             "energy_calibrator": False,
-#             "spectral_classifier_branch": False,
-#             "base_objective": "balanced CE + GICS + geometry reserve + base geometry-energy margin",
-#             "incremental_objective": "low-rank geometry replay + residual geometry adaptation + joint CE + old/new energy margin",
-#             "uses_logdet_energy": bool(self.use_logdet_energy),
-#             "logdet_energy_weight": float(self.logdet_energy_weight),
-#             "row_energy_standardization": False,
+#         expected = {
+#             "method": self.METHOD_NAME,
+#             "geometry_bank_schema_version": self.BANK_SCHEMA_VERSION,
+#             "geometry_feature_space":
+#                 "unnormalized_euclidean_residual_projected_z",
+#             "joint_factorization": self.JOINT_FACTORIZATION,
+#             "classifier_contract":
+#                 "dimension_normalized_conditional_joint_energy",
+#             "spectral_object":
+#                 "central_finite_difference_canonical_feature_tangent",
+#             "spectral_role":
+#                 "conditional_training_coupled_replay_and_inference",
+#             "inference_geometry":
+#                 "occupancy_conditioned_spectral_tangent_geometry",
+#             "raw_spectral_gaussian": False,
+#             "occupancy_tangent_coupling": True,
+#             "independent_response_factorization": False,
+#             "old_rows_immutable": True,
+#             "feature_normalization": False,
 #         }
+#         mismatched = {
+#             key: (contract.get(key), target)
+#             for key, target in expected.items()
+#             if contract.get(key) != target
+#         }
+#         if mismatched:
+#             raise RuntimeError(f"PC-STGB feature contract mismatch: {mismatched}")
+
+#         configured_mode = self._normalized_mode(
+#             self._optional_arg("incremental_update_mode", "pc_stgb_row_replay")
+#         )
+#         model_mode = self._normalized_mode(
+#             contract.get(
+#                 "incremental_update_mode",
+#                 getattr(self.model, "incremental_update_mode", ""),
+#             )
+#         )
+#         if configured_mode != "pc_stgb_row_replay" or model_mode != configured_mode:
+#             raise RuntimeError(
+#                 "args and model must use incremental_update_mode="
+#                 f"'pc_stgb_row_replay'; args={configured_mode!r}, "
+#                 f"model={model_mode!r}"
+#             )
+
+#         bank = self._require_object_attr(self.model, "geometry_bank", "model")
+#         classifier = self._require_object_attr(self.model, "classifier", "model")
+#         if int(getattr(bank, "SCHEMA_VERSION", -1)) != self.BANK_SCHEMA_VERSION:
+#             raise RuntimeError("Trainer requires the schema-v5 PC-STGB GeometryBank")
+
+#         num_interventions = int(contract.get("num_interventions", 0))
+#         response_rank = int(contract.get("response_rank", 0))
+#         if num_interventions <= 0 or response_rank <= 0:
+#             raise RuntimeError(
+#                 "PC-STGB requires positive intervention count and tangent rank"
+#             )
+#         if int(bank.num_interventions) != num_interventions:
+#             raise RuntimeError("Model and GeometryBank intervention counts differ")
+#         if int(bank.response_rank) != response_rank:
+#             raise RuntimeError("Model and GeometryBank tangent ranks differ")
+#         if int(
+#             self._optional_arg("num_spectral_interventions", num_interventions)
+#         ) != num_interventions:
+#             raise RuntimeError("CLI and model intervention counts differ")
+
+#         bank_weight = float(bank.response_weight)
+#         classifier_weight = float(classifier.response_weight)
+#         contract_weight = float(contract.get("response_weight", bank_weight))
+#         if max(
+#             abs(bank_weight - classifier_weight),
+#             abs(bank_weight - contract_weight),
+#         ) > 1e-12:
+#             raise RuntimeError(
+#                 "Model, GeometryBank, and classifier tangent weights differ"
+#             )
+#         if bank_weight <= 0.0:
+#             raise RuntimeError("spectral_response_weight must be positive")
+#         if not bool(classifier.normalize_energy_by_dim):
+#             raise RuntimeError("Classifier must use dimension-normalized energy")
+#         if float(bank.energy_logdet_weight) <= 0.0:
+#             raise RuntimeError("Occupancy energy requires a positive log-volume weight")
+#         if float(classifier.response_logdet_weight) <= 0.0:
+#             raise RuntimeError("Tangent energy requires a positive log-volume weight")
+
+#         classifier_contract = classifier.classifier_contract()
+#         classifier_expected = {
+#             "joint_factorization": self.JOINT_FACTORIZATION,
+#             "uses_coupling_inference_score": True,
+#             "uses_independent_response_factorization": False,
+#             "uses_raw_spectral_gaussian": False,
+#             "uses_calibration": False,
+#         }
+#         classifier_failures = {
+#             key: (classifier_contract.get(key), value)
+#             for key, value in classifier_expected.items()
+#             if classifier_contract.get(key) != value
+#         }
+#         if classifier_failures:
+#             raise RuntimeError(
+#                 "PC-STGB classifier contract mismatch: "
+#                 f"{classifier_failures}"
+#             )
+
+#         if self._optional_bool("normalize_geometry_features", False):
+#             raise RuntimeError("PC-STGB forbids normalized geometry features")
+
+#         forbidden_flags = (
+#             "use_incremental_adapter",
+#             "use_geometry_gated_adapter",
+#             "use_geometry_transport",
+#             "use_sglat_transport",
+#             "allow_old_model_transport",
+#             "use_energy_calibrator",
+#             "use_geometry_calibrator",
+#             "use_adaptive_boundary",
+#             "allow_incremental_projection_training",
+#             "use_raw_spectral_gaussian",
+#             "use_spectral_feature_coupling",
+#             "use_independent_geometry_replay",
+#             "use_independent_response_replay",
+#         )
+#         active_flags = [
+#             name
+#             for name in forbidden_flags
+#             if hasattr(self.args, name)
+#             and getattr(self.args, name) is not None
+#             and self._parse_bool(getattr(self.args, name), name)
+#         ]
+#         if active_flags:
+#             raise RuntimeError(
+#                 f"Retired or contradictory architecture branches are enabled: "
+#                 f"{active_flags}"
+#             )
+
+#         retired_weights = (
+#             "base_gics_weight",
+#             "pgr_weight",
+#             "pgr_geometry_margin_weight",
+#             "pgr_clearance_weight",
+#             "pgr_condition_weight",
+#             "pgr_spectral_risk_weight",
+#             "base_admission_weight",
+#             "base_spectral_fisher_weight",
+#             "base_joint_coupling_weight",
+#         )
+#         active_weights = [
+#             name
+#             for name in retired_weights
+#             if hasattr(self.args, name)
+#             and getattr(self.args, name) is not None
+#             and abs(float(getattr(self.args, name))) > 1e-12
+#         ]
+#         if active_weights:
+#             raise RuntimeError(
+#                 "Retired loss weights must be removed or set to zero: "
+#                 f"{active_weights}"
+#             )
+
+#     def _assert_dataset_response_contract(self) -> None:
+#         if not self._optional_bool("base_require_response_views", True):
+#             raise RuntimeError("base_require_response_views must be true")
+
+#         capability_names = (
+#             "has_spectral_response_views",
+#             "return_spectral_response_views",
+#             "return_spectral_intervention_views",
+#             "spectral_interventions_enabled",
+#         )
+#         observed = False
+#         for name in capability_names:
+#             if not hasattr(self.dataset, name):
+#                 continue
+#             observed = True
+#             value = getattr(self.dataset, name)
+#             enabled = bool(value() if callable(value) else value)
+#             if not enabled:
+#                 raise RuntimeError(
+#                     f"Dataset {name} is false, but paired +/- tangent views "
+#                     "are required"
+#                 )
+#         if not observed and self.debug:
+#             print(
+#                 "[Trainer] No static tangent-view capability flag was found; "
+#                 "the first batch will be validated strictly."
+#             )
+
+#     def _assert_base_stack_contract(self) -> None:
+#         required_model = (
+#             "feature_contract",
+#             "assert_architecture_contract",
+#             "extract_joint_geometry_tuple",
+#             "compute_logits_from_features",
+#             "ensure_base_ce_head",
+#             "drop_base_ce_head",
+#             "build_candidate_geometry_rows",
+#             "score_candidate_geometry_rows",
+#             "finalize_base_geometry",
+#             "sample_geometry_replay",
+#             "geometry_diagnostics",
+#             "export_memory_snapshot",
+#             "load_memory_snapshot",
+#             "model_contract_digest",
+#             "set_base_mode",
+#             "set_incremental_mode",
+#             "commit_candidate_geometry_rows",
+#             "assert_frozen_modules",
+#             "set_phase",
+#         )
+#         missing_model = [
+#             name
+#             for name in required_model
+#             if not callable(getattr(self.model, name, None))
+#         ]
+#         if missing_model:
+#             raise RuntimeError(
+#                 f"PC-STGB model contract is incomplete: {missing_model}"
+#             )
+
+#         bank = self._require_object_attr(self.model, "geometry_bank", "model")
+#         required_bank = (
+#             "get_bank",
+#             "get_valid_mask",
+#             "assert_bank_valid",
+#             "assert_phase0_base_handoff_ready",
+#             "assert_response_prior_ready",
+#             "contract_digest",
+#             "snapshot_rows",
+#             "assert_rows_identical",
+#             "rows_digest",
+#             "export_snapshot",
+#             "load_snapshot",
+#             "phase_geometry_state_report",
+#             "compute_geometry_diagnostics",
+#             "refine_candidate_joint_rows",
+#             "candidate_joint_energy_matrix",
+#             "commit_incremental_geometry_rows",
+#         )
+#         missing_bank = [
+#             name for name in required_bank if not callable(getattr(bank, name, None))
+#         ]
+#         if missing_bank:
+#             raise RuntimeError(
+#                 f"PC-STGB GeometryBank contract is incomplete: {missing_bank}"
+#             )
+
+#         required_state = (
+#             "means",
+#             "bases",
+#             "eigvals",
+#             "res_vars",
+#             "active_ranks",
+#             "sample_counts",
+#             "response_bases",
+#             "response_means",
+#             "response_eigvals",
+#             "response_res_vars",
+#             "response_active_ranks",
+#             "response_sample_counts",
+#             "response_reliability",
+#             "response_stats_ready",
+#             "response_couplings",
+#             "response_coupling_reliability",
+#             "response_coupling_explained_variance",
+#             "response_coupling_ready",
+#             "response_prior_mean",
+#             "response_prior_variance",
+#             "response_prior_sample_count",
+#             "response_prior_ready",
+#             "response_prior_frozen",
+#             "energy_stats_ready",
+#             "margin_stats_ready",
+#             "phase_created",
+#             "frozen_class_mask",
+#         )
+#         missing_state = [
+#             name
+#             for name in required_state
+#             if not torch.is_tensor(getattr(bank, name, None))
+#         ]
+#         if missing_state:
+#             raise RuntimeError(
+#                 "PC-STGB GeometryBank persistent state is incomplete: "
+#                 f"{missing_state}"
+#             )
+
+#         classifier = self.model.classifier
+#         required_classifier = (
+#             "classifier_contract",
+#             "classifier_contract_digest",
+#             "bind_geometry_bank_contract",
+#             "compute_joint_logits",
+#             "compute_candidate_joint_logits",
+#             "expand_to_seen_classes",
+#         )
+#         missing_classifier = [
+#             name
+#             for name in required_classifier
+#             if not callable(getattr(classifier, name, None))
+#         ]
+#         if missing_classifier:
+#             raise RuntimeError(
+#                 f"PC-STGB classifier contract is incomplete: {missing_classifier}"
+#             )
 
 #     # ------------------------------------------------------------------
-#     # Phase dispatch
+#     # Phase routing
 #     # ------------------------------------------------------------------
-#     def _assert_incremental_preflight(
+#     def _prepare_initial_model_state(self) -> None:
+#         bank = self.model.geometry_bank
+#         if len(bank) == 0:
+#             self.model.set_phase(0)
+#             self.model.set_base_mode(train_backbone=True, train_projection=True)
+#             self.model.current_phase = 0
+#             self.model.old_class_count = 0
+#             self.model.old_classes = []
+#             self.model.new_classes = []
+#             return
+
+#         valid = torch.nonzero(
+#             bank.get_valid_mask(), as_tuple=False
+#         ).flatten().detach().cpu().tolist()
+#         if not valid:
+#             raise RuntimeError(
+#                 "Model contains allocated GeometryBank rows without valid class "
+#                 "memory. Start phase 0 from an empty bank."
+#             )
+#         self._set_post_base_state(valid)
+
+#     def _set_post_base_state(self, seen_classes: Iterable[int]) -> None:
+#         seen = self._as_class_list(seen_classes, name="post_base_seen_classes")
+#         self.model.current_phase = 0
+#         self.model.seen_classes = list(seen)
+#         self.model.old_classes = list(seen)
+#         self.model.new_classes = []
+#         self.model.old_class_count = len(seen)
+#         self.model.current_num_classes = len(seen)
+#         self.model.base_mode_active = False
+#         self.model.incremental_mode_active = False
+#         self.model.classifier.expand_to_seen_classes(seen)
+
+#         modules = (
+#             getattr(self.model, "backbone", None),
+#             getattr(self.model, "projection", None),
+#             getattr(self.model, "norm", None),
+#             getattr(self.model, "classifier", None),
+#             getattr(self.model, "base_ce_head", None),
+#         )
+#         for module in modules:
+#             if module is None:
+#                 continue
+#             module.eval()
+#             for parameter in module.parameters():
+#                 parameter.requires_grad_(False)
+#                 parameter.grad = None
+#         residual = getattr(self.model, "projection_residual_logit", None)
+#         if isinstance(residual, torch.nn.Parameter):
+#             residual.requires_grad_(False)
+#             residual.grad = None
+#         self.model.eval()
+
+#     def _set_post_phase_state(
+#         self, seen_classes: Iterable[int], phase: int
+#     ) -> None:
+#         seen = self._as_class_list(
+#             seen_classes, name="post_phase_seen_classes"
+#         )
+#         phase = int(phase)
+#         self._set_post_base_state(seen)
+#         self.model.current_phase = phase
+#         self.model.seen_classes = list(seen)
+#         self.model.old_classes = list(seen)
+#         self.model.new_classes = []
+#         self.model.old_class_count = len(seen)
+#         self.model.current_num_classes = len(seen)
+#         self.model.base_mode_active = False
+#         self.model.incremental_mode_active = False
+
+#     def _seen_classes_for_phase(self, phase: int) -> List[int]:
+#         phase = int(phase)
+#         phase_map = self._require_object_attr(
+#             self.dataset, "phase_to_classes", "dataset"
+#         )
+#         if phase < 0:
+#             raise RuntimeError("phase must be non-negative")
+#         values: List[int] = []
+#         for index in range(phase + 1):
+#             try:
+#                 current = phase_map[index]
+#             except (KeyError, IndexError, TypeError) as exc:
+#                 raise RuntimeError(
+#                     f"dataset.phase_to_classes has no phase {index}"
+#                 ) from exc
+#             values.extend(int(value) for value in current)
+#         return self._as_class_list(values, name=f"seen_through_phase_{phase}")
+
+#     def _print_execution_summary(self) -> None:
+#         bank = self.model.geometry_bank
+#         total_parameters = sum(
+#             int(parameter.numel()) for parameter in self.model.parameters()
+#         )
+#         print(
+#             f"[Trainer] method={self.METHOD_NAME} | scope=base+incremental | "
+#             f"parameters={total_parameters:,} | device={self.device} | "
+#             f"occupancy_rank={int(bank.rank)} | "
+#             f"tangent_rank={int(bank.response_rank)} | "
+#             f"interventions={int(bank.num_interventions)} | "
+#             f"tangent_weight={float(bank.response_weight):.4f}"
+#         )
+#         print(
+#             "[Base Objective] temporary CE + held-out conditional joint-energy "
+#             "consolidation + real-sample lower-boundary certification."
+#         )
+#         print(
+#             "[Base Memory] zero persistent rows during optimization; one final "
+#             "frozen-prior atomic reconstruction and classifier binding."
+#         )
+
+#     def train_phase(
 #         self,
 #         phase: int,
-#         old_classes: Optional[Iterable[int]] = None,
-#         new_classes: Optional[Iterable[int]] = None,
-#         seen_classes: Optional[Iterable[int]] = None,
-#     ) -> None:
-#         """Preflight for the clean incremental row-insertion path.
-
-#         The previous version used ``range(old_class_count)``. That works only
-#         for sequential class ids and can silently freeze/check the wrong rows.
-#         This version resolves old/new/seen classes from the dataset protocol and
-#         validates the exact global GeometryBank rows that will be used.
-#         """
+#         epochs: int,
+#         batch_size: int,
+#         lr: float,
+#     ) -> Dict[str, Any]:
 #         phase = int(phase)
-#         if phase <= 0:
-#             raise RuntimeError("Incremental preflight requires phase > 0.")
-#         self._assert_updated_stack_contract(phase=phase)
+#         epochs = int(epochs)
+#         batch_size = int(batch_size)
+#         lr = float(lr)
+#         if phase < 0:
+#             raise ValueError("phase must be non-negative")
+#         if batch_size <= 0:
+#             raise ValueError("batch_size must be positive")
+#         if phase == 0:
+#             if epochs <= 0:
+#                 raise ValueError("base epochs must be positive")
+#             if not math.isfinite(lr) or lr <= 0.0:
+#                 raise ValueError("base learning rate must be finite and positive")
+#         else:
+#             if epochs < 0:
+#                 raise ValueError("incremental epochs must be non-negative")
+#             if not math.isfinite(lr):
+#                 raise ValueError("incremental learning-rate argument must be finite")
 
-#         if old_classes is None or new_classes is None or seen_classes is None:
-#             old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
-#         old_ids = [int(c) for c in old_classes]
-#         new_ids = [int(c) for c in new_classes]
-#         seen_ids = [int(c) for c in seen_classes]
-
-#         if not old_ids:
-#             raise RuntimeError(f"Incremental phase {phase} has no old classes.")
-#         if not new_ids:
-#             raise RuntimeError(f"Incremental phase {phase} has no new classes.")
-#         if set(old_ids).intersection(new_ids):
-#             raise RuntimeError(f"Incremental phase {phase} old/new overlap: {sorted(set(old_ids).intersection(new_ids))}")
-#         if seen_ids != list(dict.fromkeys([*old_ids, *new_ids])):
-#             raise RuntimeError(f"Incremental phase {phase} seen_classes must equal old+new. old={old_ids}, new={new_ids}, seen={seen_ids}")
-
-#         # Central contract check added in the cleaned helper; fall back to local
-#         # checks when older helpers are still present.
-#         fn = getattr(self, "assert_clean_incremental_contract", None)
-#         if callable(fn):
-#             fn(phase=phase, old_classes=old_ids, new_classes=new_ids, seen_classes=seen_ids)
-
-#         if self._incremental_update_mode() == "geometry_gated_adapter" and not hasattr(self.model, "geometry_plastic_adapter"):
-#             raise RuntimeError("Incremental Residual Geometry Adaptation requires model.geometry_plastic_adapter.")
-
-#         bank = self._safe_get_subspace_bank(require_ready=True)
-#         self.assert_bank_ready_for_seen_classes(bank, old_ids)
-#         # Before inserting new rows, future rows must not already be valid.
-#         if hasattr(self, "assert_bank_has_only_allowed_valid_rows"):
-#             self.assert_bank_has_only_allowed_valid_rows(bank, old_ids)
-
-#         gb = getattr(self.model, "geometry_bank", None)
-#         if gb is not None:
-#             if hasattr(gb, "freeze_classes"):
-#                 gb.freeze_classes(old_ids)
-#             elif hasattr(gb, "freeze_classes_up_to") and old_ids == list(range(max(old_ids) + 1)):
-#                 gb.freeze_classes_up_to(max(old_ids) + 1)
-#             elif hasattr(gb, "frozen_class_mask"):
-#                 gb.frozen_class_mask[torch.as_tensor(old_ids, device=gb.frozen_class_mask.device)] = True
-#             if hasattr(gb, "assert_bank_valid"):
-#                 try:
-#                     gb.assert_bank_valid(seen_classes=old_ids, strict=True)
-#                 except TypeError:
-#                     gb.assert_bank_valid(seen_classes=old_ids)
-
-#         print(f"[Incremental Preflight] phase={phase} | old={old_ids} | new={new_ids} | seen={seen_ids} | old_rows_frozen=True")
-
-#     def train_phase(self, phase, epochs, batch_size: int = 64, lr: float = 1e-4):
-#         """Dispatch one phase using the strict geometry-replay/adaptation contract.
-
-#         Phase 0 delegates to the certificate-aware base trainer. Incremental
-#         phases resolve old/new/seen classes from the dataset protocol, freeze the
-#         certified old rows, configure only permitted trainable parameters, and
-#         then delegate to ``train_incremental_phase``.
-#         """
-#         phase = int(phase)
-#         self.early_stop_patience = 0
-#         for k in ("early_stop_patience", "base_early_stop_patience", "incremental_early_stop_patience"):
-#             try:
-#                 setattr(self.args, k, 0)
-#             except Exception:
-#                 pass
-
-#         self._force_clean_main_path_args()
-#         self._propagate_clean_energy_config_to_model()
-#         self._assert_global_architecture_contract()
+#         self.assert_architecture_contract()
+#         self._assert_dataset_response_contract()
+#         self._assert_base_stack_contract()
 
 #         if phase == 0:
-#             self._set_model_phase_and_old_count(0, 0)
-#             self._set_base_trainable_params()
-#             self._assert_updated_stack_contract(phase=0)
-#             self._print_trainable_summary(phase=0)
-#             return self.train_base_phase(phase=0, epochs=epochs, batch_size=batch_size, lr=lr)
-
-#         if self.base_only or self.disable_incremental_training:
-#             raise RuntimeError(
-#                 "Incremental training is disabled. Set --base_only false and "
-#                 "--disable_incremental_training false."
+#             if len(self.model.geometry_bank) != 0:
+#                 raise RuntimeError(
+#                     "Cannot retrain phase 0 over an existing persistent bank. "
+#                     "Create a fresh model or explicitly reset the complete run."
+#                 )
+#             self.model.set_phase(0)
+#             self.model.set_base_mode(train_backbone=True, train_projection=True)
+#             self._print_execution_summary()
+#             return self.train_base_phase(
+#                 phase=0,
+#                 epochs=epochs,
+#                 batch_size=batch_size,
+#                 lr=lr,
 #             )
 
-#         old_classes, new_classes, seen_classes = self.resolve_phase_classes(phase)
-#         old_class_count = len(old_classes)
-#         self._set_model_phase_and_old_count(phase, old_class_count)
-#         self._set_incremental_trainable_params(old_class_count)
-#         self._assert_incremental_preflight(
-#             phase,
-#             old_classes=old_classes,
-#             new_classes=new_classes,
-#             seen_classes=seen_classes,
+#         return self.train_incremental_phase(
+#             phase=phase,
+#             epochs=epochs,
+#             batch_size=batch_size,
+#             lr=lr,
 #         )
-#         self._print_trainable_summary(phase=phase)
-#         return self.train_incremental_phase(phase=phase, epochs=epochs, batch_size=batch_size, lr=lr)
-
-#     def _old_new_boundary_preservation_loss(self, *args, **kwargs):
-#         """Delegate to the real IncrementalPhaseTrainer implementation.
-
-#         This method used to return a zero stub from Trainer, which silently
-#         disabled the old/new invasion loss during descriptor refinement because
-#         Trainer appears before IncrementalPhaseTrainer in the MRO.
-#         """
-#         return IncrementalPhaseTrainer._old_new_boundary_preservation_loss(self, *args, **kwargs)
-
-#     def _project_new_descriptor_params_out_of_old_tangent_space(self, *args, **kwargs):
-#         """Delegate to the real new-row-only projection implementation."""
-#         return IncrementalPhaseTrainer._project_new_descriptor_params_out_of_old_tangent_space(self, *args, **kwargs)
-
-#     def _adaptive_boundary_loss_from_current_bank(self, *args, **kwargs):
-#         """Adaptive-boundary remains disabled through IncrementalPhaseTrainer."""
-#         return IncrementalPhaseTrainer._adaptive_boundary_loss_from_current_bank(self, *args, **kwargs)
-
-#     def _adaptive_boundary_enabled(self) -> bool:
-#         return False
-
-#     def _adaptive_boundary_state(self, old_class_count: int = 0) -> Dict[str, float]:
-#         return {"adaptive_boundary_enabled": 0.0, "boundary_radius_mean": 0.0, "old_boundary_radius_mean": 0.0, "new_boundary_radius_mean": 0.0}
-
-#     def _adaptive_boundary_trainable_params(self) -> List[torch.nn.Parameter]:
-#         return []
 
 #     # ------------------------------------------------------------------
-#     # Checkpointing
+#     # Checkpoint contracts and persistence
 #     # ------------------------------------------------------------------
-#     def save_checkpoint(self, phase, history, evaluator_metrics: Optional[Dict] = None) -> None:
+#     @staticmethod
+#     def _clone(value: Any) -> Any:
+#         if torch.is_tensor(value):
+#             return value.detach().cpu().clone()
+#         if isinstance(value, Mapping):
+#             return {str(key): Trainer._clone(item) for key, item in value.items()}
+#         if isinstance(value, tuple):
+#             return tuple(Trainer._clone(item) for item in value)
+#         if isinstance(value, list):
+#             return [Trainer._clone(item) for item in value]
+#         return value
+
+#     @staticmethod
+#     def _digest_update(digest: "hashlib._Hash", value: Any) -> None:
+#         if torch.is_tensor(value):
+#             tensor = value.detach().cpu().contiguous()
+#             digest.update(b"tensor")
+#             digest.update(str(tensor.dtype).encode("utf-8"))
+#             digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+#             if tensor.numel():
+#                 digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+#             return
+#         if isinstance(value, Mapping):
+#             digest.update(b"mapping")
+#             for key in sorted(value, key=lambda item: str(item)):
+#                 digest.update(str(key).encode("utf-8"))
+#                 Trainer._digest_update(digest, value[key])
+#             return
+#         if isinstance(value, (tuple, list)):
+#             digest.update(b"sequence")
+#             for item in value:
+#                 Trainer._digest_update(digest, item)
+#             return
+#         digest.update(repr(value).encode("utf-8"))
+
+#     @classmethod
+#     def _content_sha256(cls, value: Any) -> str:
+#         digest = hashlib.sha256()
+#         cls._digest_update(digest, value)
+#         return digest.hexdigest()
+
+#     @staticmethod
+#     def _file_sha256(path: str) -> str:
+#         digest = hashlib.sha256()
+#         with open(path, "rb") as stream:
+#             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+#                 digest.update(chunk)
+#         return digest.hexdigest()
+
+#     def _runtime_contract(self, *, phase: int = 0) -> Dict[str, Any]:
 #         phase = int(phase)
+#         feature_contract = dict(self.model.feature_contract())
+#         bank = self.model.geometry_bank
+#         classifier = self.model.classifier
+#         bank_digest = (
+#             bank.contract_digest()
+#             if bool(bank.response_prior_ready.item())
+#             else None
+#         )
+#         return {
+#             "format_version": self.CHECKPOINT_FORMAT_VERSION,
+#             "architecture_id": self.ARCHITECTURE_ID,
+#             "method": self.METHOD_NAME,
+#             "schema_version": self.BANK_SCHEMA_VERSION,
+#             "joint_factorization": self.JOINT_FACTORIZATION,
+#             "phase": phase,
+#             "base_only_checkpoint": phase == 0,
+#             "feature_contract": feature_contract,
+#             "feature_dim": int(bank.feature_dim),
+#             "occupancy_rank": int(bank.rank),
+#             "tangent_rank": int(bank.response_rank),
+#             "num_interventions": int(bank.num_interventions),
+#             "intervention_definition_version": int(
+#                 bank.intervention_definition_version
+#             ),
+#             "tangent_weight": float(bank.response_weight),
+#             "occupancy_logdet_weight": float(bank.energy_logdet_weight),
+#             "tangent_logdet_weight": float(classifier.response_logdet_weight),
+#             "normalize_energy_by_dim": bool(classifier.normalize_energy_by_dim),
+#             "response_prior_ready": bool(bank.response_prior_ready.item()),
+#             "response_prior_frozen": bool(bank.response_prior_frozen.item()),
+#             "geometry_bank_contract_digest": bank_digest,
+#             "classifier_bound_contract_digest": classifier.bound_contract_digest,
+#             "classifier_contract_digest": classifier.classifier_contract_digest(),
+#             "model_contract_digest": self.model.model_contract_digest(),
+#             "base_objective":
+#                 "temporary_ce_plus_conditional_joint_margin_plus_real_boundary_certificate",
+#             "classifier": "conditional_joint_occupancy_tangent_energy",
+#             "persistent_memory":
+#                 "frozen_aggregate_occupancy_coupling_and_tangent_residual_rows",
+#             "coupled_replay": True,
+#             "inference_uses_conditional_tangent": True,
+#             "uses_independent_response_factorization": False,
+#             "uses_latent_boundary_witnesses": False,
+#             "raw_spectral_gaussian": False,
+#             "old_rows_immutable": True,
+#             "raw_old_exemplars": False,
+#             "stored_old_features": False,
+#             "stored_old_responses": False,
+#         }
+
+#     def _assert_loaded_runtime_contract(
+#         self, runtime: Mapping[str, Any], *, strict: bool
+#     ) -> None:
+#         if not strict:
+#             return
+#         errors: List[str] = []
+#         current = self._runtime_contract(phase=int(runtime.get("phase", 0)))
+#         exact = (
+#             "architecture_id",
+#             "method",
+#             "schema_version",
+#             "joint_factorization",
+#             "feature_dim",
+#             "occupancy_rank",
+#             "tangent_rank",
+#             "num_interventions",
+#             "intervention_definition_version",
+#             "normalize_energy_by_dim",
+#             "classifier",
+#             "persistent_memory",
+#             "coupled_replay",
+#             "inference_uses_conditional_tangent",
+#             "uses_independent_response_factorization",
+#             "uses_latent_boundary_witnesses",
+#             "raw_spectral_gaussian",
+#             "old_rows_immutable",
+#         )
+#         for key in exact:
+#             if runtime.get(key) != current.get(key):
+#                 errors.append(
+#                     f"{key}={runtime.get(key)!r} != {current.get(key)!r}"
+#                 )
+#         for key in (
+#             "tangent_weight",
+#             "occupancy_logdet_weight",
+#             "tangent_logdet_weight",
+#         ):
+#             saved = float(runtime.get(key, float("nan")))
+#             if not math.isfinite(saved) or not math.isclose(
+#                 saved, float(current[key]), rel_tol=0.0, abs_tol=1e-12
+#             ):
+#                 errors.append(f"{key}={saved!r} != {current[key]!r}")
+
+#         saved_contract = runtime.get("feature_contract")
+#         if not isinstance(saved_contract, Mapping):
+#             errors.append("feature_contract is missing")
+#         else:
+#             current_contract = self.model.feature_contract()
+#             for key in (
+#                 "contract_version",
+#                 "method",
+#                 "d_model",
+#                 "subspace_rank",
+#                 "response_rank",
+#                 "num_interventions",
+#                 "response_weight",
+#                 "intervention_definition_version",
+#                 "geometry_bank_schema_version",
+#                 "geometry_feature_space",
+#                 "joint_factorization",
+#                 "classifier_contract",
+#                 "incremental_update_mode",
+#                 "spectral_object",
+#                 "spectral_role",
+#                 "inference_geometry",
+#                 "raw_spectral_gaussian",
+#                 "occupancy_tangent_coupling",
+#                 "independent_response_factorization",
+#             ):
+#                 if saved_contract.get(key) != current_contract.get(key):
+#                     errors.append(
+#                         f"feature_contract[{key}]={saved_contract.get(key)!r} "
+#                         f"!= {current_contract.get(key)!r}"
+#                     )
+#         if errors:
+#             raise RuntimeError(
+#                 "PC-STGB checkpoint runtime contract mismatch: "
+#                 + "; ".join(errors)
+#             )
+
+#     def _validate_final_memory_contract(
+#         self,
+#         seen_classes: Sequence[int],
+#         *,
+#         require_statistics: bool = True,
+#     ) -> None:
+#         self.assert_bank_ready_for_seen_classes(
+#             None,
+#             seen_classes,
+#             require_statistics=require_statistics,
+#             require_response=True,
+#             require_joint_state=True,
+#             require_frozen=True,
+#             require_frozen_prior=True,
+#             require_bound_contract=True,
+#         )
+#         self.assert_bank_has_only_allowed_valid_rows(None, seen_classes)
+#         bank_digest = self.model.geometry_bank.contract_digest()
+#         if self.model.classifier.bound_contract_digest != bank_digest:
+#             raise RuntimeError(
+#                 "Classifier is not bound to the current GeometryBank contract"
+#             )
+#         if not bool(self.model.classifier.require_bound_contract):
+#             raise RuntimeError("Classifier contract enforcement is disabled")
+
+#     def save_checkpoint(
+#         self,
+#         phase: int,
+#         history: Mapping[str, Any],
+#         evaluator_metrics: Optional[Mapping[str, Any]] = None,
+#     ) -> str:
+#         phase = int(phase)
+#         if phase < 0:
+#             raise RuntimeError("checkpoint phase must be non-negative")
+#         if not isinstance(history, Mapping):
+#             raise TypeError("history must be a mapping")
+#         seen_classes = self._seen_classes_for_phase(phase)
+#         self._validate_final_memory_contract(seen_classes)
+
+#         base_report = history.get("base_geometry_report")
+#         if not isinstance(base_report, Mapping):
+#             base_report = getattr(self.model, "base_geometry_report", None)
+#         base_handoff = history.get("base_handoff")
+#         if not isinstance(base_handoff, Mapping):
+#             base_handoff = getattr(self.model, "base_handoff", None)
+#         if not isinstance(base_report, Mapping):
+#             raise RuntimeError("Cannot save without the originating base_geometry_report")
+#         if not isinstance(base_handoff, Mapping):
+#             raise RuntimeError("Cannot save without the originating base_handoff")
+#         if not bool(base_report.get("structural_valid", False)):
+#             raise RuntimeError("Cannot save a run built from an invalid base bank")
+
+#         phase_report = self.geometry_phase_certificate(
+#             phase,
+#             seen_classes,
+#             require_statistics=True,
+#             require_response=True,
+#             require_frozen=True,
+#         )
+#         if phase_report.get("errors") or not bool(phase_report.get("ok", False)):
+#             raise RuntimeError(
+#                 f"Cannot save invalid phase-{phase} geometry: "
+#                 f"{phase_report.get('errors', [])}"
+#             )
+
 #         phase_dir = os.path.join(self.save_dir, f"phase_{phase}")
 #         os.makedirs(phase_dir, exist_ok=True)
-#         ckpt = {
-#             "phase": phase,
-#             "base_only": self._as_bool(self.base_only),
-#             "incremental_enabled": not self._as_bool(self.disable_incremental_training),
-#             "base_objective": "balanced CE + GICS + geometry reserve + base geometry-energy margin",
-#             "incremental_objective": "low-rank geometry replay + residual geometry adaptation + joint CE + old/new geometry energy margins",
-#             "runtime_contract": self._current_runtime_contract(),
-#             "architecture_contract": {
-#                 "method": "Low-Rank Geometry Replay and Residual Geometry Adaptation for HSI NECIL",
-#                 "classifier_mode": "geometry_only",
-#                 "bank": "mean,basis,eigvals,residual_variance,reliability,sample_count,band_signature,spectral_shape",
-#                 "old_memory": "frozen GeometryBank statistics only",
-#                 "replay": "synthetic GeometryBank replay only; no raw old patches/features",
-#                 "incremental_update_mode": self._incremental_update_mode(),
-#                 "residual_adaptation": "geometry_plastic_adapter_only",
-#                 "forbidden_components": ["KD", "teacher", "prototypes", "transport", "adaptive_boundary", "measured_calibration", "BSS/GDR"],
-#             },
-#             "model_state_dict": self.model.state_dict(),
-#             "memory_snapshot": self.model.export_memory_snapshot() if hasattr(self.model, "export_memory_snapshot") else None,
-#             "current_num_classes": int(getattr(self.model, "current_num_classes", 0)),
-#             "old_class_count": int(getattr(self.model, "old_class_count", 0)),
-#             "history": history,
-#             "base_geometry_certificate": getattr(self, "_last_base_geometry_certificate", getattr(self.model, "base_geometry_certificate", None)),
-#             "args": vars(self.args) if hasattr(self.args, "__dict__") else {},
-#         }
-#         diag = getattr(self, f"_last_phase_{phase}_geometry_diagnostics", None)
-#         if diag is None:
-#             diag = getattr(self, "_last_base_geometry_diagnostics", None)
-#         if diag is not None:
-#             ckpt["geometry_diagnostics"] = diag
-#         if evaluator_metrics is not None:
-#             ckpt["evaluator_metrics"] = evaluator_metrics
 #         path = os.path.join(phase_dir, "checkpoint.pth")
-#         torch.save(ckpt, path)
-#         print(f"[Saved] {path}")
+#         manifest_path = path + ".sha256"
 
+#         memory_snapshot = self._clone(self.model.export_memory_snapshot())
+#         memory_digest = self._content_sha256(memory_snapshot)
+#         model_state = {
+#             key: value.detach().cpu().clone()
+#             if torch.is_tensor(value)
+#             else self._clone(value)
+#             for key, value in self.model.state_dict().items()
+#         }
+
+#         dataset_state = None
+#         dataset_export = getattr(self.dataset, "export_runtime_state", None)
+#         if callable(dataset_export):
+#             dataset_state = self._clone(dataset_export())
+#         elif self._optional_bool("checkpoint_requires_dataset_state", self._optional_bool("base_checkpoint_requires_dataset_state", False)):
+#             raise RuntimeError(
+#                 "checkpoint_requires_dataset_state=true, but the dataset "
+#                 "does not expose export_runtime_state()"
+#             )
+
+#         runtime_contract = self._runtime_contract(phase=phase)
+#         checkpoint: Dict[str, Any] = {
+#             "format_version": self.CHECKPOINT_FORMAT_VERSION,
+#             "phase": phase,
+#             "runtime_contract": runtime_contract,
+#             "model_state_dict": model_state,
+#             "memory_snapshot": memory_snapshot,
+#             "memory_snapshot_sha256": memory_digest,
+#             "geometry_bank_contract_digest":
+#                 self.model.geometry_bank.contract_digest(),
+#             "classifier_bound_contract_digest":
+#                 self.model.classifier.bound_contract_digest,
+#             "classifier_contract_digest":
+#                 self.model.classifier.classifier_contract_digest(),
+#             "model_contract_digest": self.model.model_contract_digest(),
+#             "dataset_runtime_state": dataset_state,
+#             "seen_classes": list(seen_classes),
+#             "history": self._clone(dict(history)),
+#             "base_geometry_report": self._clone(dict(base_report)),
+#             "base_handoff": self._clone(dict(base_handoff)),
+#             "phase_geometry_report": self._clone(dict(phase_report)),
+#             "incremental_admission_certificate": self._clone(
+#                 history.get("admission_certificate")
+#             ) if isinstance(history.get("admission_certificate"), Mapping) else None,
+#             "incremental_commit_report": self._clone(
+#                 history.get("commit_report")
+#             ) if isinstance(history.get("commit_report"), Mapping) else None,
+#             "args": dict(vars(self.args)) if hasattr(self.args, "__dict__") else {},
+#             "torch_rng_state": torch.get_rng_state().cpu(),
+#         }
+#         if torch.cuda.is_available():
+#             checkpoint["cuda_rng_state_all"] = [
+#                 state.cpu() for state in torch.cuda.get_rng_state_all()
+#             ]
+#         if evaluator_metrics is not None:
+#             checkpoint["evaluator_metrics"] = self._clone(
+#                 dict(evaluator_metrics)
+#             )
+
+#         descriptor, temporary = tempfile.mkstemp(
+#             prefix=".checkpoint_", suffix=".pth.tmp", dir=phase_dir
+#         )
+#         os.close(descriptor)
+#         manifest_tmp = manifest_path + ".tmp"
+#         try:
+#             with open(temporary, "wb") as stream:
+#                 torch.save(checkpoint, stream)
+#                 stream.flush()
+#                 os.fsync(stream.fileno())
+#             file_digest = self._file_sha256(temporary)
+#             with open(manifest_tmp, "w", encoding="utf-8") as stream:
+#                 json.dump(
+#                     {
+#                         "sha256": file_digest,
+#                         "memory_snapshot_sha256": memory_digest,
+#                         "format_version": self.CHECKPOINT_FORMAT_VERSION,
+#                         "architecture_id": self.ARCHITECTURE_ID,
+#                         "method": self.METHOD_NAME,
+#                         "schema_version": self.BANK_SCHEMA_VERSION,
+#                         "joint_factorization": self.JOINT_FACTORIZATION,
+#                         "phase": phase,
+#                         "seen_classes": list(seen_classes),
+#                         "geometry_bank_contract_digest":
+#                             checkpoint["geometry_bank_contract_digest"],
+#                         "classifier_bound_contract_digest":
+#                             checkpoint["classifier_bound_contract_digest"],
+#                         "model_contract_digest":
+#                             checkpoint["model_contract_digest"],
+#                     },
+#                     stream,
+#                     indent=2,
+#                 )
+#                 stream.flush()
+#                 os.fsync(stream.fileno())
+#             os.replace(temporary, path)
+#             os.replace(manifest_tmp, manifest_path)
+#         except Exception:
+#             for candidate in (temporary, manifest_tmp):
+#                 try:
+#                     if os.path.exists(candidate):
+#                         os.remove(candidate)
+#                 except OSError:
+#                     pass
+#             raise
+#         print(f"[Saved PC-STGB Checkpoint] {path}")
+#         return path
+
+#     def load_checkpoint(
+#         self,
+#         path: str,
+#         *,
+#         strict: bool = True,
+#         verify_checksum: bool = True,
+#         restore_rng: bool = True,
+#     ) -> Dict[str, Any]:
+#         path = os.path.abspath(str(path))
+#         if not os.path.isfile(path):
+#             raise FileNotFoundError(path)
+
+#         manifest: Dict[str, Any] = {}
+#         if verify_checksum:
+#             manifest_path = path + ".sha256"
+#             if not os.path.isfile(manifest_path):
+#                 raise RuntimeError(f"Checkpoint manifest is missing: {manifest_path}")
+#             with open(manifest_path, "r", encoding="utf-8") as stream:
+#                 manifest = json.load(stream)
+#             actual = self._file_sha256(path)
+#             expected = str(manifest.get("sha256", ""))
+#             if actual != expected:
+#                 raise RuntimeError(
+#                     "Checkpoint checksum mismatch: "
+#                     f"expected={expected}, actual={actual}"
+#                 )
+#             if strict:
+#                 manifest_expected = {
+#                     "architecture_id": self.ARCHITECTURE_ID,
+#                     "method": self.METHOD_NAME,
+#                     "schema_version": self.BANK_SCHEMA_VERSION,
+#                     "joint_factorization": self.JOINT_FACTORIZATION,
+#                 }
+#                 failures = {
+#                     key: (manifest.get(key), value)
+#                     for key, value in manifest_expected.items()
+#                     if manifest.get(key) != value
+#                 }
+#                 if failures:
+#                     raise RuntimeError(
+#                         f"Checkpoint manifest contract mismatch: {failures}"
+#                     )
+
+#         try:
+#             checkpoint = torch.load(
+#                 path, map_location=self.device, weights_only=False
+#             )
+#         except TypeError:
+#             checkpoint = torch.load(path, map_location=self.device)
+#         if not isinstance(checkpoint, Mapping):
+#             raise RuntimeError("Checkpoint payload must be a mapping")
+#         phase = int(checkpoint.get("phase", -1))
+#         if phase < 0:
+#             raise RuntimeError("Checkpoint phase must be non-negative")
+#         if int(checkpoint.get("format_version", -1)) != self.CHECKPOINT_FORMAT_VERSION:
+#             raise RuntimeError(
+#                 "Unsupported checkpoint format version: "
+#                 f"{checkpoint.get('format_version')!r}"
+#             )
+#         runtime = checkpoint.get("runtime_contract")
+#         if not isinstance(runtime, Mapping):
+#             raise RuntimeError("Checkpoint runtime contract is missing")
+#         self._assert_loaded_runtime_contract(runtime, strict=strict)
+
+#         model_state = checkpoint.get("model_state_dict")
+#         memory = checkpoint.get("memory_snapshot")
+#         if not isinstance(model_state, Mapping):
+#             raise RuntimeError("Checkpoint is missing model_state_dict")
+#         if not isinstance(memory, Mapping):
+#             raise RuntimeError("Checkpoint is missing memory_snapshot")
+#         calculated_memory_digest = self._content_sha256(memory)
+#         saved_memory_digest = str(checkpoint.get("memory_snapshot_sha256", ""))
+#         if strict and calculated_memory_digest != saved_memory_digest:
+#             raise RuntimeError("Checkpoint memory snapshot digest mismatch")
+#         if verify_checksum and manifest.get("memory_snapshot_sha256") not in (
+#             None,
+#             calculated_memory_digest,
+#         ):
+#             raise RuntimeError("Manifest and checkpoint memory digests disagree")
+
+#         self.model.load_state_dict(model_state, strict=strict)
+#         self.model.load_memory_snapshot(dict(memory), strict=strict)
+
+#         dataset_state = checkpoint.get("dataset_runtime_state")
+#         if isinstance(dataset_state, Mapping):
+#             restore = getattr(self.dataset, "restore_runtime_state", None)
+#             if callable(restore):
+#                 restore(dataset_state, purge_finalized_train_payload=False)
+#             elif strict and self._optional_bool(
+#                 "checkpoint_requires_dataset_state",
+#                 self._optional_bool("base_checkpoint_requires_dataset_state", False),
+#             ):
+#                 raise RuntimeError("Dataset cannot restore saved runtime state")
+
+#         seen_classes = [int(value) for value in checkpoint.get("seen_classes", [])]
+#         expected_seen = self._seen_classes_for_phase(phase)
+#         if strict and seen_classes != expected_seen:
+#             raise RuntimeError(
+#                 f"Checkpoint classes={seen_classes} != dataset classes={expected_seen}"
+#             )
+#         seen_classes = seen_classes or expected_seen
+#         self._set_post_phase_state(seen_classes, phase)
+#         self._validate_final_memory_contract(seen_classes)
+
+#         actual_bank_digest = self.model.geometry_bank.contract_digest()
+#         actual_bound_digest = self.model.classifier.bound_contract_digest
+#         actual_classifier_digest = self.model.classifier.classifier_contract_digest()
+#         actual_model_digest = self.model.model_contract_digest()
+#         expected_digests = {
+#             "geometry_bank_contract_digest": actual_bank_digest,
+#             "classifier_bound_contract_digest": actual_bound_digest,
+#             "classifier_contract_digest": actual_classifier_digest,
+#             "model_contract_digest": actual_model_digest,
+#         }
+#         mismatched = {
+#             key: (checkpoint.get(key), value)
+#             for key, value in expected_digests.items()
+#             if strict and checkpoint.get(key) != value
+#         }
+#         if mismatched:
+#             raise RuntimeError(
+#                 f"Checkpoint contract digest mismatch after restore: {mismatched}"
+#             )
+#         if verify_checksum:
+#             for key in (
+#                 "geometry_bank_contract_digest",
+#                 "classifier_bound_contract_digest",
+#                 "model_contract_digest",
+#             ):
+#                 saved = manifest.get(key)
+#                 if saved is not None and saved != expected_digests[key]:
+#                     raise RuntimeError(
+#                         f"Manifest {key} disagrees with restored model"
+#                     )
+
+#         base_report = checkpoint.get("base_geometry_report")
+#         base_handoff = checkpoint.get("base_handoff")
+#         self.model.base_geometry_report = base_report
+#         self.model.base_handoff = base_handoff
+#         self._last_base_geometry_report = (
+#             dict(base_report) if isinstance(base_report, Mapping) else None
+#         )
+#         self._last_base_geometry_certificate = self._last_base_geometry_report
+
+#         if restore_rng:
+#             cpu_rng = checkpoint.get("torch_rng_state")
+#             if torch.is_tensor(cpu_rng):
+#                 torch.set_rng_state(cpu_rng.cpu())
+#             cuda_rng = checkpoint.get("cuda_rng_state_all")
+#             if torch.cuda.is_available() and isinstance(cuda_rng, (list, tuple)):
+#                 torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng])
+#         return dict(checkpoint)

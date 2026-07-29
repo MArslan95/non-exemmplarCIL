@@ -1,3410 +1,1524 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+"""Losses for transport-verified spectral-spatial factor geometry.
+
+Deployed class model
+--------------------
+    p(z | c) = N(mu_c, L_c L_c^T + Psi_c)
+
+where
+    z = [z_s ; z_p]
+    Psi_c = diag(psi_c,s I_Ds, psi_c,p I_Dp).
+
+The raw ordered-spectrum model p(h | c) is NOT a second classifier. It is used
+only by the GeometryBank to produce a detached pair-risk matrix R[c, j], which
+modulates the training margin between class pairs.
+
+Official optimization routes
+----------------------------
+Base warm-up:
+    temporary linear-head cross entropy on real base samples.
+
+Base geometry stage:
+    risk-guided all-rival factor-energy loss on cross-fitted query samples.
+
+Incremental stage:
+    risk-guided all-rival factor-energy loss on real current query samples
+    + branchwise coordinate transport consistency on disjoint current queries
+    + optional relative parameter trust on controlled-plasticity parameters.
+
+There is no old-feature replay loss, trainable generic affine transport,
+spectral-anchor classifier loss, old/new logit offset, class-specific bias,
+knowledge distillation, or persistent pseudo-sample objective in this file.
+"""
+
+import math
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
+Tensor = torch.Tensor
 _EPS = 1e-12
-_INVALID_ENERGY = 1e6
+
+__all__ = [
+    "global_to_local_targets",
+    "local_to_global_targets",
+    "class_balanced_cross_entropy",
+    "risk_guided_all_rival_geometry_loss",
+    "base_ce_warmup_objective",
+    "base_geometry_objective",
+    "base_training_objective",
+    "coordinate_transport_loss",
+    "snapshot_trainable_parameters",
+    "relative_parameter_trust_loss",
+    "incremental_geometry_objective",
+    "pairwise_directional_invasion_matrix",
+    "pair_risk_confusion_statistics",
+    # Explicit migration aliases.
+    "joint_energy_margin_loss",
+    "base_geometry_loss",
+]
 
 
-# -----------------------------------------------------------------------------
-# Basic utilities
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Validation and reductions
+# =============================================================================
 
-def safe_zero_like(
-    ref: Optional[torch.Tensor] = None,
+
+def _finite_scalar(value: float, *, name: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return result
+
+
+def _nonnegative(value: float, *, name: str) -> float:
+    result = _finite_scalar(value, name=name)
+    if result < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value!r}")
+    return result
+
+
+def _positive(value: float, *, name: str) -> float:
+    result = _finite_scalar(value, name=name)
+    if result <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return result
+
+
+def _matrix(
+    value: Tensor,
     *,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    if torch.is_tensor(ref):
-        return ref.sum() * 0.0
-    return torch.tensor(
-        0.0,
-        device=device if device is not None else torch.device("cpu"),
-        dtype=dtype if dtype is not None else torch.float32,
-    )
+    name: str,
+    minimum_columns: int = 2,
+) -> Tensor:
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a tensor")
+    if value.dim() != 2 or value.size(0) == 0:
+        raise ValueError(f"{name} must be non-empty [N,C]")
+    if value.size(1) < int(minimum_columns):
+        raise ValueError(
+            f"{name} must contain at least {minimum_columns} columns"
+        )
+    if not torch.is_floating_point(value):
+        raise TypeError(f"{name} must use a floating dtype")
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f"{name} contains NaN/Inf")
+    return value
 
 
-def _require_finite_tensor(x: torch.Tensor, name: str) -> None:
-    if not torch.is_tensor(x):
-        raise TypeError(f"{name} must be a tensor.")
-    if x.numel() == 0:
-        return
-    if not torch.isfinite(x).all():
-        bad = int((~torch.isfinite(x)).sum().detach().cpu().item())
-        raise RuntimeError(f"{name}: tensor contains {bad} NaN/Inf values.")
+def _feature_matrix(value: Tensor, *, name: str) -> Tensor:
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a tensor")
+    if value.dim() != 2 or value.size(0) == 0 or value.size(1) == 0:
+        raise ValueError(f"{name} must be non-empty [N,D]")
+    if not torch.is_floating_point(value):
+        raise TypeError(f"{name} must use a floating dtype")
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f"{name} contains NaN/Inf")
+    return value
 
 
-def _as_1d_long(labels: torch.Tensor, *, device: torch.device, name: str = "labels") -> torch.Tensor:
-    if labels is None or not torch.is_tensor(labels):
-        raise TypeError(f"{name} must be a tensor.")
-    return labels.to(device=device).long().flatten()
-
-
-def _scalar(value: Any, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if torch.is_tensor(value):
-        if value.numel() == 1:
-            return value.reshape(())
-        return value.float().mean()
-    if isinstance(value, (int, float)):
-        if torch.is_tensor(ref):
-            return torch.tensor(float(value), device=ref.device, dtype=ref.dtype)
-        return torch.tensor(float(value), dtype=torch.float32)
-    return safe_zero_like(ref)
-
-
-
-def _ordered_unique_ints(values: Optional[Iterable[int]]) -> list[int]:
-    out: list[int] = []
-    seen: set[int] = set()
-    for value in values or []:
-        c = int(value)
-        if c < 0:
-            raise ValueError(f"class ids must be non-negative, got {c}")
-        if c not in seen:
-            out.append(c)
-            seen.add(c)
-    return out
-
-
-def _global_to_local_labels(labels: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-    seen = _ordered_unique_ints(seen_classes)
-    if not seen:
-        raise ValueError("seen_classes must be non-empty for global-label mapping.")
-    y = labels.long().flatten()
-    mapping = {c: i for i, c in enumerate(seen)}
-    local = torch.full_like(y, -1)
-    for c, i in mapping.items():
-        local[y == int(c)] = int(i)
-    if bool((local < 0).any().item()):
-        bad = sorted(set(int(v) for v in y[local < 0].detach().cpu().tolist()))
-        raise RuntimeError(f"labels contain classes absent from seen_classes: bad={bad}, seen={seen}")
-    return local
-
-
-def _resolve_local_labels(
-    labels: torch.Tensor,
+def _class_ids(
+    values: Union[Sequence[int], Tensor],
     *,
-    width: int,
     device: torch.device,
-    seen_classes: Optional[Iterable[int]] = None,
-    labels_are_global: bool = False,
-    name: str = "labels",
-) -> torch.Tensor:
-    y = _as_1d_long(labels, device=device, name=name)
-    if labels_are_global:
-        if seen_classes is None:
-            raise ValueError("seen_classes is required when labels_are_global=True.")
-        y = _global_to_local_labels(y, seen_classes).to(device=device)
-    if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= int(width)):
+    name: str = "class_ids",
+) -> Tensor:
+    result = torch.as_tensor(values, device=device, dtype=torch.long).flatten()
+    if result.numel() == 0:
+        raise ValueError(f"{name} is empty")
+    if bool(result.lt(0).any()):
+        bad = result[result.lt(0)].detach().cpu().unique().tolist()
+        raise ValueError(f"{name} contains negative IDs: {bad}")
+    if result.unique().numel() != result.numel():
+        raise ValueError(f"{name} contains duplicate class IDs")
+    return result
+
+
+def global_to_local_targets(
+    targets_global: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+) -> Tensor:
+    """Map arbitrary global class IDs to exact energy-column indices."""
+    if not torch.is_tensor(targets_global):
+        raise TypeError("targets_global must be a tensor")
+    targets = targets_global.long().flatten()
+    classes = _class_ids(
+        class_ids,
+        device=targets.device,
+    )
+    matches = targets[:, None].eq(classes[None, :])
+    match_count = matches.sum(dim=1)
+    if bool(match_count.ne(1).any()):
+        missing = (
+            targets[match_count.eq(0)]
+            .detach()
+            .cpu()
+            .unique()
+            .tolist()
+        )
         raise RuntimeError(
-            f"{name} must be local labels in [0,{int(width)-1}], got "
-            f"{torch.unique(y).detach().cpu().tolist()}"
+            f"targets contain classes outside class_ids: {missing}"
         )
-    return y
-
-
-def _class_balanced_mean(values: torch.Tensor, labels_local: torch.Tensor) -> torch.Tensor:
-    if values.numel() == 0:
-        return values.sum() * 0.0
-    v = values.flatten()
-    y = labels_local.long().flatten().to(device=v.device)
-    if v.numel() != y.numel():
-        raise RuntimeError(f"class-balanced reduction mismatch: values={v.numel()}, labels={y.numel()}")
-    terms = [v[y == c].mean() for c in torch.unique(y, sorted=True) if bool((y == c).any().item())]
-    return torch.stack(terms).mean() if terms else v.sum() * 0.0
-
-
-def _resolve_old_new_masks(
-    width: int,
-    *,
-    device: torch.device,
-    seen_classes: Optional[Iterable[int]] = None,
-    old_classes: Optional[Iterable[int]] = None,
-    new_classes: Optional[Iterable[int]] = None,
-    old_class_count: Optional[int] = None,
-    require_nonempty: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if seen_classes is None:
-        seen = list(range(int(width)))
-    else:
-        seen = _ordered_unique_ints(seen_classes)
-        if len(seen) != int(width):
-            raise RuntimeError(f"len(seen_classes)={len(seen)} must equal energy/logit width={int(width)}")
-
-    if old_classes is None:
-        k = int(max(0, min(int(old_class_count or 0), int(width))))
-        old = seen[:k]
-    else:
-        old = _ordered_unique_ints(old_classes)
-    if new_classes is None:
-        old_set = set(old)
-        new = [c for c in seen if c not in old_set]
-    else:
-        new = _ordered_unique_ints(new_classes)
-
-    seen_set, old_set, new_set = set(seen), set(old), set(new)
-    if not old_set.issubset(seen_set):
-        raise RuntimeError(f"old_classes are not a subset of seen_classes: old={old}, seen={seen}")
-    if not new_set.issubset(seen_set):
-        raise RuntimeError(f"new_classes are not a subset of seen_classes: new={new}, seen={seen}")
-    if old_set & new_set:
-        raise RuntimeError(f"old_classes and new_classes overlap: {sorted(old_set & new_set)}")
-    old_mask = torch.tensor([c in old_set for c in seen], device=device, dtype=torch.bool)
-    new_mask = torch.tensor([c in new_set for c in seen], device=device, dtype=torch.bool)
-    if require_nonempty and (not bool(old_mask.any().item()) or not bool(new_mask.any().item())):
-        raise RuntimeError(f"old/new groups must both be non-empty: seen={seen}, old={old}, new={new}")
-    return old_mask, new_mask
-
-
-def _resolve_valid_class_mask(
-    valid_mask: Optional[torch.Tensor],
-    *,
-    width: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if valid_mask is None:
-        return torch.ones((int(width),), device=device, dtype=torch.bool)
-    vm = valid_mask.to(device=device).bool()
-    if vm.dim() == 2:
-        if vm.size(1) != int(width):
-            raise RuntimeError(f"valid_mask width={vm.size(1)} does not match class width={int(width)}")
-        vm = vm.all(dim=0)
-    else:
-        vm = vm.flatten()
-    if vm.numel() != int(width):
-        raise RuntimeError(f"valid_mask must contain {int(width)} class entries, got {vm.numel()}")
-    return vm
-
-
-def _class_centers(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    min_samples: int = 2,
-    normalize_centers: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-        device = features.device if torch.is_tensor(features) else torch.device("cpu")
-        dtype = features.dtype if torch.is_tensor(features) else torch.float32
-        return (
-            torch.empty(0, 0, device=device, dtype=dtype),
-            torch.empty(0, device=device, dtype=torch.long),
-            torch.empty(0, device=device, dtype=dtype),
-        )
-
-    if features.dim() != 2:
-        raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-
-    y = _as_1d_long(labels, device=features.device)
-    if y.numel() != features.size(0):
-        raise ValueError(f"labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-    centers, class_ids, counts = [], [], []
-    for cls in torch.unique(y, sorted=True):
-        mask = y == cls
-        n = int(mask.sum().item())
-        if n < int(min_samples):
-            continue
-        c = features[mask].mean(dim=0)
-        if normalize_centers:
-            c = F.normalize(c, dim=0, eps=1e-6)
-        centers.append(c)
-        class_ids.append(cls)
-        counts.append(torch.tensor(float(n), device=features.device, dtype=features.dtype))
-
-    if not centers:
-        return (
-            torch.empty(0, features.size(1), device=features.device, dtype=features.dtype),
-            torch.empty(0, device=features.device, dtype=torch.long),
-            torch.empty(0, device=features.device, dtype=features.dtype),
-        )
-
-    return torch.stack(centers, dim=0), torch.stack(class_ids).long(), torch.stack(counts)
-
-
-def _pairwise_center_margin_loss(centers: torch.Tensor, margin: float) -> torch.Tensor:
-    if centers is None or not torch.is_tensor(centers) or centers.numel() == 0 or centers.size(0) < 2:
-        return safe_zero_like(centers)
-    dist = torch.cdist(centers, centers, p=2)
-    eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-    pair = dist[~eye]
-    if pair.numel() == 0:
-        return centers.sum() * 0.0
-    return F.relu(float(margin) - pair).pow(2).mean()
-
-
-def _pad_to_width(x: torch.Tensor, width: int) -> torch.Tensor:
-    if x.size(1) == width:
-        return x
-    if x.size(1) > width:
-        return x[:, :width]
-    return F.pad(x, (0, int(width) - int(x.size(1))))
-
-
-# -----------------------------------------------------------------------------
-# Spectral / band profiles
-# -----------------------------------------------------------------------------
-
-def _spectral_derivatives(spectral_summary: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    if spectral_summary.dim() != 2:
-        raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-    if spectral_summary.size(1) < 2:
-        z = spectral_summary.new_zeros((spectral_summary.size(0), 1))
-        return z, z
-    d1 = spectral_summary[:, 1:] - spectral_summary[:, :-1]
-    if d1.size(1) < 2:
-        d2 = d1.new_zeros((d1.size(0), 1))
-    else:
-        d2 = d1[:, 1:] - d1[:, :-1]
-    return d1, d2
-
-
-def _spectral_profile_descriptor(spectral_summary: torch.Tensor) -> torch.Tensor:
-    """Derivative-aware descriptor for physical spectral-shape comparison.
-
-    Raw HSI spectra may be normalized and may contain signed values.  Direct
-    softmax over signed spectra destroys absorption/reflectance shape.  This
-    descriptor preserves curve shape by standardizing each spectrum and appending
-    first/second derivative information.
-    """
-    if spectral_summary.dim() != 2:
-        raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-    s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-    s = s - s.mean(dim=1, keepdim=True)
-    s = s / s.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-    d1, d2 = _spectral_derivatives(s)
-    desc = torch.cat([F.normalize(s, dim=1, eps=1e-6), F.normalize(d1, dim=1, eps=1e-6), F.normalize(d2, dim=1, eps=1e-6)], dim=1)
-    return torch.nan_to_num(desc, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def _band_importance_profile(band_summary: torch.Tensor) -> torch.Tensor:
-    """Convert raw spectra or band summaries to a non-negative band profile.
-
-    This is the correct base regularizer target for HSI: it compares where the
-    spectrum changes/absorbs, not a hidden classifier branch.  It works for raw
-    physical spectra and is still safe for reduced non-physical summaries.
-    """
-    if band_summary is None or not torch.is_tensor(band_summary):
-        raise TypeError("band_summary must be a tensor.")
-    if band_summary.dim() != 2:
-        raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-    b = torch.nan_to_num(band_summary, nan=0.0, posinf=0.0, neginf=0.0)
-    B, S = b.shape
-    if S <= 0:
-        return b
-
-    # Per-sample standardization preserves spectral shape under dataset scaling.
-    z = b - b.mean(dim=1, keepdim=True)
-    z = z / z.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-    d1, d2 = _spectral_derivatives(z)
-    d1e = _pad_to_width(d1.abs(), S)
-    d2e = _pad_to_width(d2.abs(), S)
-    profile = z.abs() + 0.50 * d1e + 0.25 * d2e
-    profile = profile.clamp_min(0.0)
-    uniform = torch.full_like(profile, 1.0 / float(max(S, 1)))
-    denom = profile.sum(dim=1, keepdim=True)
-    profile = torch.where(denom > 1e-8, profile / denom.clamp_min(1e-8), uniform)
-    return torch.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-# Backward-compatible name used by old code.
-def _normalize_band_summary(band_summary: torch.Tensor) -> torch.Tensor:
-    return _band_importance_profile(band_summary)
-
-
-def _positive_cosine_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a = F.normalize(a, dim=1, eps=1e-6)
-    b = F.normalize(b, dim=1, eps=1e-6)
-    return (a @ b.t()).clamp(0.0, 1.0)
-
-
-# -----------------------------------------------------------------------------
-# GICS: Geometry-Involved Class Separation
-# -----------------------------------------------------------------------------
-
-def base_geometry_involved_contrastive_loss(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    key_features: Optional[torch.Tensor] = None,
-    weight: float = 0.20,
-    temperature: float = 0.07,
-    same_class_positive: bool = True,
-    class_balanced: bool = True,
-    detach_key: bool = True,
-    normalize: bool = True,
-    return_parts: bool = True,
-    **_: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Base-phase GICS on canonical projected z-space."""
-    if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-        z = safe_zero_like(features)
-        out = {"total": z, "gics": z, "weighted_gics": z, "valid_anchors": z, "num_anchors": z, "mean_positive_count": z}
-        return out if return_parts else z
-
-    if features.dim() != 2:
-        raise ValueError(f"GICS expects projected features [B,D], got {tuple(features.shape)}")
-    _require_finite_tensor(features, "gics.features")
-
-    zq = features
-    explicit_key = key_features is not None and torch.is_tensor(key_features) and key_features.numel() > 0
-    zk = key_features if explicit_key else features
-    if zk.dim() != 2:
-        raise ValueError(f"key_features must be [B,D], got {tuple(zk.shape)}")
-    if zk.size(0) != zq.size(0) or zk.size(1) != zq.size(1):
-        raise ValueError(f"key_features shape mismatch: query={tuple(zq.shape)}, key={tuple(zk.shape)}")
-    if detach_key:
-        zk = zk.detach()
-
-    y = _as_1d_long(labels, device=zq.device)
-    if y.numel() != zq.size(0):
-        raise ValueError(f"GICS labels/features mismatch: labels={y.numel()}, features={zq.size(0)}")
-
-    q = F.normalize(zq, dim=1, eps=1e-6) if normalize else zq
-    k = F.normalize(zk.to(device=zq.device, dtype=zq.dtype), dim=1, eps=1e-6) if normalize else zk.to(device=zq.device, dtype=zq.dtype)
-
-    logits = q @ k.t()
-    logits = logits / max(float(temperature), 1e-6)
-    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-    B = zq.size(0)
-    diag = torch.eye(B, device=zq.device, dtype=torch.bool)
-    positive = y.view(-1, 1).eq(y.view(1, -1)) if same_class_positive else diag.clone()
-
-    if explicit_key:
-        positive = positive | diag
-        denom_mask = torch.ones_like(positive, dtype=torch.bool)
-    else:
-        positive = positive & (~diag)
-        denom_mask = ~diag
-
-    pos_count = positive.float().sum(dim=1)
-    valid = pos_count > 0
-
-    if not bool(valid.any().item()):
-        gics = features.sum() * 0.0
-    else:
-        exp_logits = torch.exp(logits).masked_fill(~denom_mask, 0.0)
-        denom = exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        log_prob = logits - denom.log()
-        per = -(positive.float() * log_prob).sum(dim=1) / pos_count.clamp_min(1.0)
-        per = per[valid]
-        yv = y[valid]
-        if per.numel() == 0:
-            gics = features.sum() * 0.0
-        elif class_balanced:
-            class_terms = []
-            for c in torch.unique(yv, sorted=True):
-                cm = yv == c
-                if bool(cm.any().item()):
-                    class_terms.append(per[cm].mean())
-            gics = torch.stack(class_terms).mean() if class_terms else features.sum() * 0.0
-        else:
-            gics = per.mean()
-
-    total = float(weight) * gics
-    if not return_parts:
-        return total
-    return {
-        "total": total,
-        "gics": gics.detach(),
-        "weighted_gics": total.detach(),
-        "valid_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-        "num_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-        "mean_positive_count": pos_count[valid].float().mean().detach() if bool(valid.any().item()) else features.sum().detach() * 0.0,
-    }
-
-
-# Backward-compatible aliases.
-def base_fcs_geometry_contrastive_loss(*args: Any, **kwargs: Any):
-    return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-def base_geometry_involved_contrastive_separation_loss(*args: Any, **kwargs: Any):
-    return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-def base_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-    return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-def base_hsi_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-    return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# -----------------------------------------------------------------------------
-# PGR: Prospective Geometry Reserve
-# -----------------------------------------------------------------------------
-
-def _batch_subspace_overlap_loss(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    rank: int = 3,
-    min_samples: int = 6,
-    max_overlap: float = 0.50,
-    normalize: bool = True,
-    include_mean_overlap: bool = True,
-    return_parts: bool = False,
-) -> torch.Tensor | Dict[str, torch.Tensor]:
-    """Margin-based subspace reserve.
-
-    The old loss minimized average overlap only.  That can look nonzero in logs
-    while leaving a single highly-overlapping class pair that breaks incremental
-    descriptor insertion.  This version explicitly penalizes pair overlaps above
-    max_overlap while still reporting mean/max overlap.
-    """
-    if features is None or not torch.is_tensor(features) or features.numel() == 0:
-        z = safe_zero_like(features)
-        if return_parts:
-            return {"total": z, "pair_count": z, "valid_class_count": z, "mean_overlap": z, "max_overlap": z}
-        return z
-    if features.dim() != 2:
-        raise ValueError(f"subspace loss expects [B,D], got {tuple(features.shape)}")
-
-    y = _as_1d_long(labels, device=features.device)
-    z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-    _, D = z.shape
-
-    bases = []
-    for cls in torch.unique(y, sorted=True):
-        m = y == cls
-        n = int(m.sum().item())
-        if n < int(min_samples):
-            continue
-        xc = z[m] - z[m].mean(dim=0, keepdim=True)
-        r = max(1, min(int(rank), n - 1, D))
-        try:
-            _, s, vh = torch.linalg.svd(xc, full_matrices=False)
-        except RuntimeError:
-            continue
-        if s.numel() == 0 or float(s[0].detach().abs().item()) <= 1e-8:
-            continue
-        keep = (s[:r] / s[0].clamp_min(1e-8)) > 1e-3
-        if bool(keep.any().item()):
-            bases.append(vh[:r][keep].t().contiguous())
-
-    if len(bases) < 2:
-        loss = features.sum() * 0.0
-        overlaps = features.new_empty(0)
-        pair_count = 0
-    else:
-        overlap_list = []
-        for i in range(len(bases)):
-            for j in range(i + 1, len(bases)):
-                Ui, Uj = bases[i], bases[j]
-                denom = float(max(min(Ui.size(1), Uj.size(1)), 1))
-                ov = (Ui.t() @ Uj).pow(2).sum() / denom
-                overlap_list.append(ov)
-        overlaps = torch.stack(overlap_list) if overlap_list else features.new_empty(0)
-        pair_count = int(overlaps.numel())
-        if pair_count == 0:
-            loss = features.sum() * 0.0
-        else:
-            margin_loss = F.relu(overlaps - float(max_overlap)).pow(2).mean()
-            mean_loss = 0.10 * overlaps.mean() if include_mean_overlap else overlaps.sum() * 0.0
-            loss = margin_loss + mean_loss
-
-    if return_parts:
-        return {
-            "total": loss,
-            "pair_count": torch.tensor(float(pair_count), device=features.device, dtype=features.dtype),
-            "valid_class_count": torch.tensor(float(len(bases)), device=features.device, dtype=features.dtype),
-            "mean_overlap": overlaps.mean().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-            "max_overlap": overlaps.max().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-        }
-    return loss
-
-
-
-def risk_aware_band_discrimination_loss(
-    band_summary: Optional[torch.Tensor],
-    labels: torch.Tensor,
-    *,
-    features: Optional[torch.Tensor] = None,
-    min_samples: int = 3,
-    max_band_similarity: float = 0.75,
-    risk_center_margin: float = 1.0,
-    risk_weight: float = 1.0,
-    return_parts: bool = True,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Band-guided feature-geometry reserve for HSI.
-
-    Important: raw physical spectra are *not* trainable. Therefore this loss
-    must not try to make raw band profiles dissimilar directly.  Instead, high
-    band similarity marks a hard class pair and increases the gradient on the
-    learned feature geometry for that pair.
-
-    Loss = hard_band_similarity.detach() * feature_center_conflict(features)
-
-    This keeps band information in the architecture while preserving the main
-    SCTGR rule: inference and replay remain geometry-energy based.
-    """
-    ref = features if torch.is_tensor(features) else (band_summary if torch.is_tensor(band_summary) else labels)
-    if band_summary is None or not torch.is_tensor(band_summary) or band_summary.numel() == 0:
-        z = safe_zero_like(ref)
-        out = {
-            "total": z,
-            "band": z,
-            "pair_count": z,
-            "valid_class_count": z,
-            "mean_similarity": z,
-            "max_similarity": z,
-            "guided_conflict_mean": z,
-            "guided_conflict_max": z,
-        }
-        return out if return_parts else z
-
-    if band_summary.dim() != 2:
-        raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-    y = _as_1d_long(labels, device=band_summary.device)
-    if y.numel() != band_summary.size(0):
-        raise ValueError(f"band labels/batch mismatch: labels={y.numel()}, band={band_summary.size(0)}")
-
-    b = _band_importance_profile(band_summary)
-    b_centers, class_ids, _ = _class_centers(b, y, min_samples=min_samples, normalize_centers=True)
-    if b_centers.size(0) < 2:
-        z = band_summary.sum() * 0.0
-        out = {
-            "total": z,
-            "band": z,
-            "pair_count": z,
-            "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-            "mean_similarity": z,
-            "max_similarity": z,
-            "guided_conflict_mean": z,
-            "guided_conflict_max": z,
-        }
-        return out if return_parts else z
-
-    sim = (b_centers @ b_centers.t()).clamp(0.0, 1.0)
-    eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-    pair_sim = sim[~eye]
-    hard_band = F.relu(pair_sim - float(max_band_similarity)) / max(1.0 - float(max_band_similarity), 1e-6)
-    hard_band = hard_band.detach()
-
-    # The only trainable part is the learned feature geometry.  If features are
-    # missing or class ids cannot be aligned, the band term reports similarity
-    # but contributes zero gradient instead of applying a useless constant loss.
-    if features is not None and torch.is_tensor(features) and features.numel() > 0:
-        zf = F.normalize(features.to(device=band_summary.device, dtype=band_summary.dtype), dim=1, eps=1e-6)
-        f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-        if f_centers.size(0) == b_centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-            dist = torch.cdist(f_centers, f_centers, p=2)
-            feature_conflict = F.relu(float(risk_center_margin) - dist) / max(float(risk_center_margin), 1e-6)
-            feature_conflict = feature_conflict[~eye]
-            guided = hard_band * feature_conflict
-            loss_vec = hard_band * feature_conflict.pow(2)
-            loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-        else:
-            guided = torch.zeros_like(pair_sim)
-            loss = features.sum() * 0.0
-    else:
-        guided = torch.zeros_like(pair_sim)
-        loss = band_summary.sum() * 0.0
-
-    if not return_parts:
-        return loss
-    return {
-        "total": loss,
-        "band": loss.detach(),
-        "pair_count": torch.tensor(float(pair_sim.numel()), device=band_summary.device, dtype=band_summary.dtype),
-        "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-        "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-        "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-        "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-        "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-    }
-
-
-def prospective_geometry_reserve_loss(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    band_summary: Optional[torch.Tensor] = None,
-    weight: float = 0.10,
-    compact_weight: float = 0.15,
-    center_weight: float = 0.20,
-    subspace_weight: float = 0.10,
-    band_weight: float = 0.05,
-    volume_weight: float = 0.05,
-    center_margin: float = 1.05,
-    min_class_samples: int = 3,
-    subspace_min_samples: int = 6,
-    subspace_rank: int = 3,
-    max_band_similarity: float = 0.75,
-    max_class_variance: float = 0.75,
-    min_class_variance: float = 0.015,
-    max_subspace_overlap: float = 0.50,
-    normalize_features: bool = True,
-    adaptive_component_weights: bool = True,
-    return_parts: bool = True,
-    **kwargs: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Base-phase PGR.
-
-    Active terms:
-      - compactness: same-class spread control
-      - center reserve: class centers separated by margin
-      - subspace reserve: explicit margin on tangent subspace overlap
-      - band reserve: risky classes avoid identical spectral-band profiles
-      - volume reserve: avoids both broad blobs and collapsed zero-volume rows
-    """
-    if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-        z0 = safe_zero_like(features)
-        out = {
-            "total": z0, "pgr": z0, "weighted_pgr": z0,
-            "compact": z0, "center": z0, "subspace": z0, "band": z0, "volume": z0,
-            "valid_class_count": z0, "unique_class_count": z0,
-            "subspace_pair_count": z0, "band_pair_count": z0,
-            "compact_factor": z0, "center_factor": z0, "subspace_factor": z0,
-            "band_factor": z0, "volume_factor": z0,
-            "subspace_mean_overlap": z0, "subspace_max_overlap": z0,
-            "band_mean_similarity": z0, "band_max_similarity": z0,
-        }
-        return out if return_parts else z0
-
-    if features.dim() != 2:
-        raise ValueError(f"PGR expects features [B,D], got {tuple(features.shape)}")
-    _require_finite_tensor(features, "pgr.features")
-
-    y = _as_1d_long(labels, device=features.device)
-    if y.numel() != features.size(0):
-        raise ValueError(f"PGR labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-    # Let explicit aliases in kwargs override defaults without requiring trainer changes.
-    if "pgr_max_subspace_overlap" in kwargs:
-        max_subspace_overlap = float(kwargs["pgr_max_subspace_overlap"])
-    if "subspace_overlap_max" in kwargs:
-        max_subspace_overlap = float(kwargs["subspace_overlap_max"])
-    if "pgr_min_class_variance" in kwargs:
-        min_class_variance = float(kwargs["pgr_min_class_variance"])
-
-    z = F.normalize(features, dim=1, eps=1e-6) if normalize_features else features
-
-    compact_terms = []
-    volume_terms = []
-    class_vars = []
-    for cls in torch.unique(y, sorted=True):
-        m = y == cls
-        if int(m.sum().item()) < int(min_class_samples):
-            continue
-        xc = z[m]
-        var = (xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean()
-        compact_terms.append(var)
-        class_vars.append(var.detach())
-        broad = F.relu(var - float(max_class_variance)).pow(2)
-        collapsed = F.relu(float(min_class_variance) - var).pow(2)
-        volume_terms.append(broad + collapsed)
-
-    compact = torch.stack(compact_terms).mean() if compact_terms else features.sum() * 0.0
-    volume = torch.stack(volume_terms).mean() if volume_terms else features.sum() * 0.0
-    valid_class_count = len(compact_terms)
-    unique_class_count = int(torch.unique(y).numel())
-
-    centers, _, _ = _class_centers(z, y, min_samples=min_class_samples, normalize_centers=False)
-    center = _pairwise_center_margin_loss(centers, center_margin)
-
-    sub_obj = _batch_subspace_overlap_loss(
-        z,
-        y,
-        rank=int(subspace_rank),
-        min_samples=int(subspace_min_samples),
-        max_overlap=float(max_subspace_overlap),
-        normalize=False,
-        return_parts=True,
+    return matches.to(torch.long).argmax(dim=1)
+
+
+def local_to_global_targets(
+    targets_local: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+) -> Tensor:
+    if not torch.is_tensor(targets_local):
+        raise TypeError("targets_local must be a tensor")
+    local = targets_local.long().flatten()
+    classes = _class_ids(
+        class_ids,
+        device=local.device,
     )
-    subspace = sub_obj["total"]
-    subspace_pair_count = sub_obj["pair_count"]
-
-    band_obj = risk_aware_band_discrimination_loss(
-        band_summary,
-        y,
-        features=z,
-        min_samples=int(min_class_samples),
-        max_band_similarity=float(max_band_similarity),
-        risk_center_margin=float(center_margin),
-        return_parts=True,
-    )
-    band = band_obj["total"] if isinstance(band_obj, dict) else band_obj
-    band_pair_count = band_obj.get("pair_count", features.sum().detach() * 0.0) if isinstance(band_obj, dict) else features.sum().detach() * 0.0
-
-    one = torch.tensor(1.0, device=features.device, dtype=features.dtype)
-    zero = features.sum() * 0.0
-    if adaptive_component_weights:
-        compact_factor = one if valid_class_count > 0 else zero
-        volume_factor = one if valid_class_count > 0 else zero
-        center_factor = one if int(centers.size(0)) >= 2 else zero
-        subspace_factor = one if float(subspace_pair_count.detach().item()) > 0.0 else zero
-        band_factor = one if float(band_pair_count.detach().item()) > 0.0 else zero
-    else:
-        compact_factor = center_factor = subspace_factor = band_factor = volume_factor = one
-
-    pgr_unweighted = (
-        float(compact_weight) * compact_factor * compact
-        + float(center_weight) * center_factor * center
-        + float(subspace_weight) * subspace_factor * subspace
-        + float(band_weight) * band_factor * band
-        + float(volume_weight) * volume_factor * volume
-    )
-    total = float(weight) * pgr_unweighted
-
-    if not return_parts:
-        return total
-    return {
-        "total": total,
-        "pgr": pgr_unweighted.detach(),
-        "weighted_pgr": total.detach(),
-        "compact": compact.detach(),
-        "center": center.detach(),
-        "subspace": subspace.detach(),
-        "band": band.detach(),
-        "volume": volume.detach(),
-        "valid_class_count": torch.tensor(float(valid_class_count), device=features.device, dtype=features.dtype),
-        "unique_class_count": torch.tensor(float(unique_class_count), device=features.device, dtype=features.dtype),
-        "subspace_pair_count": subspace_pair_count.detach(),
-        "band_pair_count": band_pair_count.detach() if torch.is_tensor(band_pair_count) else torch.tensor(float(band_pair_count), device=features.device, dtype=features.dtype),
-        "compact_factor": compact_factor.detach(),
-        "center_factor": center_factor.detach(),
-        "subspace_factor": subspace_factor.detach(),
-        "band_factor": band_factor.detach(),
-        "volume_factor": volume_factor.detach(),
-        "subspace_mean_overlap": sub_obj.get("mean_overlap", zero).detach(),
-        "subspace_max_overlap": sub_obj.get("max_overlap", zero).detach(),
-        "band_mean_similarity": band_obj.get("mean_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-        "band_max_similarity": band_obj.get("max_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-        "band_guided_conflict_mean": band_obj.get("guided_conflict_mean", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-        "band_guided_conflict_max": band_obj.get("guided_conflict_max", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-        "class_variance_mean": torch.stack(class_vars).mean() if class_vars else zero.detach(),
-    }
-
-
-def base_prospective_geometry_reserve_loss(*args: Any, **kwargs: Any):
-    return prospective_geometry_reserve_loss(*args, **kwargs)
-
-
-# -----------------------------------------------------------------------------
-# Physical spectral-shape reserve
-# -----------------------------------------------------------------------------
-
-
-def spectral_shape_discrimination_loss(
-    spectral_summary: Optional[torch.Tensor],
-    labels: torch.Tensor,
-    *,
-    features: Optional[torch.Tensor] = None,
-    spectral_summary_is_physical: bool = False,
-    require_physical_summary: bool = True,
-    min_samples: int = 3,
-    max_shape_similarity: float = 0.75,
-    risk_center_margin: float = 1.0,
-    risk_weight: float = 1.0,
-    return_parts: bool = True,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Spectral-shape-guided feature-geometry reserve.
-
-    Raw wavelength spectra are fixed metadata, not trainable outputs.  High
-    spectral-shape similarity should therefore identify hard HSI class pairs and
-    push their learned feature centers apart.  It should not be optimized as a
-    standalone raw-spectrum dissimilarity objective.
-    """
-    ref = features if torch.is_tensor(features) else (spectral_summary if torch.is_tensor(spectral_summary) else labels)
-    if (
-        spectral_summary is None
-        or not torch.is_tensor(spectral_summary)
-        or spectral_summary.numel() == 0
-        or (bool(require_physical_summary) and not bool(spectral_summary_is_physical))
+    if local.numel() and (
+        int(local.min().item()) < 0
+        or int(local.max().item()) >= classes.numel()
     ):
-        z = safe_zero_like(ref)
-        out = {
-            "total": z,
-            "spectral_shape": z,
-            "pair_count": z,
-            "valid_class_count": z,
-            "mean_similarity": z,
-            "max_similarity": z,
-            "guided_conflict_mean": z,
-            "guided_conflict_max": z,
-        }
-        return out if return_parts else z
-
-    s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-    if s.dim() != 2:
-        raise ValueError(f"spectral_summary must be [B,S], got {tuple(s.shape)}")
-    y = _as_1d_long(labels, device=s.device)
-    if y.numel() != s.size(0):
-        raise ValueError(f"spectral_summary/label mismatch: spectra={s.size(0)}, labels={y.numel()}")
-
-    desc = _spectral_profile_descriptor(s)
-    centers, class_ids, _ = _class_centers(desc, y, min_samples=min_samples, normalize_centers=False)
-
-    if centers.size(0) < 2:
-        z = s.sum() * 0.0
-        out = {
-            "total": z,
-            "spectral_shape": z,
-            "pair_count": z,
-            "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-            "mean_similarity": z,
-            "max_similarity": z,
-            "guided_conflict_mean": z,
-            "guided_conflict_max": z,
-        }
-        return out if return_parts else z
-
-    sim = _positive_cosine_matrix(centers, centers)
-    eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-    pair_sim = sim[~eye]
-    hard_shape = F.relu(pair_sim - float(max_shape_similarity)) / max(1.0 - float(max_shape_similarity), 1e-6)
-    hard_shape = hard_shape.detach()
-
-    if features is not None and torch.is_tensor(features) and features.numel() > 0:
-        zf = F.normalize(features.to(device=s.device, dtype=s.dtype), dim=1, eps=1e-6)
-        f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-        if f_centers.size(0) == centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-            dist = torch.cdist(f_centers, f_centers, p=2)
-            feature_conflict = F.relu(float(risk_center_margin) - dist)[~eye] / max(float(risk_center_margin), 1e-6)
-            guided = hard_shape * feature_conflict
-            loss_vec = hard_shape * feature_conflict.pow(2)
-            loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-        else:
-            guided = torch.zeros_like(pair_sim)
-            loss = features.sum() * 0.0
-    else:
-        guided = torch.zeros_like(pair_sim)
-        loss = s.sum() * 0.0
-
-    if not return_parts:
-        return loss
-    return {
-        "total": loss,
-        "spectral_shape": loss.detach(),
-        "pair_count": torch.tensor(float(pair_sim.numel()), device=s.device, dtype=s.dtype),
-        "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-        "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-        "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-        "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-        "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-    }
+        raise RuntimeError("targets_local is outside the class-column range")
+    return classes.index_select(0, local)
 
 
-# -----------------------------------------------------------------------------
-# Low-rank GeometryBank energy used by classifier/replay/margins
-# -----------------------------------------------------------------------------
-
-def _canonicalize_variances(
+def _sample_weights(
+    value: Optional[Tensor],
     *,
-    eigvals: Optional[torch.Tensor] = None,
-    res_vars: Optional[torch.Tensor] = None,
-    variances: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if variances is not None and torch.is_tensor(variances):
-        if variances.dim() != 2 or variances.size(1) < 2:
-            raise ValueError(f"variances must be [C,R+1], got {tuple(variances.shape)}")
-        return variances[:, :-1], variances[:, -1]
-    if eigvals is None or res_vars is None:
-        raise ValueError("Either variances or eigvals+res_vars must be provided.")
-    return eigvals, res_vars
-
-
-def _active_rank_mask(active_ranks: Optional[torch.Tensor], C: int, R: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-    if active_ranks is None or not torch.is_tensor(active_ranks):
-        ar = torch.full((C,), int(R), device=device, dtype=torch.long)
-    else:
-        ar = active_ranks.to(device=device).long().flatten()
-        if ar.numel() != C:
-            raise ValueError(f"active_ranks must have C={C} entries, got {ar.numel()}")
-        ar = ar.clamp(min=0, max=R)
-    idx = torch.arange(R, device=device).view(1, R)
-    mask = (idx < ar.view(C, 1)).to(dtype=dtype)
-    return mask, ar
-
-
-
-
-def geometry_energy_matrix(
-    features: Optional[torch.Tensor] = None,
-    means: Optional[torch.Tensor] = None,
-    bases: Optional[torch.Tensor] = None,
-    variances: Optional[torch.Tensor] = None,
-    *,
-    bank: Optional[Mapping[str, torch.Tensor]] = None,
-    eigvals: Optional[torch.Tensor] = None,
-    res_vars: Optional[torch.Tensor] = None,
-    active_ranks: Optional[torch.Tensor] = None,
-    reliability: Optional[torch.Tensor] = None,
-    sample_counts: Optional[torch.Tensor] = None,
-    valid_mask: Optional[torch.Tensor] = None,
-    seen_classes: Optional[Iterable[int]] = None,
-    class_ids: Optional[Iterable[int]] = None,
-    variance_floor: float = 1e-4,
-    reliability_energy_weight: float = 0.0,
-    reliability_min_clamp: float = 0.05,
-    residual_variance_scale: float = 1.0,
-    normalize_by_dim: bool = True,
-    invalid_class_energy: float = _INVALID_ENERGY,
-    use_logdet_energy: bool = False,
-    logdet_energy_weight: float = 0.0,
-    logdet_normalize_by_dim: bool = True,
-    center_logdet_energy: bool = False,
-    spectral_summary: Optional[torch.Tensor] = None,
-    spectral_curve_means: Optional[torch.Tensor] = None,
-    spectral_curve_vars: Optional[torch.Tensor] = None,
-    spectral_curve_d1: Optional[torch.Tensor] = None,
-    spectral_curve_d2: Optional[torch.Tensor] = None,
-    spectral_shape_reliability: Optional[torch.Tensor] = None,
-    use_spectral_residual_energy: bool = False,
-    spectral_energy_weight: float = 0.0,
-    spectral_summary_is_physical: bool = False,
-    spectral_require_physical_summary: bool = True,
-    return_parts: bool = False,
-    **_: Any,
-) -> torch.Tensor | Dict[str, torch.Tensor]:
-    """Exact GeometryBank energy shared by replay, losses, and classification.
-
-    Main-path energy is rank-normalized parallel Mahalanobis plus
-    residual-dimension-normalized orthogonal Mahalanobis. Reliability, logdet,
-    spectral, calibration, and residual-rescaling terms are rejected because
-    they would make loss energy differ from GeometryBank replay validation.
-    """
-    del (
-        reliability, reliability_min_clamp, logdet_normalize_by_dim,
-        spectral_summary, spectral_curve_means, spectral_curve_vars,
-        spectral_curve_d1, spectral_curve_d2, spectral_shape_reliability,
-        spectral_summary_is_physical, spectral_require_physical_summary,
-    )
-    if abs(float(residual_variance_scale) - 1.0) > 1e-8:
-        raise RuntimeError("residual_variance_scale must be 1.0 for GeometryBank energy consistency.")
-    if not bool(normalize_by_dim):
-        raise RuntimeError("normalize_by_dim must be true for GeometryBank energy consistency.")
-    if bool(use_logdet_energy) or float(logdet_energy_weight) != 0.0 or bool(center_logdet_energy):
-        raise RuntimeError("Log-determinant energy is disabled; it is absent from replay-validation energy.")
-    if float(reliability_energy_weight) != 0.0:
-        raise RuntimeError("Reliability controls replay/trust and must not bias classifier or loss energy.")
-    if bool(use_spectral_residual_energy) or float(spectral_energy_weight) != 0.0:
-        raise RuntimeError("Spectral information guides replay and base reserve; it is not an inference-energy branch.")
-
-    if isinstance(means, Mapping) and bank is None and bases is None:
-        bank = means
-        means = None
-    selected_ids = _ordered_unique_ints(seen_classes if seen_classes is not None else class_ids)
-    bank_class_ids: Optional[torch.Tensor] = None
-    if bank is not None:
-        means = bank.get("means", means)
-        bases = bank.get("bases", bank.get("subspace_bases", bases))
-        variances = bank.get("variances", variances)
-        eigvals = bank.get("eigvals", bank.get("eigenvalues", eigvals))
-        res_vars = bank.get("res_vars", bank.get("residual_variances", bank.get("resvars", res_vars)))
-        active_ranks = bank.get("active_ranks", active_ranks)
-        sample_counts = bank.get("sample_counts", sample_counts)
-        valid_mask = bank.get("valid_mask", bank.get("valid_class_mask", valid_mask))
-        if torch.is_tensor(bank.get("class_ids", None)):
-            bank_class_ids = bank["class_ids"].long().flatten()
-
-    if means is None or bases is None:
-        raise ValueError("geometry_energy_matrix requires means and bases, or a bank mapping containing them.")
-    if features is None or not torch.is_tensor(features):
-        raise TypeError("features must be a tensor.")
-    if features.dim() != 2:
-        raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-    if means.dim() != 2 or bases.dim() != 3:
-        raise ValueError(f"means/bases must be [C,D] and [C,D,R], got {tuple(means.shape)}, {tuple(bases.shape)}")
-
-    B, D = features.shape
-    C, Dm = means.shape
-    if Dm != D or bases.size(0) != C or bases.size(1) != D:
-        raise ValueError(f"feature/bank shape mismatch: features={tuple(features.shape)}, means={tuple(means.shape)}, bases={tuple(bases.shape)}")
-
-    device, dtype = features.device, features.dtype
-    means = means.to(device=device, dtype=dtype)
-    bases = bases.to(device=device, dtype=dtype)
-    eig, rv = _canonicalize_variances(eigvals=eigvals, res_vars=res_vars, variances=variances)
-    eig = eig.to(device=device, dtype=dtype)
-    rv = rv.to(device=device, dtype=dtype).flatten()
-    R = int(bases.size(2))
-    if eig.shape != (C, R) or rv.numel() != C:
-        raise ValueError(f"variance shape mismatch: eig={tuple(eig.shape)}, res={rv.numel()}, expected {(C,R)} and {C}")
-
-    row_idx = torch.arange(C, device=device, dtype=torch.long)
-    global_ids = torch.arange(C, device=device, dtype=torch.long)
-    if selected_ids:
-        if bank_class_ids is not None:
-            ids_cpu = bank_class_ids.detach().cpu().tolist()
-            if len(set(int(c) for c in ids_cpu)) != len(ids_cpu):
-                raise RuntimeError("bank['class_ids'] contains duplicate ids.")
-            mapping = {int(c): i for i, c in enumerate(ids_cpu)}
-            missing = [c for c in selected_ids if c not in mapping]
-            if missing:
-                raise RuntimeError(f"selected classes absent from bank: {missing}")
-            row_idx = torch.as_tensor([mapping[c] for c in selected_ids], device=device, dtype=torch.long)
-        else:
-            missing = [c for c in selected_ids if c >= C]
-            if missing:
-                raise RuntimeError(f"selected classes absent from full bank rows: {missing}")
-            row_idx = torch.as_tensor(selected_ids, device=device, dtype=torch.long)
-        global_ids = torch.as_tensor(selected_ids, device=device, dtype=torch.long)
-        means = means.index_select(0, row_idx)
-        bases = bases.index_select(0, row_idx)
-        eig = eig.index_select(0, row_idx)
-        rv = rv.index_select(0, row_idx)
-        if active_ranks is not None:
-            active_ranks = active_ranks.to(device=device).flatten().index_select(0, row_idx)
-        if sample_counts is not None:
-            sample_counts = sample_counts.to(device=device).flatten().index_select(0, row_idx)
-        if valid_mask is not None:
-            valid_mask = valid_mask.to(device=device).flatten().index_select(0, row_idx)
-        C = len(selected_ids)
-
-    if features.numel() == 0:
-        empty = torch.empty((0, C), device=device, dtype=dtype)
-        return {"energy": empty, "feature_energy": empty} if return_parts else empty
-
-    _require_finite_tensor(features, "geometry_energy.features")
-    _require_finite_tensor(means, "geometry_energy.means")
-    _require_finite_tensor(bases, "geometry_energy.bases")
-    _require_finite_tensor(eig, "geometry_energy.eigvals")
-    _require_finite_tensor(rv, "geometry_energy.res_vars")
-    if bool((rv <= 0).any().item()):
-        raise RuntimeError("GeometryBank residual variances must be positive.")
-
-    rank_mask, ar = _active_rank_mask(active_ranks, C, R, device, dtype)
-    delta = features.unsqueeze(1) - means.unsqueeze(0)
-    coeff = torch.einsum("bcd,cdr->bcr", delta, bases)
-    coeff_active = coeff * rank_mask.view(1, C, R)
-    recon = torch.einsum("bcr,cdr->bcd", coeff_active, bases)
-    residual = delta - recon
-
-    eig_safe = eig.clamp_min(float(variance_floor))
-    rv_safe = rv.clamp_min(float(variance_floor))
-    parallel_raw = ((coeff_active.square() / eig_safe.view(1, C, R)) * rank_mask.view(1, C, R)).sum(dim=-1)
-    residual_raw = residual.square().sum(dim=-1)
-    active_dims = ar.to(dtype=dtype).clamp_min(1.0)
-    residual_dims = (D - ar.clamp(min=0, max=D)).to(dtype=dtype).clamp_min(1.0)
-    parallel = parallel_raw / active_dims.view(1, C)
-    orthogonal = residual_raw / (residual_dims.view(1, C) * rv_safe.view(1, C))
-    energy = parallel + orthogonal
-
-    valid_class = torch.isfinite(means).all(dim=1) & torch.isfinite(bases).all(dim=(1, 2))
-    valid_class &= torch.isfinite(eig).all(dim=1) & torch.isfinite(rv) & (rv > 0)
-    if sample_counts is not None:
-        sc = sample_counts.to(device=device).flatten()
-        if sc.numel() != C:
-            raise ValueError(f"sample_counts must have C={C} entries, got {sc.numel()}")
-        valid_class &= torch.isfinite(sc) & (sc > 0)
-    if valid_mask is not None:
-        valid_class &= _resolve_valid_class_mask(valid_mask, width=C, device=device)
-
-    if bool((~valid_class).any().item()):
-        mask = (~valid_class).view(1, C)
-        energy = energy.masked_fill(mask, float(invalid_class_energy))
-        parallel = parallel.masked_fill(mask, float(invalid_class_energy))
-        orthogonal = orthogonal.masked_fill(mask, float(invalid_class_energy))
-    energy = torch.nan_to_num(energy, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0)
-
-    if not return_parts:
-        return energy
-    zero_c = torch.zeros((C,), device=device, dtype=dtype)
-    return {
-        "energy": energy,
-        "feature_energy": energy,
-        "parallel": torch.nan_to_num(parallel, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-        "orthogonal": torch.nan_to_num(orthogonal, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-        "parallel_energy": parallel,
-        "residual_energy": orthogonal,
-        "parallel_raw": parallel_raw,
-        "residual_raw": residual_raw,
-        "active_dims": active_dims,
-        "residual_dims": residual_dims,
-        "logdet_penalty": zero_c,
-        "reliability_penalty": zero_c,
-        "spectral_energy": torch.zeros_like(energy),
-        "active_ranks": ar,
-        "rank_mask": rank_mask,
-        "valid_class_mask": valid_class,
-        "global_class_ids": global_ids,
-        "row_indices": row_idx,
-    }
-
-
-
-# -----------------------------------------------------------------------------
-# Phase-consistent energy-margin helpers
-# -----------------------------------------------------------------------------
-
-
-def _energy_to_logits(
-    energy: torch.Tensor,
-    *,
-    valid_mask: Optional[torch.Tensor] = None,
-    logit_scale: float = 8.0,
-    center_per_sample: bool = True,
-    clip: float = 50.0,
-    invalid_logit: float = -1e9,
-) -> torch.Tensor:
-    """Convert lower-is-better geometry energy using the classifier contract."""
-    if energy is None or not torch.is_tensor(energy) or energy.dim() != 2:
-        raise RuntimeError(f"energy must be [B,C], got {None if energy is None else tuple(energy.shape)}")
-    e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-    vm = _resolve_valid_class_mask(valid_mask, width=e.size(1), device=e.device)
-    finite = torch.isfinite(e) & (e < 0.5 * float(_INVALID_ENERGY)) & vm.view(1, -1)
-    if center_per_sample:
-        masked = e.masked_fill(~finite, float("inf"))
-        row_min = masked.min(dim=1, keepdim=True).values
-        row_min = torch.where(torch.isfinite(row_min), row_min, torch.zeros_like(row_min))
-        e = e - row_min
-    logits = -float(logit_scale) * e
-    if float(clip) > 0.0:
-        logits = logits.clamp(-float(clip), float(clip))
-    logits = torch.nan_to_num(logits, nan=float(invalid_logit), posinf=float(invalid_logit), neginf=float(invalid_logit))
-    return logits.masked_fill(~finite, float(invalid_logit))
-
-
-
-def _ce_from_logits(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    label_smoothing: float = 0.0,
-    clip: float = 50.0,
-    class_balanced: bool = True,
-) -> torch.Tensor:
-    if logits is None or not torch.is_tensor(logits) or logits.numel() == 0:
-        return safe_zero_like(labels if torch.is_tensor(labels) else None)
-    if logits.dim() != 2:
-        raise RuntimeError(f"logits must be [B,C], got {tuple(logits.shape)}")
-    y = _resolve_local_labels(labels, width=logits.size(1), device=logits.device, name="CE labels")
-    if y.numel() != logits.size(0):
-        raise RuntimeError(f"CE labels/logits mismatch: labels={y.numel()}, logits={logits.size(0)}")
-    per = F.cross_entropy(logits.clamp(-float(clip), float(clip)), y, label_smoothing=float(label_smoothing), reduction="none")
-    return _class_balanced_mean(per, y) if class_balanced else per.mean()
-
-
-
-def _energy_margin_parts(
-    energy: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    margin: float = 0.25,
-    valid_mask: Optional[torch.Tensor] = None,
-    class_balanced: bool = True,
-) -> Dict[str, torch.Tensor]:
-    ref = energy if torch.is_tensor(energy) else labels
-    if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-        z = safe_zero_like(ref)
-        return {"total": z, "violation_rate": z.detach(), "error_rate": z.detach(), "mean_gap": z.detach(), "min_gap": z.detach(), "true_energy": z.detach(), "nearest_wrong_energy": z.detach()}
-    if energy.dim() != 2:
-        raise RuntimeError(f"energy must be [B,C], got {tuple(energy.shape)}")
-    y = _resolve_local_labels(labels, width=energy.size(1), device=energy.device, name="energy labels")
-    if y.numel() != energy.size(0):
-        raise RuntimeError("labels/energy batch mismatch")
-    vm = _resolve_valid_class_mask(valid_mask, width=energy.size(1), device=energy.device)
-    if not bool(vm.index_select(0, y).all().item()):
-        raise RuntimeError("A target label points to an invalid class-energy column.")
-    e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-    true_e = e.gather(1, y.view(-1, 1)).squeeze(1)
-    rival_valid = vm.view(1, -1).expand_as(e).clone()
-    rival_valid.scatter_(1, y.view(-1, 1), False)
-    nearest_wrong = e.masked_fill(~rival_valid, float("inf")).min(dim=1).values
-    finite = torch.isfinite(nearest_wrong) & torch.isfinite(true_e)
-    gap = nearest_wrong - true_e
-    per = F.relu(float(margin) - gap)
-    if bool(finite.any().item()):
-        loss = _class_balanced_mean(per[finite], y[finite]) if class_balanced else per[finite].mean()
-        violation = _class_balanced_mean((gap[finite] < float(margin)).float(), y[finite]) if class_balanced else (gap[finite] < float(margin)).float().mean()
-        error = _class_balanced_mean((gap[finite] <= 0.0).float(), y[finite]) if class_balanced else (gap[finite] <= 0.0).float().mean()
-        mean_gap = _class_balanced_mean(gap[finite], y[finite]) if class_balanced else gap[finite].mean()
-        min_gap = gap[finite].min()
-    else:
-        loss = e.sum() * 0.0
-        violation = error = mean_gap = min_gap = e.sum() * 0.0
-    return {
-        "total": loss,
-        "violation_rate": violation.detach(),
-        "error_rate": error.detach(),
-        "mean_gap": mean_gap.detach(),
-        "min_gap": min_gap.detach(),
-        "true_energy": true_e[finite].mean().detach() if bool(finite.any().item()) else e.sum().detach() * 0.0,
-        "nearest_wrong_energy": nearest_wrong[finite].mean().detach() if bool(finite.any().item()) else e.sum().detach() * 0.0,
-    }
-
-
-
-def _old_new_invasion_parts(
-    energy: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    old_class_count: Optional[int] = None,
-    seen_classes: Optional[Iterable[int]] = None,
-    old_classes: Optional[Iterable[int]] = None,
-    new_classes: Optional[Iterable[int]] = None,
-    old_mask: Optional[torch.Tensor] = None,
-    new_mask: Optional[torch.Tensor] = None,
-    margin: float = 0.25,
-    class_balanced: bool = True,
-) -> Dict[str, torch.Tensor]:
-    ref = energy if torch.is_tensor(energy) else labels
-    if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-        z = safe_zero_like(ref)
-        return {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach(), "old_to_new_violation": z.detach(), "new_to_old_violation": z.detach()}
-    if energy.dim() != 2:
-        raise RuntimeError(f"energy must be [B,C], got {tuple(energy.shape)}")
-    C = int(energy.size(1))
-    if old_mask is None or new_mask is None:
-        old_mask, new_mask = _resolve_old_new_masks(
-            C, device=energy.device, seen_classes=seen_classes,
-            old_classes=old_classes, new_classes=new_classes,
-            old_class_count=old_class_count, require_nonempty=False,
+    sample_count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str = "sample_weights",
+) -> Tensor:
+    if value is None:
+        return torch.ones(sample_count, device=device, dtype=dtype)
+    result = torch.as_tensor(value, device=device, dtype=dtype).flatten()
+    if result.numel() != int(sample_count):
+        raise ValueError(
+            f"{name} has {result.numel()} entries; expected {sample_count}"
         )
-    else:
-        old_mask = old_mask.to(device=energy.device).bool().flatten()
-        new_mask = new_mask.to(device=energy.device).bool().flatten()
-    if old_mask.numel() != C or new_mask.numel() != C:
-        raise RuntimeError("old_mask/new_mask must match energy width")
-    if not bool(old_mask.any().item()) or not bool(new_mask.any().item()):
-        z = energy.sum() * 0.0
-        return {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach(), "old_to_new_violation": z.detach(), "new_to_old_violation": z.detach()}
-    y = _resolve_local_labels(labels, width=C, device=energy.device, name="invasion labels")
-    if y.numel() != energy.size(0):
-        raise RuntimeError("labels/energy batch mismatch")
-    e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-    true_e = e.gather(1, y.view(-1, 1)).squeeze(1)
-    old_min = e[:, old_mask].min(dim=1).values
-    new_min = e[:, new_mask].min(dim=1).values
-    is_old = old_mask.index_select(0, y)
-    is_new = new_mask.index_select(0, y)
-    if not bool((is_old | is_new).all().item()):
-        raise RuntimeError("Each target class must belong to exactly one of old_classes or new_classes.")
-    opposite = torch.where(is_old, new_min, old_min)
-    gap = opposite - true_e
-    per = F.relu(float(margin) - gap)
-    finite = torch.isfinite(per)
-    loss = _class_balanced_mean(per[finite], y[finite]) if bool(finite.any().item()) and class_balanced else (per[finite].mean() if bool(finite.any().item()) else e.sum() * 0.0)
-    violation = _class_balanced_mean((gap[finite] < float(margin)).float(), y[finite]) if bool(finite.any().item()) and class_balanced else ((gap[finite] < float(margin)).float().mean() if bool(finite.any().item()) else e.sum() * 0.0)
-    mean_gap = _class_balanced_mean(gap[finite], y[finite]) if bool(finite.any().item()) and class_balanced else (gap[finite].mean() if bool(finite.any().item()) else e.sum() * 0.0)
-    old_v = (gap[is_old] < float(margin)).float().mean() if bool(is_old.any().item()) else e.sum() * 0.0
-    new_v = (gap[is_new] < float(margin)).float().mean() if bool(is_new.any().item()) else e.sum() * 0.0
-    return {
-        "total": loss,
-        "violation_rate": violation.detach(),
-        "mean_gap": mean_gap.detach(),
-        "old_to_new_violation": old_v.detach(),
-        "new_to_old_violation": new_v.detach(),
-    }
+    if not torch.isfinite(result).all():
+        raise ValueError(f"{name} contains NaN/Inf")
+    if bool(result.lt(0.0).any()):
+        raise ValueError(f"{name} must be non-negative")
+    if float(result.sum().detach().item()) <= 0.0:
+        raise ValueError(f"{name} sums to zero")
+    return result
 
 
-def base_local_geometry_energy_margin_loss(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    **_: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Removed: the base trainer owns the exact low-rank margin.
-    The former helper used isotropic center distance, which is not the
-    GeometryBank energy and caused a second, conflicting base-margin path.
-    """
-    del features, labels
-    raise RuntimeError(
-        "base_local_geometry_energy_margin_loss is removed. "
-        "Use BasePhaseTrainer._base_batch_geometry_energy_margin so phase-0 "
-        "training uses the exact rank-normalized GeometryBank energy once."
-    )
-
-
-
-def incremental_geometry_training_loss(
+def _valid_class_mask(
+    value: Optional[Tensor],
     *,
-    labels: torch.Tensor,
-    logits: Optional[torch.Tensor] = None,
-    energy: Optional[torch.Tensor] = None,
-    features: Optional[torch.Tensor] = None,
-    bank: Optional[Mapping[str, torch.Tensor]] = None,
-    seen_classes: Optional[Iterable[int]] = None,
-    old_classes: Optional[Iterable[int]] = None,
-    new_classes: Optional[Iterable[int]] = None,
-    labels_are_global: bool = False,
-    old_class_count: int = 0,
-    ce_weight: float = 1.0,
-    joint_old_new_ce_weight: Optional[float] = None,
-    geometry_energy_margin_weight: float = 0.30,
-    geometry_energy_margin: float = 0.30,
-    old_new_invasion_weight: float = 0.50,
-    old_new_geometry_margin: float = 0.35,
+    class_count: int,
+    device: torch.device,
+) -> Tensor:
+    if value is None:
+        return torch.ones(class_count, device=device, dtype=torch.bool)
+    result = torch.as_tensor(value, device=device, dtype=torch.bool).flatten()
+    if result.numel() != int(class_count):
+        raise ValueError(
+            f"valid_class_mask must contain C={class_count} values"
+        )
+    if not bool(result.any()):
+        raise ValueError("valid_class_mask selects no class")
+    return result
+
+
+def _weighted_mean(values: Tensor, weights: Tensor) -> Tensor:
+    return (values * weights).sum() / weights.sum().clamp_min(_EPS)
+
+
+def _class_balanced_mean(
+    values: Tensor,
+    class_labels: Tensor,
+    weights: Tensor,
+) -> Tensor:
+    terms: List[Tensor] = []
+    for class_id in torch.unique(class_labels, sorted=True):
+        selected = class_labels.eq(class_id)
+        selected_weights = weights[selected]
+        if float(selected_weights.sum().detach().item()) <= 0.0:
+            raise RuntimeError(
+                f"class {int(class_id.item())} has zero effective weight"
+            )
+        terms.append(
+            _weighted_mean(values[selected], selected_weights)
+        )
+    if not terms:
+        raise RuntimeError("class-balanced reduction received no samples")
+    return torch.stack(terms).mean()
+
+
+def _reduce(
+    values: Tensor,
+    class_labels: Tensor,
+    weights: Tensor,
+    *,
+    class_balanced: bool,
+) -> Tensor:
+    if class_balanced:
+        return _class_balanced_mean(values, class_labels, weights)
+    return _weighted_mean(values, weights)
+
+
+# =============================================================================
+# Base warm-up cross entropy
+# =============================================================================
+
+
+def class_balanced_cross_entropy(
+    logits: Tensor,
+    targets_global: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    *,
+    sample_weights: Optional[Tensor] = None,
     label_smoothing: float = 0.0,
-    logit_scale: float = 8.0,
-    ce_logit_clip: float = 50.0,
-    variance_floor: float = 5e-4,
-    residual_variance_scale: float = 1.0,
-    reliability_energy_weight: float = 0.0,
-    normalize_by_dim: bool = True,
+    class_balanced: bool = True,
     return_parts: bool = True,
-    **kwargs: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Class-balanced all-seen CE plus exact geometry and invasion margins."""
-    ref = energy if torch.is_tensor(energy) else (logits if torch.is_tensor(logits) else features)
-    z = safe_zero_like(ref)
-    seen = _ordered_unique_ints(seen_classes)
-    if energy is None and torch.is_tensor(features) and bank is not None:
-        energy = geometry_energy_matrix(
-            features,
-            bank=bank,
-            seen_classes=seen or None,
-            variance_floor=float(variance_floor),
-            residual_variance_scale=float(residual_variance_scale),
-            reliability_energy_weight=float(reliability_energy_weight),
-            normalize_by_dim=bool(normalize_by_dim),
-            return_parts=False,
-            **kwargs,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Cross entropy using explicit global-ID to column mapping.
+
+    Query purity should not normally be passed as ``sample_weights``. Spatial
+    purity is an estimator weight for support-row fitting, not a mechanism for
+    suppressing difficult query gradients.
+    """
+    scores = _matrix(logits, name="logits")
+    classes = _class_ids(class_ids, device=scores.device)
+    if scores.size(1) != classes.numel():
+        raise ValueError(
+            "logit width does not match class_ids length"
         )
-    width = int(energy.size(1)) if torch.is_tensor(energy) else (int(logits.size(1)) if torch.is_tensor(logits) else 0)
-    if width <= 0:
-        return {"total": z} if return_parts else z
-    y = _resolve_local_labels(
-        labels, width=width, device=(energy.device if torch.is_tensor(energy) else logits.device),
-        seen_classes=seen or None, labels_are_global=bool(labels_are_global), name="incremental labels",
+    targets = targets_global.to(scores.device).long().flatten()
+    if targets.numel() != scores.size(0):
+        raise ValueError("target/logit batch mismatch")
+    local = global_to_local_targets(targets, classes)
+
+    weights = _sample_weights(
+        sample_weights,
+        sample_count=scores.size(0),
+        device=scores.device,
+        dtype=scores.dtype,
     )
-    valid = None
-    if torch.is_tensor(energy):
-        valid = torch.isfinite(energy).all(dim=0) & (energy < 0.5 * _INVALID_ENERGY).any(dim=0)
-    if logits is None and torch.is_tensor(energy):
-        logits = _energy_to_logits(energy, valid_mask=valid, logit_scale=float(logit_scale), clip=float(ce_logit_clip))
-    ce_w = float(joint_old_new_ce_weight) if joint_old_new_ce_weight is not None else float(ce_weight)
-    ce = _ce_from_logits(logits, y, label_smoothing=float(label_smoothing), clip=float(ce_logit_clip), class_balanced=True) if torch.is_tensor(logits) else z
-    if not torch.is_tensor(energy) and torch.is_tensor(logits):
-        energy = -logits.float() / max(float(logit_scale), 1e-6)
-    margin_parts = _energy_margin_parts(energy, y, margin=float(geometry_energy_margin), valid_mask=valid, class_balanced=True)
-    invasion_parts = _old_new_invasion_parts(
-        energy, y, old_class_count=int(old_class_count), seen_classes=seen or None,
-        old_classes=old_classes, new_classes=new_classes,
-        margin=float(old_new_geometry_margin), class_balanced=True,
+    smoothing = _nonnegative(
+        label_smoothing,
+        name="label_smoothing",
     )
-    energy_margin_total = _scalar(margin_parts["total"], ref)
-    invasion_total = _scalar(invasion_parts["total"], ref)
-    total = ce_w * ce + float(geometry_energy_margin_weight) * energy_margin_total + float(old_new_invasion_weight) * invasion_total
+    if smoothing >= 1.0:
+        raise ValueError("label_smoothing must be smaller than one")
+
+    per_sample = F.cross_entropy(
+        scores,
+        local,
+        reduction="none",
+        label_smoothing=smoothing,
+    )
+    total = _reduce(
+        per_sample,
+        targets,
+        weights,
+        class_balanced=class_balanced,
+    )
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError("cross entropy is not a finite scalar")
+
     if not return_parts:
         return total
     return {
         "total": total,
-        "ce": ce.detach(),
-        "incremental_ce": ce.detach(),
-        "geometry_energy_margin": energy_margin_total.detach(),
-        "old_new_invasion": invasion_total.detach(),
-        "energy_margin_violation": margin_parts["violation_rate"],
-        "energy_error_rate": margin_parts["error_rate"],
-        "energy_margin_gap": margin_parts["mean_gap"],
-        "energy_margin_min_gap": margin_parts["min_gap"],
-        "old_new_invasion_violation": invasion_parts["violation_rate"],
-        "old_new_invasion_gap": invasion_parts["mean_gap"],
-        "old_to_new_violation": invasion_parts["old_to_new_violation"],
-        "new_to_old_violation": invasion_parts["new_to_old_violation"],
-        "phase_is_base": torch.tensor(0.0, device=total.device, dtype=total.dtype),
-        "phase_is_incremental": torch.tensor(1.0, device=total.device, dtype=total.dtype),
-        "rank": energy_margin_total.detach(),
-        "admission": invasion_total.detach(),
-        "subspace": z.detach(),
-        "volume": z.detach(),
-        "trust": z.detach(),
-        "violation_rate": margin_parts["violation_rate"],
+        "per_sample": per_sample,
+        "targets_local": local,
+        "accuracy": scores.argmax(dim=1).eq(local).float().mean().detach(),
     }
 
 
-# -----------------------------------------------------------------------------
-# Unified base objective
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Risk-guided all-rival factor-energy objective
+# =============================================================================
 
 
-def base_geometry_preparation_loss(
+def _validate_pair_risk(
+    pair_risk: Optional[Tensor],
     *,
-    logits: Optional[torch.Tensor] = None,
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    key_features: Optional[torch.Tensor] = None,
-    band_summary: Optional[torch.Tensor] = None,
-    spectral_summary: Optional[torch.Tensor] = None,
-    spectral_summary_is_physical: bool = False,
-    ce_weight: float = 0.0,
-    base_geometry_weight: float = 1.0,
-    label_smoothing: float = 0.0,
-    gics_weight: float = 0.20,
-    gics_temperature: float = 0.07,
-    pgr_weight: float = 0.10,
-    pgr_compact_weight: float = 0.15,
-    pgr_center_weight: float = 0.20,
-    pgr_subspace_weight: float = 0.10,
-    pgr_band_weight: float = 0.05,
-    pgr_volume_weight: float = 0.05,
-    pgr_center_margin: float = 1.05,
-    pgr_max_band_similarity: float = 0.75,
-    pgr_max_class_variance: float = 0.75,
-    pgr_min_class_variance: float = 0.015,
-    pgr_max_subspace_overlap: float = 0.50,
-    subspace_rank: int = 3,
-    min_class_samples: int = 3,
-    subspace_min_samples: int = 6,
-    spectral_shape_weight: float = 0.05,
-    max_spectral_shape_similarity: float = 0.75,
-    spectral_shape_risk_weight: float = 1.0,
-    require_physical_summary: bool = True,
-    base_energy_margin_weight: float = 0.15,
-    base_energy_margin: float = 0.25,
-    base_energy_variance_floor: float = 5e-4,
+    class_count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if pair_risk is None:
+        return torch.zeros(
+            (class_count, class_count),
+            device=device,
+            dtype=dtype,
+        )
+
+    risk = torch.as_tensor(
+        pair_risk,
+        device=device,
+        dtype=dtype,
+    )
+    if risk.shape != (class_count, class_count):
+        raise ValueError(
+            f"pair_risk must be [{class_count},{class_count}], "
+            f"got {tuple(risk.shape)}"
+        )
+    if not torch.isfinite(risk).all():
+        raise RuntimeError("pair_risk contains NaN/Inf")
+    if bool(risk.lt(-1e-6).any()) or bool(risk.gt(1.0 + 1e-6).any()):
+        raise ValueError("pair_risk values must lie in [0,1]")
+    risk = risk.clamp(0.0, 1.0)
+
+    # The intended risk is a class-pair relation, not a directional logit
+    # correction. Reject accidental asymmetric matrices instead of silently
+    # introducing class-order bias.
+    if not torch.allclose(
+        risk,
+        risk.transpose(0, 1),
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise RuntimeError("pair_risk must be symmetric")
+    if not torch.allclose(
+        torch.diagonal(risk),
+        torch.zeros(class_count, device=device, dtype=dtype),
+        atol=1e-6,
+        rtol=0.0,
+    ):
+        raise RuntimeError("pair_risk diagonal must be zero")
+    return risk
+
+
+def risk_guided_all_rival_geometry_loss(
+    energy: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    targets_global: Tensor,
+    *,
+    pair_risk: Optional[Tensor] = None,
+    base_margin: float = 0.50,
+    risk_strength: float = 0.50,
+    temperature: float = 0.50,
+    maximum_margin: Optional[float] = None,
+    sample_weights: Optional[Tensor] = None,
+    valid_class_mask: Optional[Tensor] = None,
+    class_balanced: bool = True,
     return_parts: bool = True,
-    **kwargs: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Base CE/GICS/PGR/spectral reserve.
+) -> Union[Tensor, Dict[str, Tensor]]:
+    r"""Risk-guided all-rival loss on lower-is-better factor energy.
 
-    The exact low-rank base energy margin is intentionally owned by
-    BasePhaseTrainer._base_batch_geometry_energy_margin. Keeping another local
-    approximation here would double-count the term and use a different energy.
-    Margin arguments are accepted only for API compatibility.
+    For query i with global target y_i and rival j:
+
+        m_{y_i,j} = m_0 (1 + kappa R_{y_i,j})
+
+        l_i = tau log[
+            1 + sum_{j != y_i}
+            exp((m_{y_i,j} + E_{i,y_i} - E_{i,j}) / tau)
+        ].
+
+    The pair-risk matrix must follow the exact ``class_ids`` column order.
+    It is detached internally so spectral-shape and bank statistics are not
+    optimized through the query objective.
     """
-    del base_energy_margin_weight, base_energy_margin, base_energy_variance_floor
-    if features is None or not torch.is_tensor(features) or features.numel() == 0:
-        z = safe_zero_like(features)
-        out = {"total": z, "ce": z, "base_geometry": z}
-        for key in (
-            "base_gics", "base_gics_weighted", "base_gics_anchors", "base_gics_pos",
-            "base_pgr", "base_pgr_weighted", "base_compact", "base_center", "base_subspace", "base_band", "base_volume",
-            "base_pgr_valid_class_count", "base_pgr_subspace_pair_count", "base_pgr_band_pair_count", "base_pgr_volume_factor",
-            "base_pgr_subspace_max_overlap", "base_pgr_band_max_similarity", "base_pgr_band_guided_conflict_mean", "base_pgr_band_guided_conflict_max",
-            "base_spectral_shape", "base_spectral_shape_raw", "base_spectral_shape_mean_similarity", "base_spectral_shape_max_similarity",
-            "base_spectral_shape_pair_count", "base_spectral_shape_active", "base_spectral_shape_guided_conflict_mean", "base_spectral_shape_guided_conflict_max",
-            "base_energy_margin", "base_energy_margin_weighted", "base_energy_margin_violation", "base_energy_margin_gap",
-        ):
-            out[key] = z
-        return out if return_parts else z
-    if features.dim() != 2:
-        raise ValueError(f"base features must be [B,D], got {tuple(features.shape)}")
-    _require_finite_tensor(features, "base.features")
-    labels = _as_1d_long(labels, device=features.device)
-    if labels.numel() != features.size(0):
-        raise ValueError(f"base labels/features mismatch: labels={labels.numel()}, features={features.size(0)}")
+    scores = _matrix(energy, name="energy")
+    n, c = scores.shape
+    classes = _class_ids(class_ids, device=scores.device)
+    if classes.numel() != c:
+        raise ValueError(
+            "energy width does not match class_ids length"
+        )
 
-    ce = safe_zero_like(features)
-    if ce_weight > 0.0:
-        if logits is None or not torch.is_tensor(logits):
-            raise ValueError("logits are required when ce_weight > 0.")
-        ce = _ce_from_logits(logits, labels, label_smoothing=float(label_smoothing), class_balanced=True)
+    targets = targets_global.to(scores.device).long().flatten()
+    if targets.numel() != n:
+        raise ValueError("target/energy batch mismatch")
+    local = global_to_local_targets(targets, classes)
 
-    band_for_pgr = spectral_summary if (
-        torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0 and bool(spectral_summary_is_physical)
-    ) else band_summary
-    gics = base_geometry_involved_contrastive_loss(
-        features, labels, key_features=key_features, weight=float(gics_weight),
-        temperature=float(gics_temperature), return_parts=True,
+    valid = _valid_class_mask(
+        valid_class_mask,
+        class_count=c,
+        device=scores.device,
     )
-    pgr = prospective_geometry_reserve_loss(
-        features, labels, band_summary=band_for_pgr, weight=float(pgr_weight),
-        compact_weight=float(pgr_compact_weight), center_weight=float(pgr_center_weight),
-        subspace_weight=float(pgr_subspace_weight), band_weight=float(pgr_band_weight),
-        volume_weight=float(pgr_volume_weight), center_margin=float(pgr_center_margin),
-        min_class_samples=int(min_class_samples), subspace_min_samples=int(subspace_min_samples),
-        subspace_rank=int(subspace_rank), max_band_similarity=float(pgr_max_band_similarity),
-        max_class_variance=float(pgr_max_class_variance), min_class_variance=float(pgr_min_class_variance),
-        max_subspace_overlap=float(kwargs.get("subspace_overlap_max", pgr_max_subspace_overlap)), return_parts=True,
+    if not bool(valid.index_select(0, local).all()):
+        raise RuntimeError("targets reference invalid class columns")
+
+    m0 = _nonnegative(base_margin, name="base_margin")
+    kappa = _nonnegative(risk_strength, name="risk_strength")
+    tau = _positive(temperature, name="temperature")
+    max_margin = (
+        None
+        if maximum_margin is None
+        else _positive(maximum_margin, name="maximum_margin")
     )
-    shape = spectral_shape_discrimination_loss(
-        spectral_summary, labels, features=features,
-        spectral_summary_is_physical=bool(spectral_summary_is_physical),
-        require_physical_summary=bool(require_physical_summary), min_samples=int(min_class_samples),
-        max_shape_similarity=float(max_spectral_shape_similarity), risk_center_margin=float(pgr_center_margin),
-        risk_weight=float(spectral_shape_risk_weight), return_parts=True,
+    if max_margin is not None and max_margin < m0:
+        raise ValueError("maximum_margin must be >= base_margin")
+
+    risk = _validate_pair_risk(
+        pair_risk,
+        class_count=c,
+        device=scores.device,
+        dtype=scores.dtype,
+    ).detach()
+    margin_matrix = m0 * (1.0 + kappa * risk)
+    if max_margin is not None:
+        margin_matrix = margin_matrix.clamp_max(max_margin)
+    margin_matrix = margin_matrix.clone()
+    margin_matrix.fill_diagonal_(0.0)
+
+    weights = _sample_weights(
+        sample_weights,
+        sample_count=n,
+        device=scores.device,
+        dtype=scores.dtype,
     )
-    gics_total = _scalar(gics.get("total", safe_zero_like(features)), features)
-    pgr_total = _scalar(pgr.get("total", safe_zero_like(features)), features)
-    shape_raw = _scalar(shape.get("total", safe_zero_like(features)), features)
-    shape_total = float(spectral_shape_weight) * shape_raw
-    base_geometry = float(base_geometry_weight) * (gics_total + pgr_total + shape_total)
-    total = float(ce_weight) * ce + base_geometry
+
+    true_energy = scores.gather(1, local[:, None]).squeeze(1)
+    pair_margins = margin_matrix.index_select(0, local)
+
+    rivals_allowed = valid.view(1, c).expand(n, c).clone()
+    rivals_allowed.scatter_(1, local[:, None], False)
+    if not bool(rivals_allowed.any(dim=1).all()):
+        raise RuntimeError("one or more queries have no valid rival")
+
+    scaled_violation = (
+        pair_margins
+        + true_energy[:, None]
+        - scores
+    ) / tau
+    scaled_violation = scaled_violation.masked_fill(
+        ~rivals_allowed,
+        float("-inf"),
+    )
+    zero = torch.zeros(
+        (n, 1),
+        device=scores.device,
+        dtype=scores.dtype,
+    )
+    per_sample = tau * torch.logsumexp(
+        torch.cat([zero, scaled_violation], dim=1),
+        dim=1,
+    )
+
+    total = _reduce(
+        per_sample,
+        targets,
+        weights,
+        class_balanced=class_balanced,
+    )
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError(
+            "risk-guided geometry loss is not a finite scalar"
+        )
+
+    masked_rivals = scores.masked_fill(
+        ~rivals_allowed,
+        float("inf"),
+    )
+    nearest_rival_energy, nearest_rival_local = masked_rivals.min(dim=1)
+    nearest_gap = nearest_rival_energy - true_energy
+    nearest_required_margin = pair_margins.gather(
+        1,
+        nearest_rival_local[:, None],
+    ).squeeze(1)
+
+    margin_violation = _reduce(
+        nearest_gap.lt(nearest_required_margin).to(scores.dtype),
+        targets,
+        weights,
+        class_balanced=class_balanced,
+    )
+    classification_violation = _reduce(
+        nearest_gap.le(0.0).to(scores.dtype),
+        targets,
+        weights,
+        class_balanced=class_balanced,
+    )
+
+    predicted_local = scores.argmin(dim=1)
+    predicted_global = classes.index_select(0, predicted_local)
+    nearest_rival_global = classes.index_select(
+        0,
+        nearest_rival_local,
+    )
+
     if not return_parts:
         return total
-    zero = features.sum() * 0.0
-    spectral_active = bool(spectral_summary_is_physical) and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0
     return {
         "total": total,
-        "ce": ce.detach(),
-        "base_geometry": base_geometry,
-        "base_gics": _scalar(gics.get("gics", zero), features).detach(),
-        "base_gics_weighted": gics_total.detach(),
-        "base_gics_anchors": _scalar(gics.get("valid_anchors", zero), features).detach(),
-        "base_gics_pos": _scalar(gics.get("mean_positive_count", zero), features).detach(),
-        "base_pgr": _scalar(pgr.get("pgr", zero), features).detach(),
-        "base_pgr_weighted": pgr_total.detach(),
-        "base_compact": _scalar(pgr.get("compact", zero), features).detach(),
-        "base_center": _scalar(pgr.get("center", zero), features).detach(),
-        "base_subspace": _scalar(pgr.get("subspace", zero), features).detach(),
-        "base_band": _scalar(pgr.get("band", zero), features).detach(),
-        "base_volume": _scalar(pgr.get("volume", zero), features).detach(),
-        "base_spectral_shape": shape_total.detach(),
-        "base_spectral_shape_raw": shape_raw.detach(),
-        "base_spectral_shape_mean_similarity": _scalar(shape.get("mean_similarity", zero), features).detach(),
-        "base_spectral_shape_max_similarity": _scalar(shape.get("max_similarity", zero), features).detach(),
-        "base_spectral_shape_pair_count": _scalar(shape.get("pair_count", zero), features).detach(),
-        "base_spectral_shape_active": torch.tensor(float(spectral_active), device=features.device, dtype=features.dtype),
-        "base_energy_margin": zero.detach(),
-        "base_energy_margin_weighted": zero.detach(),
-        "base_energy_margin_violation": zero.detach(),
-        "base_energy_margin_gap": zero.detach(),
-        "base_pgr_valid_class_count": _scalar(pgr.get("valid_class_count", zero), features).detach(),
-        "base_pgr_subspace_pair_count": _scalar(pgr.get("subspace_pair_count", zero), features).detach(),
-        "base_pgr_band_pair_count": _scalar(pgr.get("band_pair_count", zero), features).detach(),
-        "base_pgr_volume_factor": _scalar(pgr.get("volume_factor", zero), features).detach(),
-        "base_pgr_subspace_max_overlap": _scalar(pgr.get("subspace_max_overlap", zero), features).detach(),
-        "base_pgr_band_max_similarity": _scalar(pgr.get("band_max_similarity", zero), features).detach(),
-        "base_pgr_band_guided_conflict_mean": _scalar(pgr.get("band_guided_conflict_mean", zero), features).detach(),
-        "base_pgr_band_guided_conflict_max": _scalar(pgr.get("band_guided_conflict_max", zero), features).detach(),
-        "base_spectral_shape_guided_conflict_mean": _scalar(shape.get("guided_conflict_mean", zero), features).detach(),
-        "base_spectral_shape_guided_conflict_max": _scalar(shape.get("guided_conflict_max", zero), features).detach(),
-        "base_energy_margin_owned_by_trainer": torch.tensor(1.0, device=features.device, dtype=features.dtype),
+        "per_sample": per_sample,
+        "targets_local": local,
+        "true_energy": true_energy,
+        "nearest_rival_energy": nearest_rival_energy,
+        "nearest_rival_local": nearest_rival_local.detach(),
+        "nearest_rival_global": nearest_rival_global.detach(),
+        "nearest_required_margin": nearest_required_margin.detach(),
+        "nearest_pair_risk": risk[
+            local,
+            nearest_rival_local,
+        ].detach(),
+        "nearest_gap": nearest_gap,
+        "mean_gap": _reduce(
+            nearest_gap,
+            targets,
+            weights,
+            class_balanced=class_balanced,
+        ).detach(),
+        "minimum_gap": nearest_gap.min().detach(),
+        "q01_gap": torch.quantile(nearest_gap.detach(), 0.01),
+        "q05_gap": torch.quantile(nearest_gap.detach(), 0.05),
+        "margin_violation_rate": margin_violation.detach(),
+        "classification_violation_rate":
+            classification_violation.detach(),
+        "accuracy": predicted_global.eq(targets).float().mean().detach(),
+        "margin_matrix": margin_matrix.detach(),
+        "pair_risk": risk.detach(),
     }
 
 
+# =============================================================================
+# Base objectives
+# =============================================================================
 
-def unified_spectral_geometry_loss(
+
+def base_ce_warmup_objective(
+    logits: Tensor,
+    targets_global: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
     *,
-    phase: str,
-    labels: torch.Tensor,
-    logits: Optional[torch.Tensor] = None,
-    energy: Optional[torch.Tensor] = None,
-    features: Optional[torch.Tensor] = None,
-    key_features: Optional[torch.Tensor] = None,
-    band_summary: Optional[torch.Tensor] = None,
-    spectral_summary: Optional[torch.Tensor] = None,
-    spectral_summary_is_physical: bool = False,
-    bank: Optional[Mapping[str, torch.Tensor]] = None,
-    seen_classes: Optional[Iterable[int]] = None,
-    old_classes: Optional[Iterable[int]] = None,
-    new_classes: Optional[Iterable[int]] = None,
-    labels_are_global: bool = False,
-    old_class_count: int = 0,
-    ce_weight: Optional[float] = None,
-    joint_old_new_ce_weight: Optional[float] = None,
-    geometry_energy_margin_weight: float = 0.30,
-    geometry_energy_margin: float = 0.30,
-    old_new_invasion_weight: float = 0.50,
-    old_new_geometry_margin: float = 0.35,
-    logit_scale: float = 8.0,
     label_smoothing: float = 0.0,
+    class_balanced: bool = True,
     return_parts: bool = True,
-    **kwargs: Any,
-) -> Dict[str, torch.Tensor] | torch.Tensor:
-    """Single public loss router for the current SCTGR architecture."""
-    p = str(phase).strip().lower()
-    if p in {"base", "phase0", "phase_0", "0"}:
-        return base_geometry_preparation_loss(
-            logits=logits, features=features, labels=labels, key_features=key_features,
-            band_summary=band_summary, spectral_summary=spectral_summary,
-            spectral_summary_is_physical=spectral_summary_is_physical,
-            ce_weight=float(0.0 if ce_weight is None else ce_weight),
-            label_smoothing=float(label_smoothing), return_parts=return_parts, **kwargs,
-        )
-    if p in {"incremental", "inc", "phase_inc", "phase1", "phase_1", "1", "2", "3", "4", "5"} or p.startswith("phase"):
-        return incremental_geometry_training_loss(
-            labels=labels, logits=logits, energy=energy, features=features, bank=bank,
-            seen_classes=seen_classes, old_classes=old_classes, new_classes=new_classes,
-            labels_are_global=bool(labels_are_global), old_class_count=int(old_class_count),
-            ce_weight=float(1.0 if ce_weight is None else ce_weight),
-            joint_old_new_ce_weight=joint_old_new_ce_weight,
-            geometry_energy_margin_weight=float(geometry_energy_margin_weight),
-            geometry_energy_margin=float(geometry_energy_margin),
-            old_new_invasion_weight=float(old_new_invasion_weight),
-            old_new_geometry_margin=float(old_new_geometry_margin),
-            logit_scale=float(logit_scale), label_smoothing=float(label_smoothing),
-            return_parts=return_parts, **kwargs,
-        )
-    raise RuntimeError(f"Unsupported phase={phase!r}. Use 'base' or 'incremental'.")
-
-
-class UnifiedSpectralGeometryLoss:
-    """Thin callable wrapper for compatibility with older code."""
-
-    def __init__(self, **defaults: Any) -> None:
-        self.defaults = dict(defaults)
-
-    def __call__(self, **kwargs: Any):
-        merged = dict(self.defaults)
-        merged.update(kwargs)
-        return unified_spectral_geometry_loss(**merged)
-
-
-# -----------------------------------------------------------------------------
-# Incremental margin losses used by SCTGR
-# -----------------------------------------------------------------------------
-
-
-def geometry_energy_margin_loss(
-    energy: torch.Tensor,
-    labels: torch.Tensor,
-    margin: float = 0.25,
-    valid_mask: Optional[torch.Tensor] = None,
-    *,
-    seen_classes: Optional[Iterable[int]] = None,
-    labels_are_global: bool = False,
-    class_balanced: bool = True,
-) -> torch.Tensor:
-    if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-        return safe_zero_like(labels if torch.is_tensor(labels) else None)
-    y = _resolve_local_labels(labels, width=energy.size(1), device=energy.device, seen_classes=seen_classes, labels_are_global=labels_are_global)
-    return _energy_margin_parts(energy, y, margin=float(margin), valid_mask=valid_mask, class_balanced=class_balanced)["total"]
-
-
-
-def old_new_invasion_loss(
-    energy: torch.Tensor,
-    labels: torch.Tensor,
-    old_class_count: Optional[int] = None,
-    margin: float = 0.25,
-    valid_mask: Optional[torch.Tensor] = None,
-    *,
-    seen_classes: Optional[Iterable[int]] = None,
-    old_classes: Optional[Iterable[int]] = None,
-    new_classes: Optional[Iterable[int]] = None,
-    labels_are_global: bool = False,
-    old_mask: Optional[torch.Tensor] = None,
-    new_mask: Optional[torch.Tensor] = None,
-    class_balanced: bool = True,
-) -> torch.Tensor:
-    del valid_mask
-    if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-        return safe_zero_like(labels if torch.is_tensor(labels) else None)
-    y = _resolve_local_labels(labels, width=energy.size(1), device=energy.device, seen_classes=seen_classes, labels_are_global=labels_are_global)
-    return _old_new_invasion_parts(
-        energy, y, old_class_count=old_class_count, seen_classes=seen_classes,
-        old_classes=old_classes, new_classes=new_classes, old_mask=old_mask,
-        new_mask=new_mask, margin=float(margin), class_balanced=class_balanced,
-    )["total"]
-
-
-# -----------------------------------------------------------------------------
-# Base diagnostics
-# -----------------------------------------------------------------------------
-
-@torch.no_grad()
-def base_center_overlap_diagnostics(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    normalize: bool = True,
-    min_samples: int = 2,
-) -> Dict[str, torch.Tensor]:
-    if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-        z = safe_zero_like(features)
-        return {"compact": z, "mean_center_margin": z, "min_center_margin": z, "num_classes": z}
-
-    z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-    y = _as_1d_long(labels, device=z.device)
-    centers, _, _ = _class_centers(z, y, min_samples=min_samples)
-
-    compact_terms = []
-    for cls in torch.unique(y, sorted=True):
-        m = y == cls
-        if int(m.sum().item()) >= int(min_samples):
-            xc = z[m]
-            compact_terms.append((xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean())
-    compact = torch.stack(compact_terms).mean() if compact_terms else z.sum() * 0.0
-
-    if centers.size(0) < 2:
-        mean_margin = z.sum() * 0.0
-        min_margin = z.sum() * 0.0
-    else:
-        dist = torch.cdist(centers, centers, p=2)
-        eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-        pair = dist[~eye]
-        mean_margin = pair.mean()
-        min_margin = pair.min()
-
-    return {
-        "compact": compact.detach(),
-        "mean_center_margin": mean_margin.detach(),
-        "min_center_margin": min_margin.detach(),
-        "num_classes": torch.tensor(float(centers.size(0)), device=z.device, dtype=z.dtype),
-    }
-
-
-@torch.no_grad()
-def base_gics_diagnostics(features: torch.Tensor, labels: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-    out = base_geometry_involved_contrastive_loss(features, labels, weight=1.0, return_parts=True, **kwargs)
-    return {
-        "gics": out["gics"].detach(),
-        "valid_anchors": out["valid_anchors"].detach(),
-        "positive_pairs": out["mean_positive_count"].detach(),
-    }
-
-
-def base_supcon_diagnostics(*args: Any, **kwargs: Any):
-    return base_gics_diagnostics(*args, **kwargs)
-
-
-# -----------------------------------------------------------------------------
-# Disabled legacy boundary helper
-# -----------------------------------------------------------------------------
-
-def sample_boundary_geometry_features(*args: Any, **kwargs: Any):
-    raise RuntimeError(
-        "sample_boundary_geometry_features is not part of  main path. "
-        "Use GeometryBank synthetic replay, not boundary replay."
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Temporary base-head objective before geometry shaping."""
+    return class_balanced_cross_entropy(
+        logits,
+        targets_global,
+        class_ids,
+        label_smoothing=label_smoothing,
+        class_balanced=class_balanced,
+        return_parts=return_parts,
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from __future__ import annotations
-# from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
-# import torch
-# import torch.nn.functional as F
-
-
-# _EPS = 1e-12
-# _INVALID_ENERGY = 1e6
-
-
-# # -----------------------------------------------------------------------------
-# # Basic utilities
-# # -----------------------------------------------------------------------------
-
-# def safe_zero_like(
-#     ref: Optional[torch.Tensor] = None,
-#     *,
-#     device: Optional[torch.device] = None,
-#     dtype: Optional[torch.dtype] = None,
-# ) -> torch.Tensor:
-#     if torch.is_tensor(ref):
-#         return ref.sum() * 0.0
-#     return torch.tensor(
-#         0.0,
-#         device=device if device is not None else torch.device("cpu"),
-#         dtype=dtype if dtype is not None else torch.float32,
-#     )
-
-
-# def _require_finite_tensor(x: torch.Tensor, name: str) -> None:
-#     if not torch.is_tensor(x):
-#         raise TypeError(f"{name} must be a tensor.")
-#     if x.numel() == 0:
-#         return
-#     if not torch.isfinite(x).all():
-#         bad = int((~torch.isfinite(x)).sum().detach().cpu().item())
-#         raise RuntimeError(f"{name}: tensor contains {bad} NaN/Inf values.")
-
-
-# def _as_1d_long(labels: torch.Tensor, *, device: torch.device, name: str = "labels") -> torch.Tensor:
-#     if labels is None or not torch.is_tensor(labels):
-#         raise TypeError(f"{name} must be a tensor.")
-#     return labels.to(device=device).long().flatten()
-
-
-# def _scalar(value: Any, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-#     if torch.is_tensor(value):
-#         if value.numel() == 1:
-#             return value.reshape(())
-#         return value.float().mean()
-#     if isinstance(value, (int, float)):
-#         if torch.is_tensor(ref):
-#             return torch.tensor(float(value), device=ref.device, dtype=ref.dtype)
-#         return torch.tensor(float(value), dtype=torch.float32)
-#     return safe_zero_like(ref)
-
-
-# def _class_centers(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     min_samples: int = 2,
-#     normalize_centers: bool = False,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         device = features.device if torch.is_tensor(features) else torch.device("cpu")
-#         dtype = features.dtype if torch.is_tensor(features) else torch.float32
-#         return (
-#             torch.empty(0, 0, device=device, dtype=dtype),
-#             torch.empty(0, device=device, dtype=torch.long),
-#             torch.empty(0, device=device, dtype=dtype),
-#         )
-
-#     if features.dim() != 2:
-#         raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     if y.numel() != features.size(0):
-#         raise ValueError(f"labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-#     centers, class_ids, counts = [], [], []
-#     for cls in torch.unique(y, sorted=True):
-#         mask = y == cls
-#         n = int(mask.sum().item())
-#         if n < int(min_samples):
-#             continue
-#         c = features[mask].mean(dim=0)
-#         if normalize_centers:
-#             c = F.normalize(c, dim=0, eps=1e-6)
-#         centers.append(c)
-#         class_ids.append(cls)
-#         counts.append(torch.tensor(float(n), device=features.device, dtype=features.dtype))
-
-#     if not centers:
-#         return (
-#             torch.empty(0, features.size(1), device=features.device, dtype=features.dtype),
-#             torch.empty(0, device=features.device, dtype=torch.long),
-#             torch.empty(0, device=features.device, dtype=features.dtype),
-#         )
-
-#     return torch.stack(centers, dim=0), torch.stack(class_ids).long(), torch.stack(counts)
-
-
-# def _pairwise_center_margin_loss(centers: torch.Tensor, margin: float) -> torch.Tensor:
-#     if centers is None or not torch.is_tensor(centers) or centers.numel() == 0 or centers.size(0) < 2:
-#         return safe_zero_like(centers)
-#     dist = torch.cdist(centers, centers, p=2)
-#     eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-#     pair = dist[~eye]
-#     if pair.numel() == 0:
-#         return centers.sum() * 0.0
-#     return F.relu(float(margin) - pair).pow(2).mean()
-
-
-# def _pad_to_width(x: torch.Tensor, width: int) -> torch.Tensor:
-#     if x.size(1) == width:
-#         return x
-#     if x.size(1) > width:
-#         return x[:, :width]
-#     return F.pad(x, (0, int(width) - int(x.size(1))))
-
-
-# # -----------------------------------------------------------------------------
-# # Spectral / band profiles
-# # -----------------------------------------------------------------------------
-
-# def _spectral_derivatives(spectral_summary: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if spectral_summary.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-#     if spectral_summary.size(1) < 2:
-#         z = spectral_summary.new_zeros((spectral_summary.size(0), 1))
-#         return z, z
-#     d1 = spectral_summary[:, 1:] - spectral_summary[:, :-1]
-#     if d1.size(1) < 2:
-#         d2 = d1.new_zeros((d1.size(0), 1))
-#     else:
-#         d2 = d1[:, 1:] - d1[:, :-1]
-#     return d1, d2
-
-
-# def _spectral_profile_descriptor(spectral_summary: torch.Tensor) -> torch.Tensor:
-#     """Derivative-aware descriptor for physical spectral-shape comparison.
-
-#     Raw HSI spectra may be normalized and may contain signed values.  Direct
-#     softmax over signed spectra destroys absorption/reflectance shape.  This
-#     descriptor preserves curve shape by standardizing each spectrum and appending
-#     first/second derivative information.
-#     """
-#     if spectral_summary.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-#     s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     s = s - s.mean(dim=1, keepdim=True)
-#     s = s / s.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-#     d1, d2 = _spectral_derivatives(s)
-#     desc = torch.cat([F.normalize(s, dim=1, eps=1e-6), F.normalize(d1, dim=1, eps=1e-6), F.normalize(d2, dim=1, eps=1e-6)], dim=1)
-#     return torch.nan_to_num(desc, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-# def _band_importance_profile(band_summary: torch.Tensor) -> torch.Tensor:
-#     """Convert raw spectra or band summaries to a non-negative band profile.
-
-#     This is the correct base regularizer target for HSI: it compares where the
-#     spectrum changes/absorbs, not a hidden classifier branch.  It works for raw
-#     physical spectra and is still safe for reduced non-physical summaries.
-#     """
-#     if band_summary is None or not torch.is_tensor(band_summary):
-#         raise TypeError("band_summary must be a tensor.")
-#     if band_summary.dim() != 2:
-#         raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-#     b = torch.nan_to_num(band_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     B, S = b.shape
-#     if S <= 0:
-#         return b
-
-#     # Per-sample standardization preserves spectral shape under dataset scaling.
-#     z = b - b.mean(dim=1, keepdim=True)
-#     z = z / z.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-#     d1, d2 = _spectral_derivatives(z)
-#     d1e = _pad_to_width(d1.abs(), S)
-#     d2e = _pad_to_width(d2.abs(), S)
-#     profile = z.abs() + 0.50 * d1e + 0.25 * d2e
-#     profile = profile.clamp_min(0.0)
-#     uniform = torch.full_like(profile, 1.0 / float(max(S, 1)))
-#     denom = profile.sum(dim=1, keepdim=True)
-#     profile = torch.where(denom > 1e-8, profile / denom.clamp_min(1e-8), uniform)
-#     return torch.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-# # Backward-compatible name used by old code.
-# def _normalize_band_summary(band_summary: torch.Tensor) -> torch.Tensor:
-#     return _band_importance_profile(band_summary)
-
-
-# def _positive_cosine_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-#     a = F.normalize(a, dim=1, eps=1e-6)
-#     b = F.normalize(b, dim=1, eps=1e-6)
-#     return (a @ b.t()).clamp(0.0, 1.0)
-
-
-# # -----------------------------------------------------------------------------
-# # GICS: Geometry-Involved Class Separation
-# # -----------------------------------------------------------------------------
-
-# def base_geometry_involved_contrastive_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     key_features: Optional[torch.Tensor] = None,
-#     weight: float = 0.20,
-#     temperature: float = 0.07,
-#     same_class_positive: bool = True,
-#     class_balanced: bool = True,
-#     detach_key: bool = True,
-#     normalize: bool = True,
-#     return_parts: bool = True,
-#     **_: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Base-phase GICS on canonical projected z-space."""
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         out = {"total": z, "gics": z, "weighted_gics": z, "valid_anchors": z, "num_anchors": z, "mean_positive_count": z}
-#         return out if return_parts else z
-
-#     if features.dim() != 2:
-#         raise ValueError(f"GICS expects projected features [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "gics.features")
-
-#     zq = features
-#     explicit_key = key_features is not None and torch.is_tensor(key_features) and key_features.numel() > 0
-#     zk = key_features if explicit_key else features
-#     if zk.dim() != 2:
-#         raise ValueError(f"key_features must be [B,D], got {tuple(zk.shape)}")
-#     if zk.size(0) != zq.size(0) or zk.size(1) != zq.size(1):
-#         raise ValueError(f"key_features shape mismatch: query={tuple(zq.shape)}, key={tuple(zk.shape)}")
-#     if detach_key:
-#         zk = zk.detach()
-
-#     y = _as_1d_long(labels, device=zq.device)
-#     if y.numel() != zq.size(0):
-#         raise ValueError(f"GICS labels/features mismatch: labels={y.numel()}, features={zq.size(0)}")
-
-#     q = F.normalize(zq, dim=1, eps=1e-6) if normalize else zq
-#     k = F.normalize(zk.to(device=zq.device, dtype=zq.dtype), dim=1, eps=1e-6) if normalize else zk.to(device=zq.device, dtype=zq.dtype)
-
-#     logits = q @ k.t()
-#     logits = logits / max(float(temperature), 1e-6)
-#     logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-#     B = zq.size(0)
-#     diag = torch.eye(B, device=zq.device, dtype=torch.bool)
-#     positive = y.view(-1, 1).eq(y.view(1, -1)) if same_class_positive else diag.clone()
-
-#     if explicit_key:
-#         positive = positive | diag
-#         denom_mask = torch.ones_like(positive, dtype=torch.bool)
-#     else:
-#         positive = positive & (~diag)
-#         denom_mask = ~diag
-
-#     pos_count = positive.float().sum(dim=1)
-#     valid = pos_count > 0
-
-#     if not bool(valid.any().item()):
-#         gics = features.sum() * 0.0
-#     else:
-#         exp_logits = torch.exp(logits).masked_fill(~denom_mask, 0.0)
-#         denom = exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12)
-#         log_prob = logits - denom.log()
-#         per = -(positive.float() * log_prob).sum(dim=1) / pos_count.clamp_min(1.0)
-#         per = per[valid]
-#         yv = y[valid]
-#         if per.numel() == 0:
-#             gics = features.sum() * 0.0
-#         elif class_balanced:
-#             class_terms = []
-#             for c in torch.unique(yv, sorted=True):
-#                 cm = yv == c
-#                 if bool(cm.any().item()):
-#                     class_terms.append(per[cm].mean())
-#             gics = torch.stack(class_terms).mean() if class_terms else features.sum() * 0.0
-#         else:
-#             gics = per.mean()
-
-#     total = float(weight) * gics
-#     if not return_parts:
-#         return total
-#     return {
-#         "total": total,
-#         "gics": gics.detach(),
-#         "weighted_gics": total.detach(),
-#         "valid_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-#         "num_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-#         "mean_positive_count": pos_count[valid].float().mean().detach() if bool(valid.any().item()) else features.sum().detach() * 0.0,
-#     }
-
-
-# # Backward-compatible aliases.
-# def base_fcs_geometry_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_geometry_involved_contrastive_separation_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_hsi_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# # -----------------------------------------------------------------------------
-# # PGR: Prospective Geometry Reserve
-# # -----------------------------------------------------------------------------
-
-# def _batch_subspace_overlap_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     rank: int = 3,
-#     min_samples: int = 6,
-#     max_overlap: float = 0.50,
-#     normalize: bool = True,
-#     include_mean_overlap: bool = True,
-#     return_parts: bool = False,
-# ) -> torch.Tensor | Dict[str, torch.Tensor]:
-#     """Margin-based subspace reserve.
-
-#     The old loss minimized average overlap only.  That can look nonzero in logs
-#     while leaving a single highly-overlapping class pair that breaks incremental
-#     descriptor insertion.  This version explicitly penalizes pair overlaps above
-#     max_overlap while still reporting mean/max overlap.
-#     """
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         if return_parts:
-#             return {"total": z, "pair_count": z, "valid_class_count": z, "mean_overlap": z, "max_overlap": z}
-#         return z
-#     if features.dim() != 2:
-#         raise ValueError(f"subspace loss expects [B,D], got {tuple(features.shape)}")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-#     _, D = z.shape
-
-#     bases = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         n = int(m.sum().item())
-#         if n < int(min_samples):
-#             continue
-#         xc = z[m] - z[m].mean(dim=0, keepdim=True)
-#         r = max(1, min(int(rank), n - 1, D))
-#         try:
-#             _, s, vh = torch.linalg.svd(xc, full_matrices=False)
-#         except RuntimeError:
-#             continue
-#         if s.numel() == 0 or float(s[0].detach().abs().item()) <= 1e-8:
-#             continue
-#         keep = (s[:r] / s[0].clamp_min(1e-8)) > 1e-3
-#         if bool(keep.any().item()):
-#             bases.append(vh[:r][keep].t().contiguous())
-
-#     if len(bases) < 2:
-#         loss = features.sum() * 0.0
-#         overlaps = features.new_empty(0)
-#         pair_count = 0
-#     else:
-#         overlap_list = []
-#         for i in range(len(bases)):
-#             for j in range(i + 1, len(bases)):
-#                 Ui, Uj = bases[i], bases[j]
-#                 denom = float(max(min(Ui.size(1), Uj.size(1)), 1))
-#                 ov = (Ui.t() @ Uj).pow(2).sum() / denom
-#                 overlap_list.append(ov)
-#         overlaps = torch.stack(overlap_list) if overlap_list else features.new_empty(0)
-#         pair_count = int(overlaps.numel())
-#         if pair_count == 0:
-#             loss = features.sum() * 0.0
-#         else:
-#             margin_loss = F.relu(overlaps - float(max_overlap)).pow(2).mean()
-#             mean_loss = 0.10 * overlaps.mean() if include_mean_overlap else overlaps.sum() * 0.0
-#             loss = margin_loss + mean_loss
-
-#     if return_parts:
-#         return {
-#             "total": loss,
-#             "pair_count": torch.tensor(float(pair_count), device=features.device, dtype=features.dtype),
-#             "valid_class_count": torch.tensor(float(len(bases)), device=features.device, dtype=features.dtype),
-#             "mean_overlap": overlaps.mean().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-#             "max_overlap": overlaps.max().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-#         }
-#     return loss
-
-
-
-# def risk_aware_band_discrimination_loss(
-#     band_summary: Optional[torch.Tensor],
-#     labels: torch.Tensor,
-#     *,
-#     features: Optional[torch.Tensor] = None,
-#     min_samples: int = 3,
-#     max_band_similarity: float = 0.75,
-#     risk_center_margin: float = 1.0,
-#     risk_weight: float = 1.0,
-#     return_parts: bool = True,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Band-guided feature-geometry reserve for HSI.
-
-#     Important: raw physical spectra are *not* trainable. Therefore this loss
-#     must not try to make raw band profiles dissimilar directly.  Instead, high
-#     band similarity marks a hard class pair and increases the gradient on the
-#     learned feature geometry for that pair.
-
-#     Loss = hard_band_similarity.detach() * feature_center_conflict(features)
-
-#     This keeps band information in the architecture while preserving the main
-#     PG-RGA rule: inference and replay remain geometry-energy based.
-#     """
-#     ref = features if torch.is_tensor(features) else (band_summary if torch.is_tensor(band_summary) else labels)
-#     if band_summary is None or not torch.is_tensor(band_summary) or band_summary.numel() == 0:
-#         z = safe_zero_like(ref)
-#         out = {
-#             "total": z,
-#             "band": z,
-#             "pair_count": z,
-#             "valid_class_count": z,
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     if band_summary.dim() != 2:
-#         raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-#     y = _as_1d_long(labels, device=band_summary.device)
-#     if y.numel() != band_summary.size(0):
-#         raise ValueError(f"band labels/batch mismatch: labels={y.numel()}, band={band_summary.size(0)}")
-
-#     b = _band_importance_profile(band_summary)
-#     b_centers, class_ids, _ = _class_centers(b, y, min_samples=min_samples, normalize_centers=True)
-#     if b_centers.size(0) < 2:
-#         z = band_summary.sum() * 0.0
-#         out = {
-#             "total": z,
-#             "band": z,
-#             "pair_count": z,
-#             "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     sim = (b_centers @ b_centers.t()).clamp(0.0, 1.0)
-#     eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-#     pair_sim = sim[~eye]
-#     hard_band = F.relu(pair_sim - float(max_band_similarity)) / max(1.0 - float(max_band_similarity), 1e-6)
-#     hard_band = hard_band.detach()
-
-#     # The only trainable part is the learned feature geometry.  If features are
-#     # missing or class ids cannot be aligned, the band term reports similarity
-#     # but contributes zero gradient instead of applying a useless constant loss.
-#     if features is not None and torch.is_tensor(features) and features.numel() > 0:
-#         zf = F.normalize(features.to(device=band_summary.device, dtype=band_summary.dtype), dim=1, eps=1e-6)
-#         f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-#         if f_centers.size(0) == b_centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-#             dist = torch.cdist(f_centers, f_centers, p=2)
-#             feature_conflict = F.relu(float(risk_center_margin) - dist) / max(float(risk_center_margin), 1e-6)
-#             feature_conflict = feature_conflict[~eye]
-#             guided = hard_band * feature_conflict
-#             loss_vec = hard_band * feature_conflict.pow(2)
-#             loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-#         else:
-#             guided = torch.zeros_like(pair_sim)
-#             loss = features.sum() * 0.0
-#     else:
-#         guided = torch.zeros_like(pair_sim)
-#         loss = band_summary.sum() * 0.0
-
-#     if not return_parts:
-#         return loss
-#     return {
-#         "total": loss,
-#         "band": loss.detach(),
-#         "pair_count": torch.tensor(float(pair_sim.numel()), device=band_summary.device, dtype=band_summary.dtype),
-#         "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-#         "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-#     }
-
-
-# def prospective_geometry_reserve_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     band_summary: Optional[torch.Tensor] = None,
-#     weight: float = 0.10,
-#     compact_weight: float = 0.15,
-#     center_weight: float = 0.20,
-#     subspace_weight: float = 0.10,
-#     band_weight: float = 0.05,
-#     volume_weight: float = 0.05,
-#     center_margin: float = 1.05,
-#     min_class_samples: int = 3,
-#     subspace_min_samples: int = 6,
-#     subspace_rank: int = 3,
-#     max_band_similarity: float = 0.75,
-#     max_class_variance: float = 0.75,
-#     min_class_variance: float = 0.015,
-#     max_subspace_overlap: float = 0.50,
-#     normalize_features: bool = True,
-#     adaptive_component_weights: bool = True,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Base-phase PGR.
-
-#     Active terms:
-#       - compactness: same-class spread control
-#       - center reserve: class centers separated by margin
-#       - subspace reserve: explicit margin on tangent subspace overlap
-#       - band reserve: risky classes avoid identical spectral-band profiles
-#       - volume reserve: avoids both broad blobs and collapsed zero-volume rows
-#     """
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z0 = safe_zero_like(features)
-#         out = {
-#             "total": z0, "pgr": z0, "weighted_pgr": z0,
-#             "compact": z0, "center": z0, "subspace": z0, "band": z0, "volume": z0,
-#             "valid_class_count": z0, "unique_class_count": z0,
-#             "subspace_pair_count": z0, "band_pair_count": z0,
-#             "compact_factor": z0, "center_factor": z0, "subspace_factor": z0,
-#             "band_factor": z0, "volume_factor": z0,
-#             "subspace_mean_overlap": z0, "subspace_max_overlap": z0,
-#             "band_mean_similarity": z0, "band_max_similarity": z0,
-#         }
-#         return out if return_parts else z0
-
-#     if features.dim() != 2:
-#         raise ValueError(f"PGR expects features [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "pgr.features")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     if y.numel() != features.size(0):
-#         raise ValueError(f"PGR labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-#     # Let explicit aliases in kwargs override defaults without requiring trainer changes.
-#     if "pgr_max_subspace_overlap" in kwargs:
-#         max_subspace_overlap = float(kwargs["pgr_max_subspace_overlap"])
-#     if "subspace_overlap_max" in kwargs:
-#         max_subspace_overlap = float(kwargs["subspace_overlap_max"])
-#     if "pgr_min_class_variance" in kwargs:
-#         min_class_variance = float(kwargs["pgr_min_class_variance"])
-
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize_features else features
-
-#     compact_terms = []
-#     volume_terms = []
-#     class_vars = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         if int(m.sum().item()) < int(min_class_samples):
-#             continue
-#         xc = z[m]
-#         var = (xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean()
-#         compact_terms.append(var)
-#         class_vars.append(var.detach())
-#         broad = F.relu(var - float(max_class_variance)).pow(2)
-#         collapsed = F.relu(float(min_class_variance) - var).pow(2)
-#         volume_terms.append(broad + collapsed)
-
-#     compact = torch.stack(compact_terms).mean() if compact_terms else features.sum() * 0.0
-#     volume = torch.stack(volume_terms).mean() if volume_terms else features.sum() * 0.0
-#     valid_class_count = len(compact_terms)
-#     unique_class_count = int(torch.unique(y).numel())
-
-#     centers, _, _ = _class_centers(z, y, min_samples=min_class_samples, normalize_centers=False)
-#     center = _pairwise_center_margin_loss(centers, center_margin)
-
-#     sub_obj = _batch_subspace_overlap_loss(
-#         z,
-#         y,
-#         rank=int(subspace_rank),
-#         min_samples=int(subspace_min_samples),
-#         max_overlap=float(max_subspace_overlap),
-#         normalize=False,
-#         return_parts=True,
-#     )
-#     subspace = sub_obj["total"]
-#     subspace_pair_count = sub_obj["pair_count"]
-
-#     band_obj = risk_aware_band_discrimination_loss(
-#         band_summary,
-#         y,
-#         features=z,
-#         min_samples=int(min_class_samples),
-#         max_band_similarity=float(max_band_similarity),
-#         risk_center_margin=float(center_margin),
-#         return_parts=True,
-#     )
-#     band = band_obj["total"] if isinstance(band_obj, dict) else band_obj
-#     band_pair_count = band_obj.get("pair_count", features.sum().detach() * 0.0) if isinstance(band_obj, dict) else features.sum().detach() * 0.0
-
-#     one = torch.tensor(1.0, device=features.device, dtype=features.dtype)
-#     zero = features.sum() * 0.0
-#     if adaptive_component_weights:
-#         compact_factor = one if valid_class_count > 0 else zero
-#         volume_factor = one if valid_class_count > 0 else zero
-#         center_factor = one if int(centers.size(0)) >= 2 else zero
-#         subspace_factor = one if float(subspace_pair_count.detach().item()) > 0.0 else zero
-#         band_factor = one if float(band_pair_count.detach().item()) > 0.0 else zero
-#     else:
-#         compact_factor = center_factor = subspace_factor = band_factor = volume_factor = one
-
-#     pgr_unweighted = (
-#         float(compact_weight) * compact_factor * compact
-#         + float(center_weight) * center_factor * center
-#         + float(subspace_weight) * subspace_factor * subspace
-#         + float(band_weight) * band_factor * band
-#         + float(volume_weight) * volume_factor * volume
-#     )
-#     total = float(weight) * pgr_unweighted
-
-#     if not return_parts:
-#         return total
-#     return {
-#         "total": total,
-#         "pgr": pgr_unweighted.detach(),
-#         "weighted_pgr": total.detach(),
-#         "compact": compact.detach(),
-#         "center": center.detach(),
-#         "subspace": subspace.detach(),
-#         "band": band.detach(),
-#         "volume": volume.detach(),
-#         "valid_class_count": torch.tensor(float(valid_class_count), device=features.device, dtype=features.dtype),
-#         "unique_class_count": torch.tensor(float(unique_class_count), device=features.device, dtype=features.dtype),
-#         "subspace_pair_count": subspace_pair_count.detach(),
-#         "band_pair_count": band_pair_count.detach() if torch.is_tensor(band_pair_count) else torch.tensor(float(band_pair_count), device=features.device, dtype=features.dtype),
-#         "compact_factor": compact_factor.detach(),
-#         "center_factor": center_factor.detach(),
-#         "subspace_factor": subspace_factor.detach(),
-#         "band_factor": band_factor.detach(),
-#         "volume_factor": volume_factor.detach(),
-#         "subspace_mean_overlap": sub_obj.get("mean_overlap", zero).detach(),
-#         "subspace_max_overlap": sub_obj.get("max_overlap", zero).detach(),
-#         "band_mean_similarity": band_obj.get("mean_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_max_similarity": band_obj.get("max_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_guided_conflict_mean": band_obj.get("guided_conflict_mean", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_guided_conflict_max": band_obj.get("guided_conflict_max", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "class_variance_mean": torch.stack(class_vars).mean() if class_vars else zero.detach(),
-#     }
-
-
-# def base_prospective_geometry_reserve_loss(*args: Any, **kwargs: Any):
-#     return prospective_geometry_reserve_loss(*args, **kwargs)
-
-
-# # -----------------------------------------------------------------------------
-# # Physical spectral-shape reserve
-# # -----------------------------------------------------------------------------
-
-
-# def spectral_shape_discrimination_loss(
-#     spectral_summary: Optional[torch.Tensor],
-#     labels: torch.Tensor,
-#     *,
-#     features: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     require_physical_summary: bool = True,
-#     min_samples: int = 3,
-#     max_shape_similarity: float = 0.75,
-#     risk_center_margin: float = 1.0,
-#     risk_weight: float = 1.0,
-#     return_parts: bool = True,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Spectral-shape-guided feature-geometry reserve.
-
-#     Raw wavelength spectra are fixed metadata, not trainable outputs.  High
-#     spectral-shape similarity should therefore identify hard HSI class pairs and
-#     push their learned feature centers apart.  It should not be optimized as a
-#     standalone raw-spectrum dissimilarity objective.
-#     """
-#     ref = features if torch.is_tensor(features) else (spectral_summary if torch.is_tensor(spectral_summary) else labels)
-#     if (
-#         spectral_summary is None
-#         or not torch.is_tensor(spectral_summary)
-#         or spectral_summary.numel() == 0
-#         or (bool(require_physical_summary) and not bool(spectral_summary_is_physical))
-#     ):
-#         z = safe_zero_like(ref)
-#         out = {
-#             "total": z,
-#             "spectral_shape": z,
-#             "pair_count": z,
-#             "valid_class_count": z,
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     if s.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(s.shape)}")
-#     y = _as_1d_long(labels, device=s.device)
-#     if y.numel() != s.size(0):
-#         raise ValueError(f"spectral_summary/label mismatch: spectra={s.size(0)}, labels={y.numel()}")
-
-#     desc = _spectral_profile_descriptor(s)
-#     centers, class_ids, _ = _class_centers(desc, y, min_samples=min_samples, normalize_centers=False)
-
-#     if centers.size(0) < 2:
-#         z = s.sum() * 0.0
-#         out = {
-#             "total": z,
-#             "spectral_shape": z,
-#             "pair_count": z,
-#             "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     sim = _positive_cosine_matrix(centers, centers)
-#     eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-#     pair_sim = sim[~eye]
-#     hard_shape = F.relu(pair_sim - float(max_shape_similarity)) / max(1.0 - float(max_shape_similarity), 1e-6)
-#     hard_shape = hard_shape.detach()
-
-#     if features is not None and torch.is_tensor(features) and features.numel() > 0:
-#         zf = F.normalize(features.to(device=s.device, dtype=s.dtype), dim=1, eps=1e-6)
-#         f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-#         if f_centers.size(0) == centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-#             dist = torch.cdist(f_centers, f_centers, p=2)
-#             feature_conflict = F.relu(float(risk_center_margin) - dist)[~eye] / max(float(risk_center_margin), 1e-6)
-#             guided = hard_shape * feature_conflict
-#             loss_vec = hard_shape * feature_conflict.pow(2)
-#             loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-#         else:
-#             guided = torch.zeros_like(pair_sim)
-#             loss = features.sum() * 0.0
-#     else:
-#         guided = torch.zeros_like(pair_sim)
-#         loss = s.sum() * 0.0
-
-#     if not return_parts:
-#         return loss
-#     return {
-#         "total": loss,
-#         "spectral_shape": loss.detach(),
-#         "pair_count": torch.tensor(float(pair_sim.numel()), device=s.device, dtype=s.dtype),
-#         "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-#         "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-#         "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-#         "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-#         "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-#     }
-
-
-# # -----------------------------------------------------------------------------
-# # Low-rank GeometryBank energy used by classifier/replay/margins
-# # -----------------------------------------------------------------------------
-
-# def _canonicalize_variances(
-#     *,
-#     eigvals: Optional[torch.Tensor] = None,
-#     res_vars: Optional[torch.Tensor] = None,
-#     variances: Optional[torch.Tensor] = None,
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if variances is not None and torch.is_tensor(variances):
-#         if variances.dim() != 2 or variances.size(1) < 2:
-#             raise ValueError(f"variances must be [C,R+1], got {tuple(variances.shape)}")
-#         return variances[:, :-1], variances[:, -1]
-#     if eigvals is None or res_vars is None:
-#         raise ValueError("Either variances or eigvals+res_vars must be provided.")
-#     return eigvals, res_vars
-
-
-# def _active_rank_mask(active_ranks: Optional[torch.Tensor], C: int, R: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if active_ranks is None or not torch.is_tensor(active_ranks):
-#         ar = torch.full((C,), int(R), device=device, dtype=torch.long)
-#     else:
-#         ar = active_ranks.to(device=device).long().flatten()
-#         if ar.numel() != C:
-#             raise ValueError(f"active_ranks must have C={C} entries, got {ar.numel()}")
-#         ar = ar.clamp(min=0, max=R)
-#     idx = torch.arange(R, device=device).view(1, R)
-#     mask = (idx < ar.view(C, 1)).to(dtype=dtype)
-#     return mask, ar
-
-
-
-# def geometry_energy_matrix(
-#     features: Optional[torch.Tensor] = None,
-#     means: Optional[torch.Tensor] = None,
-#     bases: Optional[torch.Tensor] = None,
-#     variances: Optional[torch.Tensor] = None,
-#     *,
-#     bank: Optional[Mapping[str, torch.Tensor]] = None,
-#     eigvals: Optional[torch.Tensor] = None,
-#     res_vars: Optional[torch.Tensor] = None,
-#     active_ranks: Optional[torch.Tensor] = None,
-#     reliability: Optional[torch.Tensor] = None,
-#     sample_counts: Optional[torch.Tensor] = None,
-#     variance_floor: float = 1e-4,
-#     reliability_energy_weight: float = 0.03,
-#     reliability_min_clamp: float = 0.05,
-#     residual_variance_scale: float = 0.75,
-#     normalize_by_dim: bool = True,
-#     invalid_class_energy: float = _INVALID_ENERGY,
-#     use_logdet_energy: bool = True,
-#     logdet_energy_weight: float = 0.05,
-#     logdet_normalize_by_dim: bool = True,
-#     center_logdet_energy: bool = True,
-#     # accepted but intentionally inactive in PG-RGA main path
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_curve_means: Optional[torch.Tensor] = None,
-#     spectral_curve_vars: Optional[torch.Tensor] = None,
-#     spectral_curve_d1: Optional[torch.Tensor] = None,
-#     spectral_curve_d2: Optional[torch.Tensor] = None,
-#     spectral_shape_reliability: Optional[torch.Tensor] = None,
-#     use_spectral_residual_energy: bool = False,
-#     spectral_energy_weight: float = 0.0,
-#     spectral_summary_is_physical: bool = False,
-#     spectral_require_physical_summary: bool = True,
-#     return_parts: bool = False,
-#     **_: Any,
-# ) -> torch.Tensor | Dict[str, torch.Tensor]:
-#     """Low-rank GeometryBank energy used by classifier/replay/margins.
-
-#     Supports both explicit tensors and a bank mapping.  Spectral arguments are
-#     accepted only for API compatibility; PG-RGA inference remains feature-geometry
-#     energy, not spectral-branch energy.
-#     """
-#     del spectral_summary, spectral_curve_means, spectral_curve_vars, spectral_curve_d1, spectral_curve_d2, spectral_shape_reliability
-
-#     if isinstance(means, Mapping) and bank is None and bases is None:
-#         bank = means  # supports geometry_energy_matrix(features, bank=...) style through positional means
-#         means = None
-#     if bank is not None:
-#         means = bank.get("means", means)
-#         bases = bank.get("bases", bank.get("subspace_bases", bases))
-#         variances = bank.get("variances", variances)
-#         eigvals = bank.get("eigvals", bank.get("eigenvalues", eigvals))
-#         res_vars = bank.get("res_vars", bank.get("residual_variances", res_vars))
-#         active_ranks = bank.get("active_ranks", active_ranks)
-#         reliability = bank.get("reliability", reliability)
-#         sample_counts = bank.get("sample_counts", sample_counts)
-
-#     if means is None or bases is None:
-#         raise ValueError("geometry_energy_matrix requires means and bases, or a bank mapping containing them.")
-
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         device = means.device if torch.is_tensor(means) else torch.device("cpu")
-#         dtype = means.dtype if torch.is_tensor(means) else torch.float32
-#         C = int(means.size(0)) if torch.is_tensor(means) and means.dim() >= 1 else 0
-#         empty = torch.empty((0, C), device=device, dtype=dtype)
-#         if return_parts:
-#             return {"energy": empty, "feature_energy": empty, "parallel": empty, "orthogonal": empty,
-#                     "parallel_energy": empty, "residual_energy": empty, "spectral_energy": empty}
-#         return empty
-
-#     if features.dim() != 2:
-#         raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-#     if means.dim() != 2:
-#         raise ValueError(f"means must be [C,D], got {tuple(means.shape)}")
-#     if bases.dim() != 3:
-#         raise ValueError(f"bases must be [C,D,R], got {tuple(bases.shape)}")
-#     B, D = features.shape
-#     C, Dm = means.shape
-#     if Dm != D or bases.size(0) != C or bases.size(1) != D:
-#         raise ValueError(f"feature/bank shape mismatch: features={tuple(features.shape)}, means={tuple(means.shape)}, bases={tuple(bases.shape)}")
-
-#     device, dtype = features.device, features.dtype
-#     means = means.to(device=device, dtype=dtype)
-#     bases = bases.to(device=device, dtype=dtype)
-#     eig, rv = _canonicalize_variances(eigvals=eigvals, res_vars=res_vars, variances=variances)
-#     eig = eig.to(device=device, dtype=dtype)
-#     rv = rv.to(device=device, dtype=dtype).flatten()
-
-#     R = int(bases.size(2))
-#     if eig.dim() != 2 or eig.size(0) != C or eig.size(1) != R:
-#         raise ValueError(f"eigvals/variances rank mismatch: eig={tuple(eig.shape)}, C={C}, R={R}")
-#     if rv.numel() != C:
-#         raise ValueError(f"res_vars must have C={C} entries, got {rv.numel()}")
-
-#     rank_mask, ar = _active_rank_mask(active_ranks, C, R, device, dtype)
-
-#     delta = features.unsqueeze(1) - means.unsqueeze(0)
-#     coeff = torch.einsum("bcd,cdr->bcr", delta, bases)
-#     coeff_active = coeff * rank_mask.view(1, C, R)
-#     recon = torch.einsum("bcr,cdr->bcd", coeff_active, bases)
-#     residual = delta - recon
-
-#     eig_safe = eig.clamp_min(float(variance_floor))
-#     rv_safe = (rv * float(residual_variance_scale)).clamp_min(float(variance_floor))
-
-#     parallel = ((coeff_active.pow(2) / eig_safe.view(1, C, R)) * rank_mask.view(1, C, R)).sum(dim=-1)
-#     orthogonal = residual.pow(2).sum(dim=-1) / rv_safe.view(1, C)
-#     energy = parallel + orthogonal
-#     if bool(normalize_by_dim):
-#         energy = energy / float(max(D, 1))
-
-#     logdet_penalty = torch.zeros((C,), device=device, dtype=dtype)
-#     if bool(use_logdet_energy) and float(logdet_energy_weight) > 0.0:
-#         active_logdet = (eig_safe.log() * rank_mask).sum(dim=1)
-#         residual_dims = (D - ar.clamp(min=0, max=D)).to(dtype=dtype)
-#         logdet_penalty = active_logdet + residual_dims * rv_safe.log()
-#         if bool(logdet_normalize_by_dim):
-#             logdet_penalty = logdet_penalty / float(max(D, 1))
-#         if bool(center_logdet_energy):
-#             logdet_penalty = logdet_penalty - logdet_penalty.mean().detach()
-#         energy = energy + float(logdet_energy_weight) * logdet_penalty.view(1, C)
-
-#     reliability_penalty = torch.zeros((C,), device=device, dtype=dtype)
-#     if reliability is not None and torch.is_tensor(reliability) and float(reliability_energy_weight) > 0.0:
-#         rel = torch.nan_to_num(reliability.to(device=device, dtype=dtype).flatten(), nan=float(reliability_min_clamp), posinf=1.0, neginf=float(reliability_min_clamp))
-#         if rel.numel() != C:
-#             raise ValueError(f"reliability must have C={C} entries, got {rel.numel()}")
-#         rel = rel.clamp(float(reliability_min_clamp), 1.0)
-#         reliability_penalty = -rel.log()
-#         reliability_penalty = reliability_penalty - reliability_penalty.mean().detach()
-#         energy = energy + float(reliability_energy_weight) * reliability_penalty.view(1, C)
-
-#     spectral_energy = torch.zeros_like(energy)
-#     if bool(use_spectral_residual_energy) and float(spectral_energy_weight) > 0.0:
-#         if bool(spectral_require_physical_summary) and not bool(spectral_summary_is_physical):
-#             spectral_energy = torch.zeros_like(energy)
-#         else:
-#             spectral_energy = torch.zeros_like(energy)
-
-#     energy = energy + spectral_energy
-
-#     # Mask invalid/uninitialized classes so stale future rows can never win.
-#     valid_class = torch.ones((C,), device=device, dtype=torch.bool)
-#     if sample_counts is not None and torch.is_tensor(sample_counts):
-#         sc = sample_counts.to(device=device).flatten()
-#         if sc.numel() == C:
-#             valid_class = sc > 0
-#     # A valid row with active_rank == 0 can still score through pure residual energy.
-#     # Do not mask tiny/low-rank classes just because their tangent rank is empty.
-#     valid_class = valid_class & (ar >= 0)
-#     if bool((~valid_class).any().item()):
-#         energy = energy.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-#         parallel = parallel.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-#         orthogonal = orthogonal.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-
-#     energy = torch.nan_to_num(energy, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0)
-
-#     if not return_parts:
-#         return energy
-#     return {
-#         "energy": energy,
-#         "feature_energy": energy,
-#         "parallel": torch.nan_to_num(parallel, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "orthogonal": torch.nan_to_num(orthogonal, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "parallel_energy": torch.nan_to_num(parallel, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "residual_energy": torch.nan_to_num(orthogonal, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "logdet_penalty": logdet_penalty,
-#         "reliability_penalty": reliability_penalty,
-#         "spectral_energy": spectral_energy,
-#         "active_ranks": ar,
-#         "rank_mask": rank_mask,
-#         "valid_class_mask": valid_class,
-#     }
-
-
-
-# # -----------------------------------------------------------------------------
-# # Phase-consistent energy-margin helpers
-# # -----------------------------------------------------------------------------
-
-# def _energy_to_logits(
-#     energy: torch.Tensor,
-#     *,
-#     logit_scale: float = 8.0,
-#     center_per_sample: bool = True,
-#     clip: float = 50.0,
-# ) -> torch.Tensor:
-#     """Convert lower-is-better energy to CE logits without changing class order."""
-#     if energy is None or not torch.is_tensor(energy):
-#         raise TypeError("energy must be a tensor.")
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,C], got {tuple(energy.shape)}")
-#     e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-#     if bool(center_per_sample) and e.numel() > 0:
-#         finite = torch.isfinite(e)
-#         row_ref = torch.where(finite, e, torch.zeros_like(e)).mean(dim=1, keepdim=True).detach()
-#         e = e - row_ref
-#     logits = -float(logit_scale) * e
-#     if float(clip) > 0.0:
-#         logits = logits.clamp(-float(clip), float(clip))
-#     return torch.nan_to_num(logits, nan=-float(clip), posinf=float(clip), neginf=-float(clip))
-
-
-# def _ce_from_logits(
-#     logits: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     label_smoothing: float = 0.0,
-#     clip: float = 50.0,
-# ) -> torch.Tensor:
-#     if logits is None or not torch.is_tensor(logits) or logits.numel() == 0:
-#         return safe_zero_like(labels if torch.is_tensor(labels) else None)
-#     if logits.dim() != 2:
-#         raise RuntimeError(f"logits must be [B,C], got {tuple(logits.shape)}")
-#     y = labels.to(device=logits.device).long().flatten()
-#     if y.numel() != logits.size(0):
-#         raise RuntimeError(f"CE labels/logits mismatch: labels={y.numel()}, logits={logits.size(0)}")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= logits.size(1)):
-#         raise RuntimeError(
-#             f"CE labels outside logit range: [{int(y.min().item())},{int(y.max().item())}] vs width={logits.size(1)}"
-#         )
-#     return F.cross_entropy(logits.clamp(-float(clip), float(clip)), y, label_smoothing=float(label_smoothing))
-
-
-# def _energy_margin_parts(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     margin: float = 0.25,
-# ) -> Dict[str, torch.Tensor]:
-#     ref = energy if torch.is_tensor(energy) else labels
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         z = safe_zero_like(ref)
-#         return {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach(), "true_energy": z.detach(), "nearest_wrong_energy": z.detach()}
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,C], got {tuple(energy.shape)}")
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= energy.size(1)):
-#         raise RuntimeError("labels outside local energy range")
-#     e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-#     true_e = e.gather(1, y.view(-1, 1)).squeeze(1)
-#     true_mask = torch.zeros_like(e, dtype=torch.bool)
-#     true_mask.scatter_(1, y.view(-1, 1), True)
-#     nearest_wrong = e.masked_fill(true_mask, float("inf")).min(dim=1).values
-#     gap = nearest_wrong - true_e
-#     loss_vec = F.relu(float(margin) - gap)
-#     finite = torch.isfinite(loss_vec)
-#     loss = loss_vec[finite].mean() if bool(finite.any().item()) else e.sum() * 0.0
-#     return {
-#         "total": loss,
-#         "violation_rate": (gap < float(margin)).float().mean().detach() if gap.numel() else e.sum().detach() * 0.0,
-#         "mean_gap": gap[torch.isfinite(gap)].mean().detach() if bool(torch.isfinite(gap).any().item()) else e.sum().detach() * 0.0,
-#         "true_energy": true_e.detach().mean() if true_e.numel() else e.sum().detach() * 0.0,
-#         "nearest_wrong_energy": nearest_wrong[torch.isfinite(nearest_wrong)].detach().mean() if bool(torch.isfinite(nearest_wrong).any().item()) else e.sum().detach() * 0.0,
-#     }
-
-
-# def _old_new_invasion_parts(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     old_class_count: int,
-#     margin: float = 0.25,
-# ) -> Dict[str, torch.Tensor]:
-#     ref = energy if torch.is_tensor(energy) else labels
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         z = safe_zero_like(ref)
-#         return {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach()}
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,C], got {tuple(energy.shape)}")
-#     C = int(energy.size(1))
-#     old = int(max(0, min(int(old_class_count), C)))
-#     if old <= 0 or old >= C:
-#         z = energy.sum() * 0.0
-#         return {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach()}
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= C):
-#         raise RuntimeError("labels outside local energy range")
-#     e = torch.nan_to_num(energy.float(), nan=float(_INVALID_ENERGY), posinf=float(_INVALID_ENERGY), neginf=0.0)
-#     true_e = e.gather(1, y.view(-1, 1)).squeeze(1)
-#     old_min = e[:, :old].min(dim=1).values
-#     new_min = e[:, old:].min(dim=1).values
-#     is_old = y < old
-#     opposite = torch.where(is_old, new_min, old_min)
-#     gap = opposite - true_e
-#     loss_vec = F.relu(float(margin) - gap)
-#     finite = torch.isfinite(loss_vec)
-#     loss = loss_vec[finite].mean() if bool(finite.any().item()) else e.sum() * 0.0
-#     return {
-#         "total": loss,
-#         "violation_rate": (gap < float(margin)).float().mean().detach() if gap.numel() else e.sum().detach() * 0.0,
-#         "mean_gap": gap[torch.isfinite(gap)].mean().detach() if bool(torch.isfinite(gap).any().item()) else e.sum().detach() * 0.0,
-#     }
-
-
-# def base_local_geometry_energy_margin_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     weight: float = 0.15,
-#     margin: float = 0.25,
-#     min_samples: int = 3,
-#     variance_floor: float = 5e-4,
-#     normalize_features: bool = True,
-#     return_parts: bool = True,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Batch-local approximation of the GeometryBank energy margin for phase 0."""
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         out = {"total": z, "raw": z, "violation_rate": z.detach(), "mean_gap": z.detach(), "valid_anchor_count": z.detach(), "valid_class_count": z.detach()}
-#         return out if return_parts else z
-#     if features.dim() != 2:
-#         raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-#     y = _as_1d_long(labels, device=features.device)
-#     if y.numel() != features.size(0):
-#         raise ValueError(f"labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize_features else features
-#     _, D = z.shape
-#     centers, class_ids, _ = _class_centers(z, y, min_samples=int(min_samples), normalize_centers=False)
-#     if centers.size(0) < 2:
-#         zero = features.sum() * 0.0
-#         out = {
-#             "total": zero, "raw": zero.detach(), "violation_rate": zero.detach(), "mean_gap": zero.detach(),
-#             "valid_anchor_count": zero.detach(),
-#             "valid_class_count": torch.tensor(float(centers.size(0)), device=features.device, dtype=features.dtype),
-#         }
-#         return out if return_parts else zero
-#     local = torch.full_like(y, -1)
-#     for j, cls in enumerate(class_ids.detach().cpu().tolist()):
-#         local[y == int(cls)] = int(j)
-#     valid_anchor = local >= 0
-#     if not bool(valid_anchor.any().item()):
-#         zero = features.sum() * 0.0
-#         out = {"total": zero, "raw": zero.detach(), "violation_rate": zero.detach(), "mean_gap": zero.detach(), "valid_anchor_count": zero.detach(), "valid_class_count": zero.detach()}
-#         return out if return_parts else zero
-#     class_vars = []
-#     for j, cls in enumerate(class_ids.detach().cpu().tolist()):
-#         m = y == int(cls)
-#         zj = z[m]
-#         cj = centers[j:j + 1]
-#         var_j = (zj - cj).pow(2).sum(dim=1).mean() / float(max(D, 1))
-#         class_vars.append(var_j.clamp_min(float(variance_floor)))
-#     class_vars = torch.stack(class_vars).to(device=features.device, dtype=features.dtype)
-#     zv = z[valid_anchor]
-#     yv = local[valid_anchor]
-#     dist2 = torch.cdist(zv, centers, p=2).pow(2) / float(max(D, 1))
-#     energy = dist2 / class_vars.view(1, -1).clamp_min(float(variance_floor))
-#     parts = _energy_margin_parts(energy, yv, margin=float(margin))
-#     raw = parts["total"]
-#     total = float(weight) * raw
-#     out = {
-#         "total": total,
-#         "raw": raw.detach(),
-#         "violation_rate": parts["violation_rate"].detach(),
-#         "mean_gap": parts["mean_gap"].detach(),
-#         "valid_anchor_count": torch.tensor(float(valid_anchor.sum().item()), device=features.device, dtype=features.dtype),
-#         "valid_class_count": torch.tensor(float(centers.size(0)), device=features.device, dtype=features.dtype),
-#     }
-#     return out if return_parts else total
-
-
-# def incremental_geometry_training_loss(
-#     *,
-#     labels: torch.Tensor,
-#     logits: Optional[torch.Tensor] = None,
-#     energy: Optional[torch.Tensor] = None,
-#     features: Optional[torch.Tensor] = None,
-#     bank: Optional[Mapping[str, torch.Tensor]] = None,
-#     old_class_count: int = 0,
-#     ce_weight: float = 1.0,
-#     joint_old_new_ce_weight: Optional[float] = None,
-#     geometry_energy_margin_weight: float = 0.30,
-#     geometry_energy_margin: float = 0.30,
-#     old_new_invasion_weight: float = 0.50,
-#     old_new_geometry_margin: float = 0.35,
-#     label_smoothing: float = 0.0,
-#     logit_scale: float = 8.0,
-#     ce_logit_clip: float = 50.0,
-#     variance_floor: float = 5e-4,
-#     residual_variance_scale: float = 0.75,
-#     reliability_energy_weight: float = 0.03,
-#     normalize_by_dim: bool = True,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Phase>=1 objective using the same GeometryBank energy as the classifier."""
-#     ref = energy if torch.is_tensor(energy) else (logits if torch.is_tensor(logits) else features)
-#     z = safe_zero_like(ref)
-#     if energy is None and torch.is_tensor(features) and bank is not None:
-#         energy = geometry_energy_matrix(
-#             features,
-#             bank=bank,
-#             variance_floor=float(variance_floor),
-#             residual_variance_scale=float(residual_variance_scale),
-#             reliability_energy_weight=float(reliability_energy_weight),
-#             normalize_by_dim=bool(normalize_by_dim),
-#             return_parts=False,
-#             **kwargs,
-#         )
-#     if logits is None and torch.is_tensor(energy):
-#         logits = _energy_to_logits(energy, logit_scale=float(logit_scale), clip=float(ce_logit_clip))
-#     ce_w = float(joint_old_new_ce_weight) if joint_old_new_ce_weight is not None else float(ce_weight)
-#     ce = _ce_from_logits(logits, labels, label_smoothing=float(label_smoothing), clip=float(ce_logit_clip)) if torch.is_tensor(logits) else z
-#     if not torch.is_tensor(energy) and torch.is_tensor(logits):
-#         energy = -logits.float() / max(float(logit_scale), 1e-6)
-#     margin_parts = _energy_margin_parts(energy, labels, margin=float(geometry_energy_margin)) if torch.is_tensor(energy) else {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach()}
-#     invasion_parts = _old_new_invasion_parts(energy, labels, old_class_count=int(old_class_count), margin=float(old_new_geometry_margin)) if torch.is_tensor(energy) else {"total": z, "violation_rate": z.detach(), "mean_gap": z.detach()}
-#     energy_margin_total = _scalar(margin_parts.get("total", z), ref)
-#     invasion_total = _scalar(invasion_parts.get("total", z), ref)
-#     total = ce_w * ce + float(geometry_energy_margin_weight) * energy_margin_total + float(old_new_invasion_weight) * invasion_total
-#     if not return_parts:
-#         return total
-#     return {
-#         "total": total,
-#         "ce": ce.detach(),
-#         "incremental_ce": ce.detach(),
-#         "geometry_energy_margin": energy_margin_total.detach(),
-#         "old_new_invasion": invasion_total.detach(),
-#         "energy_margin_violation": _scalar(margin_parts.get("violation_rate", z), ref).detach(),
-#         "energy_margin_gap": _scalar(margin_parts.get("mean_gap", z), ref).detach(),
-#         "old_new_invasion_violation": _scalar(invasion_parts.get("violation_rate", z), ref).detach(),
-#         "old_new_invasion_gap": _scalar(invasion_parts.get("mean_gap", z), ref).detach(),
-#         "phase_is_base": torch.tensor(0.0, device=total.device, dtype=total.dtype),
-#         "phase_is_incremental": torch.tensor(1.0, device=total.device, dtype=total.dtype),
-#         "rank": energy_margin_total.detach(),
-#         "admission": invasion_total.detach(),
-#         "subspace": z.detach(),
-#         "volume": z.detach(),
-#         "trust": z.detach(),
-#         "violation_rate": _scalar(margin_parts.get("violation_rate", z), ref).detach(),
-#     }
-
-
-# # -----------------------------------------------------------------------------
-# # Unified base objective
-# # -----------------------------------------------------------------------------
-
-# def base_geometry_preparation_loss(
-#     *,
-#     logits: Optional[torch.Tensor] = None,
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     key_features: Optional[torch.Tensor] = None,
-#     band_summary: Optional[torch.Tensor] = None,
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     ce_weight: float = 0.0,
-#     base_geometry_weight: float = 1.0,
-#     label_smoothing: float = 0.0,
-#     # GICS
-#     gics_weight: float = 0.20,
-#     gics_temperature: float = 0.07,
-#     # PGR
-#     pgr_weight: float = 0.10,
-#     pgr_compact_weight: float = 0.15,
-#     pgr_center_weight: float = 0.20,
-#     pgr_subspace_weight: float = 0.10,
-#     pgr_band_weight: float = 0.05,
-#     pgr_volume_weight: float = 0.05,
-#     pgr_center_margin: float = 1.05,
-#     pgr_max_band_similarity: float = 0.75,
-#     pgr_max_class_variance: float = 0.75,
-#     pgr_min_class_variance: float = 0.015,
-#     pgr_max_subspace_overlap: float = 0.50,
-#     subspace_rank: int = 3,
-#     min_class_samples: int = 3,
-#     subspace_min_samples: int = 6,
-#     # spectral shape
-#     spectral_shape_weight: float = 0.05,
-#     max_spectral_shape_similarity: float = 0.75,
-#     spectral_shape_risk_weight: float = 1.0,
-#     require_physical_summary: bool = True,
-#     # base energy handoff
-#     base_energy_margin_weight: float = 0.15,
-#     base_energy_margin: float = 0.25,
-#     base_energy_variance_floor: float = 5e-4,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Single active base-phase regularizer.
-
-#     BasePhaseTrainer computes balanced CE separately, so ce_weight defaults to
-#     0.0.  The returned 'total' remains differentiable and must be used for SRPGR.
-#     """
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         out = {
-#             "total": z, "ce": z, "base_geometry": z,
-#             "base_gics": z, "base_gics_anchors": z, "base_gics_pos": z,
-#             "base_pgr": z, "base_compact": z, "base_center": z,
-#             "base_subspace": z, "base_band": z, "base_volume": z,
-#             "base_spectral_shape": z, "base_spectral_shape_raw": z,
-#             "base_spectral_shape_mean_similarity": z, "base_spectral_shape_pair_count": z,
-#             "base_spectral_shape_active": z,
-#             "base_energy_margin": z, "base_energy_margin_weighted": z,
-#             "base_energy_margin_violation": z, "base_energy_margin_gap": z,
-#         }
-#         return out if return_parts else z
-
-#     if features.dim() != 2:
-#         raise ValueError(f"base features must be [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "base.features")
-
-#     labels = _as_1d_long(labels, device=features.device)
-#     if labels.numel() != features.size(0):
-#         raise ValueError(f"base labels/features mismatch: labels={labels.numel()}, features={features.size(0)}")
-
-#     ce = safe_zero_like(features)
-#     if ce_weight > 0.0:
-#         if logits is None or not torch.is_tensor(logits):
-#             raise ValueError("logits are required when ce_weight > 0.")
-#         if logits.dim() != 2 or logits.size(0) != labels.numel():
-#             raise ValueError(f"logits must be [B,C] aligned with labels, got {tuple(logits.shape)}")
-#         ce = F.cross_entropy(logits, labels, label_smoothing=float(label_smoothing))
-
-#     # If physical spectra are present, they are the correct band reserve input.
-#     # This avoids PCA-30 band profiles competing with raw-200 spectral descriptors.
-#     band_for_pgr = band_summary
-#     if spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0 and bool(spectral_summary_is_physical):
-#         band_for_pgr = spectral_summary
-
-#     gics = base_geometry_involved_contrastive_loss(
-#         features,
-#         labels,
-#         key_features=key_features,
-#         weight=float(gics_weight),
-#         temperature=float(gics_temperature),
-#         return_parts=True,
-#     )
-
-#     pgr = prospective_geometry_reserve_loss(
-#         features,
-#         labels,
-#         band_summary=band_for_pgr,
-#         weight=float(pgr_weight),
-#         compact_weight=float(pgr_compact_weight),
-#         center_weight=float(pgr_center_weight),
-#         subspace_weight=float(pgr_subspace_weight),
-#         band_weight=float(pgr_band_weight),
-#         volume_weight=float(pgr_volume_weight),
-#         center_margin=float(pgr_center_margin),
-#         min_class_samples=int(min_class_samples),
-#         subspace_min_samples=int(subspace_min_samples),
-#         subspace_rank=int(subspace_rank),
-#         max_band_similarity=float(pgr_max_band_similarity),
-#         max_class_variance=float(pgr_max_class_variance),
-#         min_class_variance=float(pgr_min_class_variance),
-#         max_subspace_overlap=float(kwargs.get("subspace_overlap_max", pgr_max_subspace_overlap)),
-#         return_parts=True,
-#     )
-
-#     shape_raw = spectral_shape_discrimination_loss(
-#         spectral_summary,
-#         labels,
-#         features=features,
-#         spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#         require_physical_summary=bool(require_physical_summary),
-#         min_samples=int(min_class_samples),
-#         max_shape_similarity=float(max_spectral_shape_similarity),
-#         risk_center_margin=float(pgr_center_margin),
-#         risk_weight=float(spectral_shape_risk_weight),
-#         return_parts=True,
-#     )
-#     shape_total = float(spectral_shape_weight) * _scalar(shape_raw.get("total", safe_zero_like(features)), features)
-
-#     energy_margin = base_local_geometry_energy_margin_loss(
-#         features,
-#         labels,
-#         weight=float(base_energy_margin_weight),
-#         margin=float(base_energy_margin),
-#         min_samples=int(min_class_samples),
-#         variance_floor=float(kwargs.get("geom_var_floor", kwargs.get("variance_floor", base_energy_variance_floor))),
-#         normalize_features=True,
-#         return_parts=True,
-#     )
-
-#     gics_total = _scalar(gics.get("total", safe_zero_like(features)), features)
-#     pgr_total = _scalar(pgr.get("total", safe_zero_like(features)), features)
-#     energy_margin_total = _scalar(energy_margin.get("total", safe_zero_like(features)), features)
-#     base_geometry = float(base_geometry_weight) * (gics_total + pgr_total + shape_total + energy_margin_total)
-#     total = float(ce_weight) * ce + base_geometry
-
-#     if not return_parts:
-#         return total
-
-#     spectral_active = bool(spectral_summary_is_physical) and spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0
-
-#     return {
-#         "total": total,
-#         "ce": ce.detach(),
-#         # Keep differentiable value for code that still uses this key; logs can detach later.
-#         "base_geometry": base_geometry,
-
-#         "base_gics": _scalar(gics.get("gics", safe_zero_like(features)), features).detach(),
-#         "base_gics_weighted": gics_total.detach(),
-#         "base_gics_anchors": _scalar(gics.get("valid_anchors", safe_zero_like(features)), features).detach(),
-#         "base_gics_pos": _scalar(gics.get("mean_positive_count", safe_zero_like(features)), features).detach(),
-
-#         "base_pgr": _scalar(pgr.get("pgr", safe_zero_like(features)), features).detach(),
-#         "base_pgr_weighted": pgr_total.detach(),
-#         "base_compact": _scalar(pgr.get("compact", safe_zero_like(features)), features).detach(),
-#         "base_center": _scalar(pgr.get("center", safe_zero_like(features)), features).detach(),
-#         "base_subspace": _scalar(pgr.get("subspace", safe_zero_like(features)), features).detach(),
-#         "base_band": _scalar(pgr.get("band", safe_zero_like(features)), features).detach(),
-#         "base_volume": _scalar(pgr.get("volume", safe_zero_like(features)), features).detach(),
-
-#         "base_spectral_shape": shape_total.detach(),
-#         "base_spectral_shape_raw": _scalar(shape_raw.get("total", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_mean_similarity": _scalar(shape_raw.get("mean_similarity", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_max_similarity": _scalar(shape_raw.get("max_similarity", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_pair_count": _scalar(shape_raw.get("pair_count", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_active": torch.tensor(float(spectral_active), device=features.device, dtype=features.dtype),
-
-#         "base_energy_margin": _scalar(energy_margin.get("raw", safe_zero_like(features)), features).detach(),
-#         "base_energy_margin_weighted": energy_margin_total.detach(),
-#         "base_energy_margin_violation": _scalar(energy_margin.get("violation_rate", safe_zero_like(features)), features).detach(),
-#         "base_energy_margin_gap": _scalar(energy_margin.get("mean_gap", safe_zero_like(features)), features).detach(),
-
-#         "base_pgr_valid_class_count": _scalar(pgr.get("valid_class_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_subspace_pair_count": _scalar(pgr.get("subspace_pair_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_pair_count": _scalar(pgr.get("band_pair_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_volume_factor": _scalar(pgr.get("volume_factor", safe_zero_like(features)), features).detach(),
-#         "base_pgr_subspace_max_overlap": _scalar(pgr.get("subspace_max_overlap", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_max_similarity": _scalar(pgr.get("band_max_similarity", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_guided_conflict_mean": _scalar(pgr.get("band_guided_conflict_mean", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_guided_conflict_max": _scalar(pgr.get("band_guided_conflict_max", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_guided_conflict_mean": _scalar(shape_raw.get("guided_conflict_mean", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_guided_conflict_max": _scalar(shape_raw.get("guided_conflict_max", safe_zero_like(features)), features).detach(),
-#     }
-
-
-# def unified_spectral_geometry_loss(
-#     *,
-#     phase: str,
-#     labels: torch.Tensor,
-#     logits: Optional[torch.Tensor] = None,
-#     energy: Optional[torch.Tensor] = None,
-#     features: Optional[torch.Tensor] = None,
-#     key_features: Optional[torch.Tensor] = None,
-#     band_summary: Optional[torch.Tensor] = None,
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     bank: Optional[Mapping[str, torch.Tensor]] = None,
-#     old_class_count: int = 0,
-#     ce_weight: Optional[float] = None,
-#     joint_old_new_ce_weight: Optional[float] = None,
-#     geometry_energy_margin_weight: float = 0.30,
-#     geometry_energy_margin: float = 0.30,
-#     old_new_invasion_weight: float = 0.50,
-#     old_new_geometry_margin: float = 0.35,
-#     logit_scale: float = 8.0,
-#     label_smoothing: float = 0.0,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Public phase-consistent loss entry for PG-RGA / NECIL-HSI."""
-#     p = str(phase).strip().lower()
-#     if p in {"base", "phase0", "phase_0", "0"}:
-#         return base_geometry_preparation_loss(
-#             logits=logits,
-#             features=features,
-#             labels=labels,
-#             key_features=key_features,
-#             band_summary=band_summary,
-#             spectral_summary=spectral_summary,
-#             spectral_summary_is_physical=spectral_summary_is_physical,
-#             ce_weight=float(0.0 if ce_weight is None else ce_weight),
-#             label_smoothing=float(label_smoothing),
-#             return_parts=return_parts,
-#             **kwargs,
-#         )
-#     if p in {"incremental", "inc", "phase_inc", "phase1", "phase_1", "1", "2", "3", "4", "5"} or p.startswith("phase"):
-#         return incremental_geometry_training_loss(
-#             labels=labels,
-#             logits=logits,
-#             energy=energy,
-#             features=features,
-#             bank=bank,
-#             old_class_count=int(old_class_count),
-#             ce_weight=float(1.0 if ce_weight is None else ce_weight),
-#             joint_old_new_ce_weight=joint_old_new_ce_weight,
-#             geometry_energy_margin_weight=float(geometry_energy_margin_weight),
-#             geometry_energy_margin=float(geometry_energy_margin),
-#             old_new_invasion_weight=float(old_new_invasion_weight),
-#             old_new_geometry_margin=float(old_new_geometry_margin),
-#             logit_scale=float(logit_scale),
-#             label_smoothing=float(label_smoothing),
-#             return_parts=return_parts,
-#             **kwargs,
-#         )
-#     raise RuntimeError(f"Unsupported phase={phase!r}. Use 'base' or 'incremental'.")
-
-
-# class UnifiedSpectralGeometryLoss:
-#     """Thin callable wrapper for compatibility with older code."""
-
-#     def __init__(self, **defaults: Any) -> None:
-#         self.defaults = dict(defaults)
-
-#     def __call__(self, **kwargs: Any):
-#         merged = dict(self.defaults)
-#         merged.update(kwargs)
-#         return unified_spectral_geometry_loss(**merged)
-
-
-# # -----------------------------------------------------------------------------
-# # Incremental margin losses used by PG-RGA
-# # -----------------------------------------------------------------------------
-
-# def geometry_energy_margin_loss(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     margin: float = 0.25,
-#     valid_mask: Optional[torch.Tensor] = None,
-# ) -> torch.Tensor:
-#     del valid_mask
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         return safe_zero_like(labels if torch.is_tensor(labels) else None)
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,S], got {tuple(energy.shape)}")
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= energy.size(1)):
-#         raise RuntimeError("labels outside local energy range")
-#     true_e = energy.gather(1, y.view(-1, 1)).squeeze(1)
-#     true_mask = torch.zeros_like(energy, dtype=torch.bool).scatter(1, y.view(-1, 1), True)
-#     nearest_wrong = energy.masked_fill(true_mask, float("inf")).min(dim=1).values
-#     loss = F.relu(true_e + float(margin) - nearest_wrong)
-#     finite = torch.isfinite(loss)
-#     return loss[finite].mean() if bool(finite.any().item()) else energy.sum() * 0.0
-
-
-# def old_new_invasion_loss(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     old_class_count: int,
-#     margin: float = 0.25,
-#     valid_mask: Optional[torch.Tensor] = None,
-# ) -> torch.Tensor:
-#     del valid_mask
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         return safe_zero_like(labels if torch.is_tensor(labels) else None)
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,S], got {tuple(energy.shape)}")
-#     C = int(energy.size(1))
-#     old = int(max(0, min(int(old_class_count), C)))
-#     if old <= 0 or old >= C:
-#         return energy.sum() * 0.0
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= C):
-#         raise RuntimeError("labels outside local energy range")
-#     true_e = energy.gather(1, y.view(-1, 1)).squeeze(1)
-#     old_min = energy[:, :old].min(dim=1).values
-#     new_min = energy[:, old:].min(dim=1).values
-#     is_old = y < old
-#     opposite = torch.where(is_old, new_min, old_min)
-#     loss = F.relu(true_e + float(margin) - opposite)
-#     finite = torch.isfinite(loss)
-#     return loss[finite].mean() if bool(finite.any().item()) else energy.sum() * 0.0
-
-
-# # -----------------------------------------------------------------------------
-# # Base diagnostics
-# # -----------------------------------------------------------------------------
-
-# @torch.no_grad()
-# def base_center_overlap_diagnostics(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     normalize: bool = True,
-#     min_samples: int = 2,
-# ) -> Dict[str, torch.Tensor]:
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         return {"compact": z, "mean_center_margin": z, "min_center_margin": z, "num_classes": z}
-
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-#     y = _as_1d_long(labels, device=z.device)
-#     centers, _, _ = _class_centers(z, y, min_samples=min_samples)
-
-#     compact_terms = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         if int(m.sum().item()) >= int(min_samples):
-#             xc = z[m]
-#             compact_terms.append((xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean())
-#     compact = torch.stack(compact_terms).mean() if compact_terms else z.sum() * 0.0
-
-#     if centers.size(0) < 2:
-#         mean_margin = z.sum() * 0.0
-#         min_margin = z.sum() * 0.0
-#     else:
-#         dist = torch.cdist(centers, centers, p=2)
-#         eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-#         pair = dist[~eye]
-#         mean_margin = pair.mean()
-#         min_margin = pair.min()
-
-#     return {
-#         "compact": compact.detach(),
-#         "mean_center_margin": mean_margin.detach(),
-#         "min_center_margin": min_margin.detach(),
-#         "num_classes": torch.tensor(float(centers.size(0)), device=z.device, dtype=z.dtype),
-#     }
-
-
-# @torch.no_grad()
-# def base_gics_diagnostics(features: torch.Tensor, labels: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#     out = base_geometry_involved_contrastive_loss(features, labels, weight=1.0, return_parts=True, **kwargs)
-#     return {
-#         "gics": out["gics"].detach(),
-#         "valid_anchors": out["valid_anchors"].detach(),
-#         "positive_pairs": out["mean_positive_count"].detach(),
-#     }
-
-
-# def base_supcon_diagnostics(*args: Any, **kwargs: Any):
-#     return base_gics_diagnostics(*args, **kwargs)
-
-
-# # -----------------------------------------------------------------------------
-# # Disabled legacy boundary helper
-# # -----------------------------------------------------------------------------
-
-# def sample_boundary_geometry_features(*args: Any, **kwargs: Any):
-#     raise RuntimeError(
-#         "sample_boundary_geometry_features is not part of  main path. "
-#         "Use GeometryBank synthetic replay, not boundary replay."
-#     )
+def base_geometry_objective(
+    query_energy: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    query_targets_global: Tensor,
+    *,
+    pair_risk: Optional[Tensor] = None,
+    base_margin: float = 0.50,
+    risk_strength: float = 0.50,
+    temperature: float = 0.50,
+    maximum_margin: Optional[float] = None,
+    class_balanced: bool = True,
+    return_parts: bool = True,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Cross-fitted base geometry objective on query samples.
+
+    Support purity belongs in detached support-row fitting. Query samples are
+    intentionally unweighted so difficult boundary pixels retain full gradient.
+    """
+    return risk_guided_all_rival_geometry_loss(
+        query_energy,
+        class_ids,
+        query_targets_global,
+        pair_risk=pair_risk,
+        base_margin=base_margin,
+        risk_strength=risk_strength,
+        temperature=temperature,
+        maximum_margin=maximum_margin,
+        sample_weights=None,
+        class_balanced=class_balanced,
+        return_parts=return_parts,
+    )
+
+
+def base_training_objective(
+    base_logits: Tensor,
+    base_targets_global: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    *,
+    query_energy: Optional[Tensor] = None,
+    query_targets_global: Optional[Tensor] = None,
+    pair_risk: Optional[Tensor] = None,
+    geometry_weight: float = 0.0,
+    base_margin: float = 0.50,
+    risk_strength: float = 0.50,
+    geometry_temperature: float = 0.50,
+    maximum_margin: Optional[float] = None,
+    label_smoothing: float = 0.0,
+    class_balanced: bool = True,
+    return_parts: bool = True,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Base objective with an explicit geometry-ramp weight.
+
+    During warm-up, set ``geometry_weight=0`` and omit query energy.
+    During geometry shaping, provide cross-fitted query energy and ramp
+    ``geometry_weight`` from a small value toward one.
+    """
+    if (query_energy is None) != (query_targets_global is None):
+        raise ValueError(
+            "query_energy and query_targets_global must be provided together"
+        )
+    geometry_gain = _nonnegative(
+        geometry_weight,
+        name="geometry_weight",
+    )
+    if geometry_gain > 0.0 and query_energy is None:
+        raise ValueError(
+            "query_energy is required when geometry_weight > 0"
+        )
+
+    ce = class_balanced_cross_entropy(
+        base_logits,
+        base_targets_global,
+        class_ids,
+        label_smoothing=label_smoothing,
+        class_balanced=class_balanced,
+        return_parts=True,
+    )
+    assert isinstance(ce, dict)
+
+    geometry_total = base_logits.sum() * 0.0
+    geometry_parts: Optional[Dict[str, Tensor]] = None
+    if query_energy is not None:
+        geometry_parts = base_geometry_objective(
+            query_energy,
+            class_ids,
+            query_targets_global,
+            pair_risk=pair_risk,
+            base_margin=base_margin,
+            risk_strength=risk_strength,
+            temperature=geometry_temperature,
+            maximum_margin=maximum_margin,
+            class_balanced=class_balanced,
+            return_parts=True,
+        )
+        assert isinstance(geometry_parts, dict)
+        geometry_total = geometry_parts["total"]
+
+    total = ce["total"] + geometry_gain * geometry_total
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError("base training objective is not finite")
+
+    if not return_parts:
+        return total
+    zero = total.detach() * 0.0
+    return {
+        "total": total,
+        "ce": ce["total"],
+        "geometry": geometry_total,
+        "geometry_weight": total.new_tensor(geometry_gain),
+        "ce_accuracy": ce["accuracy"],
+        "geometry_accuracy": (
+            geometry_parts["accuracy"]
+            if geometry_parts is not None
+            else zero
+        ),
+        "geometry_mean_gap": (
+            geometry_parts["mean_gap"]
+            if geometry_parts is not None
+            else zero
+        ),
+        "geometry_q05_gap": (
+            geometry_parts["q05_gap"]
+            if geometry_parts is not None
+            else zero
+        ),
+        "classification_violation_rate": (
+            geometry_parts["classification_violation_rate"]
+            if geometry_parts is not None
+            else zero
+        ),
+        "margin_violation_rate": (
+            geometry_parts["margin_violation_rate"]
+            if geometry_parts is not None
+            else zero
+        ),
+    }
+
+
+# =============================================================================
+# Coordinate transport consistency
+# =============================================================================
+
+
+def _transform_field(
+    transform: Any,
+    name: str,
+) -> Any:
+    if not hasattr(transform, name):
+        raise TypeError(
+            f"transform lacks required field {name!r}"
+        )
+    return getattr(transform, name)
+
+
+def _validate_branch_transform(
+    transform: Any,
+    *,
+    spectral_dim: int,
+    spatial_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, Tensor]:
+    spectral_rotation = torch.as_tensor(
+        _transform_field(transform, "spectral_rotation"),
+        device=device,
+        dtype=dtype,
+    )
+    spatial_rotation = torch.as_tensor(
+        _transform_field(transform, "spatial_rotation"),
+        device=device,
+        dtype=dtype,
+    )
+    spectral_bias = torch.as_tensor(
+        _transform_field(transform, "spectral_bias"),
+        device=device,
+        dtype=dtype,
+    ).flatten()
+    spatial_bias = torch.as_tensor(
+        _transform_field(transform, "spatial_bias"),
+        device=device,
+        dtype=dtype,
+    ).flatten()
+    spectral_scale = _positive(
+        float(_transform_field(transform, "spectral_scale")),
+        name="spectral_scale",
+    )
+    spatial_scale = _positive(
+        float(_transform_field(transform, "spatial_scale")),
+        name="spatial_scale",
+    )
+
+    expected = {
+        "spectral_rotation":
+            (spectral_rotation, (spectral_dim, spectral_dim)),
+        "spatial_rotation":
+            (spatial_rotation, (spatial_dim, spatial_dim)),
+        "spectral_bias":
+            (spectral_bias, (spectral_dim,)),
+        "spatial_bias":
+            (spatial_bias, (spatial_dim,)),
+    }
+    for name, (value, shape) in expected.items():
+        if tuple(value.shape) != shape:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} != {shape}"
+            )
+        if not torch.isfinite(value).all():
+            raise RuntimeError(f"{name} contains NaN/Inf")
+
+    eye_s = torch.eye(
+        spectral_dim,
+        device=device,
+        dtype=dtype,
+    )
+    eye_p = torch.eye(
+        spatial_dim,
+        device=device,
+        dtype=dtype,
+    )
+    spectral_orthogonality = (
+        spectral_rotation.transpose(0, 1)
+        @ spectral_rotation
+        - eye_s
+    ).norm()
+    spatial_orthogonality = (
+        spatial_rotation.transpose(0, 1)
+        @ spatial_rotation
+        - eye_p
+    ).norm()
+    if float(spectral_orthogonality.detach().item()) > 1e-3:
+        raise RuntimeError(
+            "spectral rotation is not sufficiently orthogonal"
+        )
+    if float(spatial_orthogonality.detach().item()) > 1e-3:
+        raise RuntimeError(
+            "spatial rotation is not sufficiently orthogonal"
+        )
+
+    # The accepted transform is a closed-form support estimate, not a trainable
+    # network component. Detach every field before constructing query targets.
+    return {
+        "spectral_rotation": spectral_rotation.detach(),
+        "spatial_rotation": spatial_rotation.detach(),
+        "spectral_bias": spectral_bias.detach(),
+        "spatial_bias": spatial_bias.detach(),
+        "spectral_scale": torch.tensor(
+            spectral_scale,
+            device=device,
+            dtype=dtype,
+        ),
+        "spatial_scale": torch.tensor(
+            spatial_scale,
+            device=device,
+            dtype=dtype,
+        ),
+        "spectral_orthogonality_error":
+            spectral_orthogonality.detach(),
+        "spatial_orthogonality_error":
+            spatial_orthogonality.detach(),
+    }
+
+
+def coordinate_transport_loss(
+    previous_joint_features: Tensor,
+    current_joint_features: Tensor,
+    *,
+    spectral_dim: int,
+    transform: Any,
+    class_targets_global: Optional[Tensor] = None,
+    sample_weights: Optional[Tensor] = None,
+    class_balanced: bool = True,
+    variance_floor: float = 1e-6,
+    return_parts: bool = True,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    r"""Keep current query coordinates near the accepted support transform.
+
+    The accepted transform is fitted on support folds and detached. For query
+    feature z^- from the frozen phase-start observer and current feature z^+:
+
+        z_s,target = a_s z_s^- R_s^T + b_s
+        z_p,target = a_p z_p^- R_p^T + b_p
+
+        L_coord =
+            ||z_s^+ - z_s,target||^2 /
+            [D_s (Var(z_s^+) + eps)]
+          + ||z_p^+ - z_p,target||^2 /
+            [D_p (Var(z_p^+) + eps)].
+
+    Gradients flow only through ``current_joint_features``.
+    """
+    previous = _feature_matrix(
+        previous_joint_features,
+        name="previous_joint_features",
+    )
+    current = _feature_matrix(
+        current_joint_features,
+        name="current_joint_features",
+    )
+    if previous.shape != current.shape:
+        raise ValueError(
+            "previous and current joint features must have identical shape"
+        )
+
+    d = current.size(1)
+    ds = int(spectral_dim)
+    if not 0 < ds < d:
+        raise ValueError("spectral_dim must lie inside joint feature width")
+    dp = d - ds
+
+    accepted = _validate_branch_transform(
+        transform,
+        spectral_dim=ds,
+        spatial_dim=dp,
+        device=current.device,
+        dtype=current.dtype,
+    )
+
+    previous_detached = previous.detach()
+    previous_s = previous_detached[:, :ds]
+    previous_p = previous_detached[:, ds:]
+    current_s = current[:, :ds]
+    current_p = current[:, ds:]
+
+    target_s = (
+        previous_s
+        @ (
+            accepted["spectral_scale"]
+            * accepted["spectral_rotation"]
+        ).transpose(0, 1)
+        + accepted["spectral_bias"].view(1, -1)
+    )
+    target_p = (
+        previous_p
+        @ (
+            accepted["spatial_scale"]
+            * accepted["spatial_rotation"]
+        ).transpose(0, 1)
+        + accepted["spatial_bias"].view(1, -1)
+    )
+
+    floor = _positive(
+        variance_floor,
+        name="variance_floor",
+    )
+    # Detach normalizers to prevent the encoder from reducing the objective by
+    # inflating branch variance.
+    variance_s = current_s.detach().var(
+        dim=0,
+        unbiased=False,
+    ).mean().clamp_min(floor)
+    variance_p = current_p.detach().var(
+        dim=0,
+        unbiased=False,
+    ).mean().clamp_min(floor)
+
+    spectral_sq = (
+        current_s - target_s
+    ).square().sum(dim=1) / (float(ds) * variance_s)
+    spatial_sq = (
+        current_p - target_p
+    ).square().sum(dim=1) / (float(dp) * variance_p)
+    per_sample = spectral_sq + spatial_sq
+
+    weights = _sample_weights(
+        sample_weights,
+        sample_count=current.size(0),
+        device=current.device,
+        dtype=current.dtype,
+    )
+    if class_balanced:
+        if class_targets_global is None:
+            raise ValueError(
+                "class_targets_global is required when class_balanced=True"
+            )
+        labels = class_targets_global.to(
+            current.device,
+        ).long().flatten()
+        if labels.numel() != current.size(0):
+            raise ValueError("class_targets_global length mismatch")
+        if bool(labels.lt(0).any()):
+            raise ValueError("class_targets_global contains negative IDs")
+    else:
+        labels = torch.zeros(
+            current.size(0),
+            device=current.device,
+            dtype=torch.long,
+        )
+
+    total = _reduce(
+        per_sample,
+        labels,
+        weights,
+        class_balanced=class_balanced,
+    )
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError("coordinate transport loss is not finite")
+
+    residual_s = (current_s.detach() - target_s).norm(dim=1)
+    residual_p = (current_p.detach() - target_p).norm(dim=1)
+    if not return_parts:
+        return total
+    return {
+        "total": total,
+        "per_sample": per_sample,
+        "spectral_term": _reduce(
+            spectral_sq,
+            labels,
+            weights,
+            class_balanced=class_balanced,
+        ),
+        "spatial_term": _reduce(
+            spatial_sq,
+            labels,
+            weights,
+            class_balanced=class_balanced,
+        ),
+        "spectral_rmse": (
+            current_s.detach() - target_s
+        ).square().mean().sqrt(),
+        "spatial_rmse": (
+            current_p.detach() - target_p
+        ).square().mean().sqrt(),
+        "spectral_mean_l2": residual_s.mean(),
+        "spatial_mean_l2": residual_p.mean(),
+        "spectral_variance_normalizer": variance_s.detach(),
+        "spatial_variance_normalizer": variance_p.detach(),
+        "spectral_orthogonality_error":
+            accepted["spectral_orthogonality_error"],
+        "spatial_orthogonality_error":
+            accepted["spatial_orthogonality_error"],
+    }
+
+
+# =============================================================================
+# Controlled-plasticity parameter trust
+# =============================================================================
+
+
+@torch.no_grad()
+def snapshot_trainable_parameters(
+    module: nn.Module,
+) -> Dict[str, Tensor]:
+    """Clone only parameters that are trainable at phase start."""
+    if not isinstance(module, nn.Module):
+        raise TypeError("module must be an nn.Module")
+    snapshot = {
+        name: parameter.detach().clone()
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad
+    }
+    if not snapshot:
+        raise RuntimeError(
+            "module has no trainable parameters to snapshot"
+        )
+    return snapshot
+
+
+def relative_parameter_trust_loss(
+    module: nn.Module,
+    reference_parameters: Mapping[str, Tensor],
+    *,
+    parameter_names: Optional[Iterable[str]] = None,
+    return_parts: bool = True,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    r"""Relative Frobenius trust penalty for controlled late modules.
+
+        L_param =
+            sum_l ||W_l,t - W_l,t-1||_F^2 /
+                  (||W_l,t-1||_F^2 + eps).
+
+    This is a stabilizer, not the paper's contribution.
+    """
+    if not isinstance(module, nn.Module):
+        raise TypeError("module must be an nn.Module")
+    if not isinstance(reference_parameters, Mapping):
+        raise TypeError("reference_parameters must be a mapping")
+
+    current = dict(module.named_parameters())
+    selected_names = (
+        [str(name) for name in parameter_names]
+        if parameter_names is not None
+        else [
+            name
+            for name, parameter in current.items()
+            if parameter.requires_grad
+        ]
+    )
+    if not selected_names:
+        zero = next(module.parameters()).sum() * 0.0
+        result = {
+            "total": zero,
+            "parameter_count": zero.detach(),
+            "maximum_relative_term": zero.detach(),
+        }
+        return result if return_parts else zero
+
+    missing_current = [
+        name for name in selected_names
+        if name not in current
+    ]
+    missing_reference = [
+        name for name in selected_names
+        if name not in reference_parameters
+    ]
+    if missing_current or missing_reference:
+        raise RuntimeError(
+            "parameter trust mapping mismatch: "
+            f"missing_current={missing_current[:8]}, "
+            f"missing_reference={missing_reference[:8]}"
+        )
+
+    terms: List[Tensor] = []
+    for name in selected_names:
+        parameter = current[name]
+        reference = torch.as_tensor(
+            reference_parameters[name],
+            device=parameter.device,
+            dtype=parameter.dtype,
+        )
+        if reference.shape != parameter.shape:
+            raise RuntimeError(
+                f"reference shape mismatch for {name}: "
+                f"{tuple(reference.shape)} vs {tuple(parameter.shape)}"
+            )
+        if not torch.isfinite(reference).all():
+            raise RuntimeError(
+                f"reference parameter {name} contains NaN/Inf"
+            )
+        numerator = (
+            parameter - reference.detach()
+        ).square().sum()
+        denominator = reference.detach().square().sum().clamp_min(_EPS)
+        terms.append(numerator / denominator)
+
+    stacked = torch.stack(terms)
+    total = stacked.sum()
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError("parameter trust loss is not finite")
+
+    if not return_parts:
+        return total
+    return {
+        "total": total,
+        "parameter_count": total.new_tensor(float(len(terms))),
+        "mean_relative_term": stacked.mean().detach(),
+        "maximum_relative_term": stacked.max().detach(),
+    }
+
+
+# =============================================================================
+# Incremental objective
+# =============================================================================
+
+
+def incremental_geometry_objective(
+    current_query_energy: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    current_targets_global: Tensor,
+    *,
+    pair_risk: Optional[Tensor] = None,
+    coordinate_loss: Optional[Union[Tensor, Mapping[str, Tensor]]] = None,
+    parameter_trust_loss: Optional[Union[Tensor, Mapping[str, Tensor]]] = None,
+    geometry_weight: float = 1.0,
+    coordinate_weight: float = 0.10,
+    parameter_trust_weight: float = 0.0,
+    base_margin: float = 0.50,
+    risk_strength: float = 0.50,
+    temperature: float = 0.50,
+    maximum_margin: Optional[float] = None,
+    class_balanced: bool = True,
+    return_parts: bool = True,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    r"""Compose the official incremental objective.
+
+        L_inc =
+            lambda_geom L_geom
+          + lambda_coord L_coord
+          + lambda_param L_param.
+
+    ``L_geom`` uses only real current query samples scored against one
+    provisional row set containing transported old rows and support-fitted new
+    rows. No old feature replay is optimized here.
+    """
+    geometry = risk_guided_all_rival_geometry_loss(
+        current_query_energy,
+        class_ids,
+        current_targets_global,
+        pair_risk=pair_risk,
+        base_margin=base_margin,
+        risk_strength=risk_strength,
+        temperature=temperature,
+        maximum_margin=maximum_margin,
+        sample_weights=None,
+        class_balanced=class_balanced,
+        return_parts=True,
+    )
+    assert isinstance(geometry, dict)
+
+    def resolve(
+        value: Optional[Union[Tensor, Mapping[str, Tensor]]],
+        *,
+        name: str,
+        reference: Tensor,
+    ) -> Tensor:
+        if value is None:
+            return reference.sum() * 0.0
+        result = value["total"] if isinstance(value, Mapping) else value
+        if not torch.is_tensor(result) or result.dim() != 0:
+            raise TypeError(f"{name} must be a scalar tensor or mapping with total")
+        if not torch.isfinite(result):
+            raise RuntimeError(f"{name} is not finite")
+        return result
+
+    coordinate = resolve(
+        coordinate_loss,
+        name="coordinate_loss",
+        reference=current_query_energy,
+    )
+    parameter = resolve(
+        parameter_trust_loss,
+        name="parameter_trust_loss",
+        reference=current_query_energy,
+    )
+
+    geometry_gain = _nonnegative(
+        geometry_weight,
+        name="geometry_weight",
+    )
+    coordinate_gain = _nonnegative(
+        coordinate_weight,
+        name="coordinate_weight",
+    )
+    parameter_gain = _nonnegative(
+        parameter_trust_weight,
+        name="parameter_trust_weight",
+    )
+    if geometry_gain == 0.0 and coordinate_gain == 0.0:
+        raise ValueError(
+            "geometry_weight and coordinate_weight cannot both be zero"
+        )
+
+    total = (
+        geometry_gain * geometry["total"]
+        + coordinate_gain * coordinate
+        + parameter_gain * parameter
+    )
+    if total.dim() != 0 or not torch.isfinite(total):
+        raise RuntimeError("incremental geometry objective is not finite")
+
+    if not return_parts:
+        return total
+    return {
+        "total": total,
+        "geometry": geometry["total"],
+        "coordinate": coordinate,
+        "parameter_trust": parameter,
+        "geometry_weight": total.new_tensor(geometry_gain),
+        "coordinate_weight": total.new_tensor(coordinate_gain),
+        "parameter_trust_weight": total.new_tensor(parameter_gain),
+        "accuracy": geometry["accuracy"],
+        "mean_gap": geometry["mean_gap"],
+        "q05_gap": geometry["q05_gap"],
+        "classification_violation_rate":
+            geometry["classification_violation_rate"],
+        "margin_violation_rate":
+            geometry["margin_violation_rate"],
+        "mean_nearest_pair_risk":
+            geometry["nearest_pair_risk"].mean().detach(),
+        "mean_nearest_required_margin":
+            geometry["nearest_required_margin"].mean().detach(),
+    }
+
+
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
+
+@torch.no_grad()
+def pairwise_directional_invasion_matrix(
+    energy: Tensor,
+    class_ids: Union[Sequence[int], Tensor],
+    targets_global: Tensor,
+    *,
+    valid_class_mask: Optional[Tensor] = None,
+    sample_weights: Optional[Tensor] = None,
+) -> Dict[str, Tensor]:
+    """Ordered source-to-rival invasion rates and Q05 energy gaps."""
+    scores = _matrix(energy, name="energy")
+    n, c = scores.shape
+    classes = _class_ids(class_ids, device=scores.device)
+    if classes.numel() != c:
+        raise ValueError("energy width does not match class_ids")
+
+    targets = targets_global.to(scores.device).long().flatten()
+    if targets.numel() != n:
+        raise ValueError("target/energy batch mismatch")
+    local = global_to_local_targets(targets, classes)
+
+    valid = _valid_class_mask(
+        valid_class_mask,
+        class_count=c,
+        device=scores.device,
+    )
+    if not bool(valid.index_select(0, local).all()):
+        raise RuntimeError("targets reference invalid class columns")
+    weights = _sample_weights(
+        sample_weights,
+        sample_count=n,
+        device=scores.device,
+        dtype=torch.float64,
+    )
+
+    invasion = torch.zeros(
+        (c, c),
+        device=scores.device,
+        dtype=torch.float64,
+    )
+    q05 = torch.full_like(invasion, float("nan"))
+    source_weight = torch.zeros(
+        c,
+        device=scores.device,
+        dtype=torch.float64,
+    )
+
+    for source in range(c):
+        if not bool(valid[source]):
+            continue
+        selected = local.eq(source)
+        if not bool(selected.any()):
+            continue
+        local_weights = weights[selected]
+        denominator = local_weights.sum().clamp_min(_EPS)
+        source_weight[source] = denominator
+        true = scores[selected, source]
+        for rival in range(c):
+            if rival == source or not bool(valid[rival]):
+                continue
+            gap = scores[selected, rival] - true
+            invasion[source, rival] = (
+                gap.le(0.0).double() * local_weights
+            ).sum() / denominator
+            q05[source, rival] = torch.quantile(
+                gap.double(),
+                0.05,
+            )
+
+    off_diagonal = (
+        valid[:, None]
+        & valid[None, :]
+        & ~torch.eye(
+            c,
+            device=scores.device,
+            dtype=torch.bool,
+        )
+    )
+    values = invasion[off_diagonal]
+    return {
+        "class_ids": classes,
+        "invasion_matrix": invasion,
+        "gap_q05_matrix": q05,
+        "source_weight": source_weight,
+        "maximum_directional_invasion": (
+            values.max()
+            if values.numel()
+            else invasion.new_tensor(0.0)
+        ),
+        "mean_directional_invasion": (
+            values.mean()
+            if values.numel()
+            else invasion.new_tensor(0.0)
+        ),
+    }
+
+
+@torch.no_grad()
+def pair_risk_confusion_statistics(
+    pair_risk: Tensor,
+    invasion_matrix: Tensor,
+) -> Dict[str, Tensor]:
+    """Check whether proposed pair risk predicts observed pair confusion."""
+    risk = torch.as_tensor(pair_risk).float()
+    invasion = torch.as_tensor(
+        invasion_matrix,
+        device=risk.device,
+        dtype=risk.dtype,
+    )
+    if risk.dim() != 2 or risk.size(0) != risk.size(1):
+        raise ValueError("pair_risk must be square")
+    if invasion.shape != risk.shape:
+        raise ValueError(
+            "invasion_matrix and pair_risk must have identical shape"
+        )
+    if not torch.isfinite(risk).all() or not torch.isfinite(invasion).all():
+        raise RuntimeError("risk/invasion contains NaN/Inf")
+
+    count = risk.size(0)
+    mask = ~torch.eye(
+        count,
+        device=risk.device,
+        dtype=torch.bool,
+    )
+    risk_values = risk[mask]
+    invasion_values = invasion[mask]
+    if risk_values.numel() < 2:
+        correlation = risk.new_tensor(float("nan"))
+    else:
+        risk_centered = risk_values - risk_values.mean()
+        invasion_centered = invasion_values - invasion_values.mean()
+        denominator = (
+            risk_centered.square().sum().sqrt()
+            * invasion_centered.square().sum().sqrt()
+        )
+        correlation = (
+            (risk_centered * invasion_centered).sum()
+            / denominator.clamp_min(_EPS)
+        )
+
+    median = torch.median(risk_values)
+    high = risk_values.ge(median)
+    low = ~high
+    return {
+        "pearson_risk_invasion": correlation,
+        "mean_high_risk_invasion": (
+            invasion_values[high].mean()
+            if bool(high.any())
+            else invasion.new_tensor(float("nan"))
+        ),
+        "mean_low_risk_invasion": (
+            invasion_values[low].mean()
+            if bool(low.any())
+            else invasion.new_tensor(float("nan"))
+        ),
+        "risk_median": median,
+    }
+
+
+# =============================================================================
+# Explicit migration aliases
+# =============================================================================
+
+
+def joint_energy_margin_loss(
+    energy: Tensor,
+    targets_global: Tensor,
+    *,
+    class_ids: Union[Sequence[int], Tensor],
+    pair_risk: Optional[Tensor] = None,
+    margin: float = 0.50,
+    risk_strength: float = 0.50,
+    temperature: float = 0.50,
+    sample_weights: Optional[Tensor] = None,
+    valid_class_mask: Optional[Tensor] = None,
+    class_balanced: bool = True,
+    return_parts: bool = True,
+    **retired_arguments: Any,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Compatibility name with the new factor-geometry contract.
+
+    The wrapper intentionally requires explicit ``class_ids``. Retired
+    spectral-conditioned or rival-restriction arguments are rejected.
+    """
+    if retired_arguments:
+        raise RuntimeError(
+            "retired joint-energy arguments were supplied: "
+            f"{sorted(retired_arguments)}"
+        )
+    return risk_guided_all_rival_geometry_loss(
+        energy,
+        class_ids,
+        targets_global,
+        pair_risk=pair_risk,
+        base_margin=margin,
+        risk_strength=risk_strength,
+        temperature=temperature,
+        sample_weights=sample_weights,
+        valid_class_mask=valid_class_mask,
+        class_balanced=class_balanced,
+        return_parts=return_parts,
+    )
+
+
+def base_geometry_loss(
+    base_logits: Tensor,
+    targets_global: Tensor,
+    *,
+    class_ids: Union[Sequence[int], Tensor],
+    query_energy: Optional[Tensor] = None,
+    query_targets_global: Optional[Tensor] = None,
+    pair_risk: Optional[Tensor] = None,
+    geometry_weight: float = 0.25,
+    geometry_margin: float = 0.50,
+    risk_strength: float = 0.50,
+    temperature: float = 0.50,
+    label_smoothing: float = 0.0,
+    class_balanced: bool = True,
+    return_parts: bool = True,
+    **retired_arguments: Any,
+) -> Union[Tensor, Dict[str, Tensor]]:
+    """Compatibility wrapper for CE plus cross-fitted factor geometry."""
+    if retired_arguments:
+        raise RuntimeError(
+            "retired base-geometry arguments were supplied: "
+            f"{sorted(retired_arguments)}"
+        )
+    return base_training_objective(
+        base_logits,
+        targets_global,
+        class_ids,
+        query_energy=query_energy,
+        query_targets_global=query_targets_global,
+        pair_risk=pair_risk,
+        geometry_weight=geometry_weight,
+        base_margin=geometry_margin,
+        risk_strength=risk_strength,
+        geometry_temperature=temperature,
+        label_smoothing=label_smoothing,
+        class_balanced=class_balanced,
+        return_parts=return_parts,
+    )
 
 
 
@@ -3425,1333 +1539,1987 @@ def sample_boundary_geometry_features(*args: Any, **kwargs: Any):
 
 # from __future__ import annotations
 
-# from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+# """Losses for strict non-exemplar HSI class-incremental geometry learning.
+
+# Deployed classifier contract
+# ----------------------------
+#     p(z, q | c) = p(z | c) p(q | z, c)
+
+# The backbone/projection and committed old rows are frozen after phase 0.
+# Incremental optimization is therefore allowed to update only bounded
+# provisional new-class row corrections.  The main method deliberately uses only:
+
+# Base:
+#     L_base = L_CE + lambda_g L_joint(optional)
+
+# Incremental:
+#     L_inc = average(L_new, L_old_to_new) + lambda_tr L_trust(optional)
+
+# `L_new` compares each real new-class sample against every seen rival.
+# `L_old_to_new` compares aggregate old replay only against provisional new rows,
+# which guarantees that replay produces a gradient for the trainable candidate
+# rows instead of selecting another immutable old row as the nearest rival.
+# """
+
+# import math
+# from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 # import torch
 # import torch.nn.functional as F
 
 
-# _EPS = 1e-12
-# _INVALID_ENERGY = 1e6
+# __all__ = [
+#     "joint_energy_margin_loss",
+#     "old_to_new_boundary_loss",
+#     "candidate_trust_region_loss",
+#     "base_geometry_loss",
+#     "incremental_geometry_loss",
+#     "pairwise_directional_invasion_matrix",
+#     # Clear project-facing aliases.
+#     "hsi_joint_energy_margin_loss",
+#     "hsi_boundary_replay_loss",
+#     "hsi_candidate_trust_region_loss",
+#     "base_hsi_geometry_objective",
+#     "incremental_hsi_geometry_objective",
+#     # Narrow migration aliases used by older trainer imports.
+#     "phase_consistent_conditional_joint_consolidation_loss",
+#     "phase_consistent_spectral_geometry_consolidation_loss",
+#     "pc_stgb_loss",
+#     "pc_sgc_loss",
+#     "candidate_descriptor_trust_region_loss",
+# ]
 
 
-# # -----------------------------------------------------------------------------
-# # Basic utilities
-# # -----------------------------------------------------------------------------
-
-# def safe_zero_like(
-#     ref: Optional[torch.Tensor] = None,
-#     *,
-#     device: Optional[torch.device] = None,
-#     dtype: Optional[torch.dtype] = None,
-# ) -> torch.Tensor:
-#     if torch.is_tensor(ref):
-#         return ref.sum() * 0.0
-#     return torch.tensor(
-#         0.0,
-#         device=device if device is not None else torch.device("cpu"),
-#         dtype=dtype if dtype is not None else torch.float32,
-#     )
+# _DIRECT_FACTORIZATIONS = {
+#     "p(z|c)p(q|z,c)",
+#     "p(z,q|c)=p(z|c)p(q|z,c)",
+# }
 
 
-# def _require_finite_tensor(x: torch.Tensor, name: str) -> None:
-#     if not torch.is_tensor(x):
-#         raise TypeError(f"{name} must be a tensor.")
-#     if x.numel() == 0:
+# def _finite(value: float, *, name: str) -> float:
+#     result = float(value)
+#     if not math.isfinite(result):
+#         raise ValueError(f"{name} must be finite, got {value!r}")
+#     return result
+
+
+# def _nonnegative(value: float, *, name: str) -> float:
+#     result = _finite(value, name=name)
+#     if result < 0.0:
+#         raise ValueError(f"{name} must be non-negative, got {value!r}")
+#     return result
+
+
+# def _positive(value: float, *, name: str) -> float:
+#     result = _finite(value, name=name)
+#     if result <= 0.0:
+#         raise ValueError(f"{name} must be positive, got {value!r}")
+#     return result
+
+
+# def _validate_factorization(value: Optional[str]) -> None:
+#     if value is None:
 #         return
-#     if not torch.isfinite(x).all():
-#         bad = int((~torch.isfinite(x)).sum().detach().cpu().item())
-#         raise RuntimeError(f"{name}: tensor contains {bad} NaN/Inf values.")
-
-
-# def _as_1d_long(labels: torch.Tensor, *, device: torch.device, name: str = "labels") -> torch.Tensor:
-#     if labels is None or not torch.is_tensor(labels):
-#         raise TypeError(f"{name} must be a tensor.")
-#     return labels.to(device=device).long().flatten()
-
-
-# def _scalar(value: Any, ref: Optional[torch.Tensor] = None) -> torch.Tensor:
-#     if torch.is_tensor(value):
-#         if value.numel() == 1:
-#             return value.reshape(())
-#         return value.float().mean()
-#     if isinstance(value, (int, float)):
-#         if torch.is_tensor(ref):
-#             return torch.tensor(float(value), device=ref.device, dtype=ref.dtype)
-#         return torch.tensor(float(value), dtype=torch.float32)
-#     return safe_zero_like(ref)
-
-
-# def _class_centers(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     min_samples: int = 2,
-#     normalize_centers: bool = False,
-# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         device = features.device if torch.is_tensor(features) else torch.device("cpu")
-#         dtype = features.dtype if torch.is_tensor(features) else torch.float32
-#         return (
-#             torch.empty(0, 0, device=device, dtype=dtype),
-#             torch.empty(0, device=device, dtype=torch.long),
-#             torch.empty(0, device=device, dtype=dtype),
-#         )
-
-#     if features.dim() != 2:
-#         raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     if y.numel() != features.size(0):
-#         raise ValueError(f"labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-#     centers, class_ids, counts = [], [], []
-#     for cls in torch.unique(y, sorted=True):
-#         mask = y == cls
-#         n = int(mask.sum().item())
-#         if n < int(min_samples):
-#             continue
-#         c = features[mask].mean(dim=0)
-#         if normalize_centers:
-#             c = F.normalize(c, dim=0, eps=1e-6)
-#         centers.append(c)
-#         class_ids.append(cls)
-#         counts.append(torch.tensor(float(n), device=features.device, dtype=features.dtype))
-
-#     if not centers:
-#         return (
-#             torch.empty(0, features.size(1), device=features.device, dtype=features.dtype),
-#             torch.empty(0, device=features.device, dtype=torch.long),
-#             torch.empty(0, device=features.device, dtype=features.dtype),
-#         )
-
-#     return torch.stack(centers, dim=0), torch.stack(class_ids).long(), torch.stack(counts)
-
-
-# def _pairwise_center_margin_loss(centers: torch.Tensor, margin: float) -> torch.Tensor:
-#     if centers is None or not torch.is_tensor(centers) or centers.numel() == 0 or centers.size(0) < 2:
-#         return safe_zero_like(centers)
-#     dist = torch.cdist(centers, centers, p=2)
-#     eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-#     pair = dist[~eye]
-#     if pair.numel() == 0:
-#         return centers.sum() * 0.0
-#     return F.relu(float(margin) - pair).pow(2).mean()
-
-
-# def _pad_to_width(x: torch.Tensor, width: int) -> torch.Tensor:
-#     if x.size(1) == width:
-#         return x
-#     if x.size(1) > width:
-#         return x[:, :width]
-#     return F.pad(x, (0, int(width) - int(x.size(1))))
-
-
-# # -----------------------------------------------------------------------------
-# # Spectral / band profiles
-# # -----------------------------------------------------------------------------
-
-# def _spectral_derivatives(spectral_summary: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if spectral_summary.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-#     if spectral_summary.size(1) < 2:
-#         z = spectral_summary.new_zeros((spectral_summary.size(0), 1))
-#         return z, z
-#     d1 = spectral_summary[:, 1:] - spectral_summary[:, :-1]
-#     if d1.size(1) < 2:
-#         d2 = d1.new_zeros((d1.size(0), 1))
-#     else:
-#         d2 = d1[:, 1:] - d1[:, :-1]
-#     return d1, d2
-
-
-# def _spectral_profile_descriptor(spectral_summary: torch.Tensor) -> torch.Tensor:
-#     """Derivative-aware descriptor for physical spectral-shape comparison.
-
-#     Raw HSI spectra may be normalized and may contain signed values.  Direct
-#     softmax over signed spectra destroys absorption/reflectance shape.  This
-#     descriptor preserves curve shape by standardizing each spectrum and appending
-#     first/second derivative information.
-#     """
-#     if spectral_summary.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(spectral_summary.shape)}")
-#     s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     s = s - s.mean(dim=1, keepdim=True)
-#     s = s / s.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-#     d1, d2 = _spectral_derivatives(s)
-#     desc = torch.cat([F.normalize(s, dim=1, eps=1e-6), F.normalize(d1, dim=1, eps=1e-6), F.normalize(d2, dim=1, eps=1e-6)], dim=1)
-#     return torch.nan_to_num(desc, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-# def _band_importance_profile(band_summary: torch.Tensor) -> torch.Tensor:
-#     """Convert raw spectra or band summaries to a non-negative band profile.
-
-#     This is the correct base regularizer target for HSI: it compares where the
-#     spectrum changes/absorbs, not a hidden classifier branch.  It works for raw
-#     physical spectra and is still safe for reduced non-physical summaries.
-#     """
-#     if band_summary is None or not torch.is_tensor(band_summary):
-#         raise TypeError("band_summary must be a tensor.")
-#     if band_summary.dim() != 2:
-#         raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-#     b = torch.nan_to_num(band_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     B, S = b.shape
-#     if S <= 0:
-#         return b
-
-#     # Per-sample standardization preserves spectral shape under dataset scaling.
-#     z = b - b.mean(dim=1, keepdim=True)
-#     z = z / z.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
-#     d1, d2 = _spectral_derivatives(z)
-#     d1e = _pad_to_width(d1.abs(), S)
-#     d2e = _pad_to_width(d2.abs(), S)
-#     profile = z.abs() + 0.50 * d1e + 0.25 * d2e
-#     profile = profile.clamp_min(0.0)
-#     uniform = torch.full_like(profile, 1.0 / float(max(S, 1)))
-#     denom = profile.sum(dim=1, keepdim=True)
-#     profile = torch.where(denom > 1e-8, profile / denom.clamp_min(1e-8), uniform)
-#     return torch.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-# # Backward-compatible name used by old code.
-# def _normalize_band_summary(band_summary: torch.Tensor) -> torch.Tensor:
-#     return _band_importance_profile(band_summary)
-
-
-# def _positive_cosine_matrix(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-#     a = F.normalize(a, dim=1, eps=1e-6)
-#     b = F.normalize(b, dim=1, eps=1e-6)
-#     return (a @ b.t()).clamp(0.0, 1.0)
-
-
-# # -----------------------------------------------------------------------------
-# # GICS: Geometry-Involved Class Separation
-# # -----------------------------------------------------------------------------
-
-# def base_geometry_involved_contrastive_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     key_features: Optional[torch.Tensor] = None,
-#     weight: float = 0.20,
-#     temperature: float = 0.07,
-#     same_class_positive: bool = True,
-#     class_balanced: bool = True,
-#     detach_key: bool = True,
-#     normalize: bool = True,
-#     return_parts: bool = True,
-#     **_: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Base-phase GICS on canonical projected z-space."""
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         out = {"total": z, "gics": z, "weighted_gics": z, "valid_anchors": z, "num_anchors": z, "mean_positive_count": z}
-#         return out if return_parts else z
-
-#     if features.dim() != 2:
-#         raise ValueError(f"GICS expects projected features [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "gics.features")
-
-#     zq = features
-#     explicit_key = key_features is not None and torch.is_tensor(key_features) and key_features.numel() > 0
-#     zk = key_features if explicit_key else features
-#     if zk.dim() != 2:
-#         raise ValueError(f"key_features must be [B,D], got {tuple(zk.shape)}")
-#     if zk.size(0) != zq.size(0) or zk.size(1) != zq.size(1):
-#         raise ValueError(f"key_features shape mismatch: query={tuple(zq.shape)}, key={tuple(zk.shape)}")
-#     if detach_key:
-#         zk = zk.detach()
-
-#     y = _as_1d_long(labels, device=zq.device)
-#     if y.numel() != zq.size(0):
-#         raise ValueError(f"GICS labels/features mismatch: labels={y.numel()}, features={zq.size(0)}")
-
-#     q = F.normalize(zq, dim=1, eps=1e-6) if normalize else zq
-#     k = F.normalize(zk.to(device=zq.device, dtype=zq.dtype), dim=1, eps=1e-6) if normalize else zk.to(device=zq.device, dtype=zq.dtype)
-
-#     logits = q @ k.t()
-#     logits = logits / max(float(temperature), 1e-6)
-#     logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-#     B = zq.size(0)
-#     diag = torch.eye(B, device=zq.device, dtype=torch.bool)
-#     positive = y.view(-1, 1).eq(y.view(1, -1)) if same_class_positive else diag.clone()
-
-#     if explicit_key:
-#         positive = positive | diag
-#         denom_mask = torch.ones_like(positive, dtype=torch.bool)
-#     else:
-#         positive = positive & (~diag)
-#         denom_mask = ~diag
-
-#     pos_count = positive.float().sum(dim=1)
-#     valid = pos_count > 0
-
-#     if not bool(valid.any().item()):
-#         gics = features.sum() * 0.0
-#     else:
-#         exp_logits = torch.exp(logits).masked_fill(~denom_mask, 0.0)
-#         denom = exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12)
-#         log_prob = logits - denom.log()
-#         per = -(positive.float() * log_prob).sum(dim=1) / pos_count.clamp_min(1.0)
-#         per = per[valid]
-#         yv = y[valid]
-#         if per.numel() == 0:
-#             gics = features.sum() * 0.0
-#         elif class_balanced:
-#             class_terms = []
-#             for c in torch.unique(yv, sorted=True):
-#                 cm = yv == c
-#                 if bool(cm.any().item()):
-#                     class_terms.append(per[cm].mean())
-#             gics = torch.stack(class_terms).mean() if class_terms else features.sum() * 0.0
-#         else:
-#             gics = per.mean()
-
-#     total = float(weight) * gics
-#     if not return_parts:
-#         return total
-#     return {
-#         "total": total,
-#         "gics": gics.detach(),
-#         "weighted_gics": total.detach(),
-#         "valid_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-#         "num_anchors": torch.tensor(float(valid.sum().item()), device=features.device, dtype=features.dtype),
-#         "mean_positive_count": pos_count[valid].float().mean().detach() if bool(valid.any().item()) else features.sum().detach() * 0.0,
-#     }
-
-
-# # Backward-compatible aliases.
-# def base_fcs_geometry_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_geometry_involved_contrastive_separation_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# def base_hsi_supervised_contrastive_loss(*args: Any, **kwargs: Any):
-#     return base_geometry_involved_contrastive_loss(*args, **kwargs)
-
-
-# # -----------------------------------------------------------------------------
-# # PGR: Prospective Geometry Reserve
-# # -----------------------------------------------------------------------------
-
-# def _batch_subspace_overlap_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     rank: int = 3,
-#     min_samples: int = 6,
-#     max_overlap: float = 0.50,
-#     normalize: bool = True,
-#     include_mean_overlap: bool = True,
-#     return_parts: bool = False,
-# ) -> torch.Tensor | Dict[str, torch.Tensor]:
-#     """Margin-based subspace reserve.
-
-#     The old loss minimized average overlap only.  That can look nonzero in logs
-#     while leaving a single highly-overlapping class pair that breaks incremental
-#     descriptor insertion.  This version explicitly penalizes pair overlaps above
-#     max_overlap while still reporting mean/max overlap.
-#     """
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         if return_parts:
-#             return {"total": z, "pair_count": z, "valid_class_count": z, "mean_overlap": z, "max_overlap": z}
-#         return z
-#     if features.dim() != 2:
-#         raise ValueError(f"subspace loss expects [B,D], got {tuple(features.shape)}")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-#     _, D = z.shape
-
-#     bases = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         n = int(m.sum().item())
-#         if n < int(min_samples):
-#             continue
-#         xc = z[m] - z[m].mean(dim=0, keepdim=True)
-#         r = max(1, min(int(rank), n - 1, D))
-#         try:
-#             _, s, vh = torch.linalg.svd(xc, full_matrices=False)
-#         except RuntimeError:
-#             continue
-#         if s.numel() == 0 or float(s[0].detach().abs().item()) <= 1e-8:
-#             continue
-#         keep = (s[:r] / s[0].clamp_min(1e-8)) > 1e-3
-#         if bool(keep.any().item()):
-#             bases.append(vh[:r][keep].t().contiguous())
-
-#     if len(bases) < 2:
-#         loss = features.sum() * 0.0
-#         overlaps = features.new_empty(0)
-#         pair_count = 0
-#     else:
-#         overlap_list = []
-#         for i in range(len(bases)):
-#             for j in range(i + 1, len(bases)):
-#                 Ui, Uj = bases[i], bases[j]
-#                 denom = float(max(min(Ui.size(1), Uj.size(1)), 1))
-#                 ov = (Ui.t() @ Uj).pow(2).sum() / denom
-#                 overlap_list.append(ov)
-#         overlaps = torch.stack(overlap_list) if overlap_list else features.new_empty(0)
-#         pair_count = int(overlaps.numel())
-#         if pair_count == 0:
-#             loss = features.sum() * 0.0
-#         else:
-#             margin_loss = F.relu(overlaps - float(max_overlap)).pow(2).mean()
-#             mean_loss = 0.10 * overlaps.mean() if include_mean_overlap else overlaps.sum() * 0.0
-#             loss = margin_loss + mean_loss
-
-#     if return_parts:
-#         return {
-#             "total": loss,
-#             "pair_count": torch.tensor(float(pair_count), device=features.device, dtype=features.dtype),
-#             "valid_class_count": torch.tensor(float(len(bases)), device=features.device, dtype=features.dtype),
-#             "mean_overlap": overlaps.mean().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-#             "max_overlap": overlaps.max().detach() if overlaps.numel() else features.sum().detach() * 0.0,
-#         }
-#     return loss
-
-
-
-# def risk_aware_band_discrimination_loss(
-#     band_summary: Optional[torch.Tensor],
-#     labels: torch.Tensor,
-#     *,
-#     features: Optional[torch.Tensor] = None,
-#     min_samples: int = 3,
-#     max_band_similarity: float = 0.75,
-#     risk_center_margin: float = 1.0,
-#     risk_weight: float = 1.0,
-#     return_parts: bool = True,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Band-guided feature-geometry reserve for HSI.
-
-#     Important: raw physical spectra are *not* trainable. Therefore this loss
-#     must not try to make raw band profiles dissimilar directly.  Instead, high
-#     band similarity marks a hard class pair and increases the gradient on the
-#     learned feature geometry for that pair.
-
-#     Loss = hard_band_similarity.detach() * feature_center_conflict(features)
-
-#     This keeps band information in the architecture while preserving the main
-#     PG-RGA rule: inference and replay remain geometry-energy based.
-#     """
-#     ref = features if torch.is_tensor(features) else (band_summary if torch.is_tensor(band_summary) else labels)
-#     if band_summary is None or not torch.is_tensor(band_summary) or band_summary.numel() == 0:
-#         z = safe_zero_like(ref)
-#         out = {
-#             "total": z,
-#             "band": z,
-#             "pair_count": z,
-#             "valid_class_count": z,
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     if band_summary.dim() != 2:
-#         raise ValueError(f"band_summary must be [B,S], got {tuple(band_summary.shape)}")
-
-#     y = _as_1d_long(labels, device=band_summary.device)
-#     if y.numel() != band_summary.size(0):
-#         raise ValueError(f"band labels/batch mismatch: labels={y.numel()}, band={band_summary.size(0)}")
-
-#     b = _band_importance_profile(band_summary)
-#     b_centers, class_ids, _ = _class_centers(b, y, min_samples=min_samples, normalize_centers=True)
-#     if b_centers.size(0) < 2:
-#         z = band_summary.sum() * 0.0
-#         out = {
-#             "total": z,
-#             "band": z,
-#             "pair_count": z,
-#             "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     sim = (b_centers @ b_centers.t()).clamp(0.0, 1.0)
-#     eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-#     pair_sim = sim[~eye]
-#     hard_band = F.relu(pair_sim - float(max_band_similarity)) / max(1.0 - float(max_band_similarity), 1e-6)
-#     hard_band = hard_band.detach()
-
-#     # The only trainable part is the learned feature geometry.  If features are
-#     # missing or class ids cannot be aligned, the band term reports similarity
-#     # but contributes zero gradient instead of applying a useless constant loss.
-#     if features is not None and torch.is_tensor(features) and features.numel() > 0:
-#         zf = F.normalize(features.to(device=band_summary.device, dtype=band_summary.dtype), dim=1, eps=1e-6)
-#         f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-#         if f_centers.size(0) == b_centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-#             dist = torch.cdist(f_centers, f_centers, p=2)
-#             feature_conflict = F.relu(float(risk_center_margin) - dist) / max(float(risk_center_margin), 1e-6)
-#             feature_conflict = feature_conflict[~eye]
-#             guided = hard_band * feature_conflict
-#             loss_vec = hard_band * feature_conflict.pow(2)
-#             loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-#         else:
-#             guided = torch.zeros_like(pair_sim)
-#             loss = features.sum() * 0.0
-#     else:
-#         guided = torch.zeros_like(pair_sim)
-#         loss = band_summary.sum() * 0.0
-
-#     if not return_parts:
-#         return loss
-#     return {
-#         "total": loss,
-#         "band": loss.detach(),
-#         "pair_count": torch.tensor(float(pair_sim.numel()), device=band_summary.device, dtype=band_summary.dtype),
-#         "valid_class_count": torch.tensor(float(b_centers.size(0)), device=band_summary.device, dtype=band_summary.dtype),
-#         "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-#         "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else band_summary.sum().detach() * 0.0,
-#     }
-
-
-# def prospective_geometry_reserve_loss(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     *,
-#     band_summary: Optional[torch.Tensor] = None,
-#     weight: float = 0.10,
-#     compact_weight: float = 0.15,
-#     center_weight: float = 0.20,
-#     subspace_weight: float = 0.10,
-#     band_weight: float = 0.05,
-#     volume_weight: float = 0.05,
-#     center_margin: float = 1.05,
-#     min_class_samples: int = 3,
-#     subspace_min_samples: int = 6,
-#     subspace_rank: int = 3,
-#     max_band_similarity: float = 0.75,
-#     max_class_variance: float = 0.75,
-#     min_class_variance: float = 0.015,
-#     max_subspace_overlap: float = 0.50,
-#     normalize_features: bool = True,
-#     adaptive_component_weights: bool = True,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Base-phase PGR.
-
-#     Active terms:
-#       - compactness: same-class spread control
-#       - center reserve: class centers separated by margin
-#       - subspace reserve: explicit margin on tangent subspace overlap
-#       - band reserve: risky classes avoid identical spectral-band profiles
-#       - volume reserve: avoids both broad blobs and collapsed zero-volume rows
-#     """
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z0 = safe_zero_like(features)
-#         out = {
-#             "total": z0, "pgr": z0, "weighted_pgr": z0,
-#             "compact": z0, "center": z0, "subspace": z0, "band": z0, "volume": z0,
-#             "valid_class_count": z0, "unique_class_count": z0,
-#             "subspace_pair_count": z0, "band_pair_count": z0,
-#             "compact_factor": z0, "center_factor": z0, "subspace_factor": z0,
-#             "band_factor": z0, "volume_factor": z0,
-#             "subspace_mean_overlap": z0, "subspace_max_overlap": z0,
-#             "band_mean_similarity": z0, "band_max_similarity": z0,
-#         }
-#         return out if return_parts else z0
-
-#     if features.dim() != 2:
-#         raise ValueError(f"PGR expects features [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "pgr.features")
-
-#     y = _as_1d_long(labels, device=features.device)
-#     if y.numel() != features.size(0):
-#         raise ValueError(f"PGR labels/features mismatch: labels={y.numel()}, features={features.size(0)}")
-
-#     # Let explicit aliases in kwargs override defaults without requiring trainer changes.
-#     if "pgr_max_subspace_overlap" in kwargs:
-#         max_subspace_overlap = float(kwargs["pgr_max_subspace_overlap"])
-#     if "subspace_overlap_max" in kwargs:
-#         max_subspace_overlap = float(kwargs["subspace_overlap_max"])
-#     if "pgr_min_class_variance" in kwargs:
-#         min_class_variance = float(kwargs["pgr_min_class_variance"])
-
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize_features else features
-
-#     compact_terms = []
-#     volume_terms = []
-#     class_vars = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         if int(m.sum().item()) < int(min_class_samples):
-#             continue
-#         xc = z[m]
-#         var = (xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean()
-#         compact_terms.append(var)
-#         class_vars.append(var.detach())
-#         broad = F.relu(var - float(max_class_variance)).pow(2)
-#         collapsed = F.relu(float(min_class_variance) - var).pow(2)
-#         volume_terms.append(broad + collapsed)
-
-#     compact = torch.stack(compact_terms).mean() if compact_terms else features.sum() * 0.0
-#     volume = torch.stack(volume_terms).mean() if volume_terms else features.sum() * 0.0
-#     valid_class_count = len(compact_terms)
-#     unique_class_count = int(torch.unique(y).numel())
-
-#     centers, _, _ = _class_centers(z, y, min_samples=min_class_samples, normalize_centers=False)
-#     center = _pairwise_center_margin_loss(centers, center_margin)
-
-#     sub_obj = _batch_subspace_overlap_loss(
-#         z,
-#         y,
-#         rank=int(subspace_rank),
-#         min_samples=int(subspace_min_samples),
-#         max_overlap=float(max_subspace_overlap),
-#         normalize=False,
-#         return_parts=True,
-#     )
-#     subspace = sub_obj["total"]
-#     subspace_pair_count = sub_obj["pair_count"]
-
-#     band_obj = risk_aware_band_discrimination_loss(
-#         band_summary,
-#         y,
-#         features=z,
-#         min_samples=int(min_class_samples),
-#         max_band_similarity=float(max_band_similarity),
-#         risk_center_margin=float(center_margin),
-#         return_parts=True,
-#     )
-#     band = band_obj["total"] if isinstance(band_obj, dict) else band_obj
-#     band_pair_count = band_obj.get("pair_count", features.sum().detach() * 0.0) if isinstance(band_obj, dict) else features.sum().detach() * 0.0
-
-#     one = torch.tensor(1.0, device=features.device, dtype=features.dtype)
-#     zero = features.sum() * 0.0
-#     if adaptive_component_weights:
-#         compact_factor = one if valid_class_count > 0 else zero
-#         volume_factor = one if valid_class_count > 0 else zero
-#         center_factor = one if int(centers.size(0)) >= 2 else zero
-#         subspace_factor = one if float(subspace_pair_count.detach().item()) > 0.0 else zero
-#         band_factor = one if float(band_pair_count.detach().item()) > 0.0 else zero
-#     else:
-#         compact_factor = center_factor = subspace_factor = band_factor = volume_factor = one
-
-#     pgr_unweighted = (
-#         float(compact_weight) * compact_factor * compact
-#         + float(center_weight) * center_factor * center
-#         + float(subspace_weight) * subspace_factor * subspace
-#         + float(band_weight) * band_factor * band
-#         + float(volume_weight) * volume_factor * volume
-#     )
-#     total = float(weight) * pgr_unweighted
-
-#     if not return_parts:
-#         return total
-#     return {
-#         "total": total,
-#         "pgr": pgr_unweighted.detach(),
-#         "weighted_pgr": total.detach(),
-#         "compact": compact.detach(),
-#         "center": center.detach(),
-#         "subspace": subspace.detach(),
-#         "band": band.detach(),
-#         "volume": volume.detach(),
-#         "valid_class_count": torch.tensor(float(valid_class_count), device=features.device, dtype=features.dtype),
-#         "unique_class_count": torch.tensor(float(unique_class_count), device=features.device, dtype=features.dtype),
-#         "subspace_pair_count": subspace_pair_count.detach(),
-#         "band_pair_count": band_pair_count.detach() if torch.is_tensor(band_pair_count) else torch.tensor(float(band_pair_count), device=features.device, dtype=features.dtype),
-#         "compact_factor": compact_factor.detach(),
-#         "center_factor": center_factor.detach(),
-#         "subspace_factor": subspace_factor.detach(),
-#         "band_factor": band_factor.detach(),
-#         "volume_factor": volume_factor.detach(),
-#         "subspace_mean_overlap": sub_obj.get("mean_overlap", zero).detach(),
-#         "subspace_max_overlap": sub_obj.get("max_overlap", zero).detach(),
-#         "band_mean_similarity": band_obj.get("mean_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_max_similarity": band_obj.get("max_similarity", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_guided_conflict_mean": band_obj.get("guided_conflict_mean", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "band_guided_conflict_max": band_obj.get("guided_conflict_max", zero).detach() if isinstance(band_obj, dict) else zero.detach(),
-#         "class_variance_mean": torch.stack(class_vars).mean() if class_vars else zero.detach(),
-#     }
-
-
-# def base_prospective_geometry_reserve_loss(*args: Any, **kwargs: Any):
-#     return prospective_geometry_reserve_loss(*args, **kwargs)
-
-
-# # -----------------------------------------------------------------------------
-# # Physical spectral-shape reserve
-# # -----------------------------------------------------------------------------
-
-
-# def spectral_shape_discrimination_loss(
-#     spectral_summary: Optional[torch.Tensor],
-#     labels: torch.Tensor,
-#     *,
-#     features: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     require_physical_summary: bool = True,
-#     min_samples: int = 3,
-#     max_shape_similarity: float = 0.75,
-#     risk_center_margin: float = 1.0,
-#     risk_weight: float = 1.0,
-#     return_parts: bool = True,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Spectral-shape-guided feature-geometry reserve.
-
-#     Raw wavelength spectra are fixed metadata, not trainable outputs.  High
-#     spectral-shape similarity should therefore identify hard HSI class pairs and
-#     push their learned feature centers apart.  It should not be optimized as a
-#     standalone raw-spectrum dissimilarity objective.
-#     """
-#     ref = features if torch.is_tensor(features) else (spectral_summary if torch.is_tensor(spectral_summary) else labels)
-#     if (
-#         spectral_summary is None
-#         or not torch.is_tensor(spectral_summary)
-#         or spectral_summary.numel() == 0
-#         or (bool(require_physical_summary) and not bool(spectral_summary_is_physical))
-#     ):
-#         z = safe_zero_like(ref)
-#         out = {
-#             "total": z,
-#             "spectral_shape": z,
-#             "pair_count": z,
-#             "valid_class_count": z,
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     s = torch.nan_to_num(spectral_summary, nan=0.0, posinf=0.0, neginf=0.0)
-#     if s.dim() != 2:
-#         raise ValueError(f"spectral_summary must be [B,S], got {tuple(s.shape)}")
-#     y = _as_1d_long(labels, device=s.device)
-#     if y.numel() != s.size(0):
-#         raise ValueError(f"spectral_summary/label mismatch: spectra={s.size(0)}, labels={y.numel()}")
-
-#     desc = _spectral_profile_descriptor(s)
-#     centers, class_ids, _ = _class_centers(desc, y, min_samples=min_samples, normalize_centers=False)
-
-#     if centers.size(0) < 2:
-#         z = s.sum() * 0.0
-#         out = {
-#             "total": z,
-#             "spectral_shape": z,
-#             "pair_count": z,
-#             "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-#             "mean_similarity": z,
-#             "max_similarity": z,
-#             "guided_conflict_mean": z,
-#             "guided_conflict_max": z,
-#         }
-#         return out if return_parts else z
-
-#     sim = _positive_cosine_matrix(centers, centers)
-#     eye = torch.eye(sim.size(0), device=sim.device, dtype=torch.bool)
-#     pair_sim = sim[~eye]
-#     hard_shape = F.relu(pair_sim - float(max_shape_similarity)) / max(1.0 - float(max_shape_similarity), 1e-6)
-#     hard_shape = hard_shape.detach()
-
-#     if features is not None and torch.is_tensor(features) and features.numel() > 0:
-#         zf = F.normalize(features.to(device=s.device, dtype=s.dtype), dim=1, eps=1e-6)
-#         f_centers, f_ids, _ = _class_centers(zf, y, min_samples=min_samples, normalize_centers=False)
-#         if f_centers.size(0) == centers.size(0) and torch.equal(f_ids.to(class_ids.device), class_ids):
-#             dist = torch.cdist(f_centers, f_centers, p=2)
-#             feature_conflict = F.relu(float(risk_center_margin) - dist)[~eye] / max(float(risk_center_margin), 1e-6)
-#             guided = hard_shape * feature_conflict
-#             loss_vec = hard_shape * feature_conflict.pow(2)
-#             loss = float(risk_weight) * (loss_vec.mean() if loss_vec.numel() > 0 else features.sum() * 0.0)
-#         else:
-#             guided = torch.zeros_like(pair_sim)
-#             loss = features.sum() * 0.0
-#     else:
-#         guided = torch.zeros_like(pair_sim)
-#         loss = s.sum() * 0.0
-
-#     if not return_parts:
-#         return loss
-#     return {
-#         "total": loss,
-#         "spectral_shape": loss.detach(),
-#         "pair_count": torch.tensor(float(pair_sim.numel()), device=s.device, dtype=s.dtype),
-#         "valid_class_count": torch.tensor(float(centers.size(0)), device=s.device, dtype=s.dtype),
-#         "mean_similarity": pair_sim.mean().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-#         "max_similarity": pair_sim.max().detach() if pair_sim.numel() > 0 else s.sum().detach() * 0.0,
-#         "guided_conflict_mean": guided.mean().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-#         "guided_conflict_max": guided.max().detach() if guided.numel() > 0 else s.sum().detach() * 0.0,
-#     }
-
-
-# # -----------------------------------------------------------------------------
-# # Low-rank GeometryBank energy used by classifier/replay/margins
-# # -----------------------------------------------------------------------------
-
-# def _canonicalize_variances(
-#     *,
-#     eigvals: Optional[torch.Tensor] = None,
-#     res_vars: Optional[torch.Tensor] = None,
-#     variances: Optional[torch.Tensor] = None,
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if variances is not None and torch.is_tensor(variances):
-#         if variances.dim() != 2 or variances.size(1) < 2:
-#             raise ValueError(f"variances must be [C,R+1], got {tuple(variances.shape)}")
-#         return variances[:, :-1], variances[:, -1]
-#     if eigvals is None or res_vars is None:
-#         raise ValueError("Either variances or eigvals+res_vars must be provided.")
-#     return eigvals, res_vars
-
-
-# def _active_rank_mask(active_ranks: Optional[torch.Tensor], C: int, R: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-#     if active_ranks is None or not torch.is_tensor(active_ranks):
-#         ar = torch.full((C,), int(R), device=device, dtype=torch.long)
-#     else:
-#         ar = active_ranks.to(device=device).long().flatten()
-#         if ar.numel() != C:
-#             raise ValueError(f"active_ranks must have C={C} entries, got {ar.numel()}")
-#         ar = ar.clamp(min=0, max=R)
-#     idx = torch.arange(R, device=device).view(1, R)
-#     mask = (idx < ar.view(C, 1)).to(dtype=dtype)
-#     return mask, ar
-
-
-
-# def geometry_energy_matrix(
-#     features: Optional[torch.Tensor] = None,
-#     means: Optional[torch.Tensor] = None,
-#     bases: Optional[torch.Tensor] = None,
-#     variances: Optional[torch.Tensor] = None,
-#     *,
-#     bank: Optional[Mapping[str, torch.Tensor]] = None,
-#     eigvals: Optional[torch.Tensor] = None,
-#     res_vars: Optional[torch.Tensor] = None,
-#     active_ranks: Optional[torch.Tensor] = None,
-#     reliability: Optional[torch.Tensor] = None,
-#     sample_counts: Optional[torch.Tensor] = None,
-#     variance_floor: float = 1e-4,
-#     reliability_energy_weight: float = 0.03,
-#     reliability_min_clamp: float = 0.05,
-#     residual_variance_scale: float = 0.75,
-#     normalize_by_dim: bool = True,
-#     invalid_class_energy: float = _INVALID_ENERGY,
-#     use_logdet_energy: bool = True,
-#     logdet_energy_weight: float = 0.05,
-#     logdet_normalize_by_dim: bool = True,
-#     center_logdet_energy: bool = True,
-#     # accepted but intentionally inactive in PG-RGA main path
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_curve_means: Optional[torch.Tensor] = None,
-#     spectral_curve_vars: Optional[torch.Tensor] = None,
-#     spectral_curve_d1: Optional[torch.Tensor] = None,
-#     spectral_curve_d2: Optional[torch.Tensor] = None,
-#     spectral_shape_reliability: Optional[torch.Tensor] = None,
-#     use_spectral_residual_energy: bool = False,
-#     spectral_energy_weight: float = 0.0,
-#     spectral_summary_is_physical: bool = False,
-#     spectral_require_physical_summary: bool = True,
-#     return_parts: bool = False,
-#     **_: Any,
-# ) -> torch.Tensor | Dict[str, torch.Tensor]:
-#     """Low-rank GeometryBank energy used by classifier/replay/margins.
-
-#     Supports both explicit tensors and a bank mapping.  Spectral arguments are
-#     accepted only for API compatibility; PG-RGA inference remains feature-geometry
-#     energy, not spectral-branch energy.
-#     """
-#     del spectral_summary, spectral_curve_means, spectral_curve_vars, spectral_curve_d1, spectral_curve_d2, spectral_shape_reliability
-
-#     if isinstance(means, Mapping) and bank is None and bases is None:
-#         bank = means  # supports geometry_energy_matrix(features, bank=...) style through positional means
-#         means = None
-#     if bank is not None:
-#         means = bank.get("means", means)
-#         bases = bank.get("bases", bank.get("subspace_bases", bases))
-#         variances = bank.get("variances", variances)
-#         eigvals = bank.get("eigvals", bank.get("eigenvalues", eigvals))
-#         res_vars = bank.get("res_vars", bank.get("residual_variances", res_vars))
-#         active_ranks = bank.get("active_ranks", active_ranks)
-#         reliability = bank.get("reliability", reliability)
-#         sample_counts = bank.get("sample_counts", sample_counts)
-
-#     if means is None or bases is None:
-#         raise ValueError("geometry_energy_matrix requires means and bases, or a bank mapping containing them.")
-
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         device = means.device if torch.is_tensor(means) else torch.device("cpu")
-#         dtype = means.dtype if torch.is_tensor(means) else torch.float32
-#         C = int(means.size(0)) if torch.is_tensor(means) and means.dim() >= 1 else 0
-#         empty = torch.empty((0, C), device=device, dtype=dtype)
-#         if return_parts:
-#             return {"energy": empty, "feature_energy": empty, "parallel": empty, "orthogonal": empty,
-#                     "parallel_energy": empty, "residual_energy": empty, "spectral_energy": empty}
-#         return empty
-
-#     if features.dim() != 2:
-#         raise ValueError(f"features must be [B,D], got {tuple(features.shape)}")
-#     if means.dim() != 2:
-#         raise ValueError(f"means must be [C,D], got {tuple(means.shape)}")
-#     if bases.dim() != 3:
-#         raise ValueError(f"bases must be [C,D,R], got {tuple(bases.shape)}")
-#     B, D = features.shape
-#     C, Dm = means.shape
-#     if Dm != D or bases.size(0) != C or bases.size(1) != D:
-#         raise ValueError(f"feature/bank shape mismatch: features={tuple(features.shape)}, means={tuple(means.shape)}, bases={tuple(bases.shape)}")
-
-#     device, dtype = features.device, features.dtype
-#     means = means.to(device=device, dtype=dtype)
-#     bases = bases.to(device=device, dtype=dtype)
-#     eig, rv = _canonicalize_variances(eigvals=eigvals, res_vars=res_vars, variances=variances)
-#     eig = eig.to(device=device, dtype=dtype)
-#     rv = rv.to(device=device, dtype=dtype).flatten()
-
-#     R = int(bases.size(2))
-#     if eig.dim() != 2 or eig.size(0) != C or eig.size(1) != R:
-#         raise ValueError(f"eigvals/variances rank mismatch: eig={tuple(eig.shape)}, C={C}, R={R}")
-#     if rv.numel() != C:
-#         raise ValueError(f"res_vars must have C={C} entries, got {rv.numel()}")
-
-#     rank_mask, ar = _active_rank_mask(active_ranks, C, R, device, dtype)
-
-#     delta = features.unsqueeze(1) - means.unsqueeze(0)
-#     coeff = torch.einsum("bcd,cdr->bcr", delta, bases)
-#     coeff_active = coeff * rank_mask.view(1, C, R)
-#     recon = torch.einsum("bcr,cdr->bcd", coeff_active, bases)
-#     residual = delta - recon
-
-#     eig_safe = eig.clamp_min(float(variance_floor))
-#     rv_safe = (rv * float(residual_variance_scale)).clamp_min(float(variance_floor))
-
-#     parallel = ((coeff_active.pow(2) / eig_safe.view(1, C, R)) * rank_mask.view(1, C, R)).sum(dim=-1)
-#     orthogonal = residual.pow(2).sum(dim=-1) / rv_safe.view(1, C)
-#     energy = parallel + orthogonal
-#     if bool(normalize_by_dim):
-#         energy = energy / float(max(D, 1))
-
-#     logdet_penalty = torch.zeros((C,), device=device, dtype=dtype)
-#     if bool(use_logdet_energy) and float(logdet_energy_weight) > 0.0:
-#         active_logdet = (eig_safe.log() * rank_mask).sum(dim=1)
-#         residual_dims = (D - ar.clamp(min=0, max=D)).to(dtype=dtype)
-#         logdet_penalty = active_logdet + residual_dims * rv_safe.log()
-#         if bool(logdet_normalize_by_dim):
-#             logdet_penalty = logdet_penalty / float(max(D, 1))
-#         if bool(center_logdet_energy):
-#             logdet_penalty = logdet_penalty - logdet_penalty.mean().detach()
-#         energy = energy + float(logdet_energy_weight) * logdet_penalty.view(1, C)
-
-#     reliability_penalty = torch.zeros((C,), device=device, dtype=dtype)
-#     if reliability is not None and torch.is_tensor(reliability) and float(reliability_energy_weight) > 0.0:
-#         rel = torch.nan_to_num(reliability.to(device=device, dtype=dtype).flatten(), nan=float(reliability_min_clamp), posinf=1.0, neginf=float(reliability_min_clamp))
-#         if rel.numel() != C:
-#             raise ValueError(f"reliability must have C={C} entries, got {rel.numel()}")
-#         rel = rel.clamp(float(reliability_min_clamp), 1.0)
-#         reliability_penalty = -rel.log()
-#         reliability_penalty = reliability_penalty - reliability_penalty.mean().detach()
-#         energy = energy + float(reliability_energy_weight) * reliability_penalty.view(1, C)
-
-#     spectral_energy = torch.zeros_like(energy)
-#     if bool(use_spectral_residual_energy) and float(spectral_energy_weight) > 0.0:
-#         if bool(spectral_require_physical_summary) and not bool(spectral_summary_is_physical):
-#             spectral_energy = torch.zeros_like(energy)
-#         else:
-#             spectral_energy = torch.zeros_like(energy)
-
-#     energy = energy + spectral_energy
-
-#     # Mask invalid/uninitialized classes so stale future rows can never win.
-#     valid_class = torch.ones((C,), device=device, dtype=torch.bool)
-#     if sample_counts is not None and torch.is_tensor(sample_counts):
-#         sc = sample_counts.to(device=device).flatten()
-#         if sc.numel() == C:
-#             valid_class = sc > 0
-#     valid_class = valid_class & (ar > 0)
-#     if bool((~valid_class).any().item()):
-#         energy = energy.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-#         parallel = parallel.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-#         orthogonal = orthogonal.masked_fill((~valid_class).view(1, C), float(invalid_class_energy))
-
-#     energy = torch.nan_to_num(energy, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0)
-
-#     if not return_parts:
-#         return energy
-#     return {
-#         "energy": energy,
-#         "feature_energy": energy,
-#         "parallel": torch.nan_to_num(parallel, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "orthogonal": torch.nan_to_num(orthogonal, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "parallel_energy": torch.nan_to_num(parallel, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "residual_energy": torch.nan_to_num(orthogonal, nan=float(invalid_class_energy), posinf=float(invalid_class_energy), neginf=0.0),
-#         "logdet_penalty": logdet_penalty,
-#         "reliability_penalty": reliability_penalty,
-#         "spectral_energy": spectral_energy,
-#         "active_ranks": ar,
-#         "rank_mask": rank_mask,
-#         "valid_class_mask": valid_class,
-#     }
-
-
-# # -----------------------------------------------------------------------------
-# # Unified base objective
-# # -----------------------------------------------------------------------------
-
-# def base_geometry_preparation_loss(
-#     *,
-#     logits: Optional[torch.Tensor] = None,
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
-#     key_features: Optional[torch.Tensor] = None,
-#     band_summary: Optional[torch.Tensor] = None,
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     ce_weight: float = 0.0,
-#     base_geometry_weight: float = 1.0,
-#     label_smoothing: float = 0.0,
-#     # GICS
-#     gics_weight: float = 0.20,
-#     gics_temperature: float = 0.07,
-#     # PGR
-#     pgr_weight: float = 0.10,
-#     pgr_compact_weight: float = 0.15,
-#     pgr_center_weight: float = 0.20,
-#     pgr_subspace_weight: float = 0.10,
-#     pgr_band_weight: float = 0.05,
-#     pgr_volume_weight: float = 0.05,
-#     pgr_center_margin: float = 1.05,
-#     pgr_max_band_similarity: float = 0.75,
-#     pgr_max_class_variance: float = 0.75,
-#     pgr_min_class_variance: float = 0.015,
-#     pgr_max_subspace_overlap: float = 0.50,
-#     subspace_rank: int = 3,
-#     min_class_samples: int = 3,
-#     subspace_min_samples: int = 6,
-#     # spectral shape
-#     spectral_shape_weight: float = 0.05,
-#     max_spectral_shape_similarity: float = 0.75,
-#     spectral_shape_risk_weight: float = 1.0,
-#     require_physical_summary: bool = True,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Single active base-phase regularizer.
-
-#     BasePhaseTrainer computes balanced CE separately, so ce_weight defaults to
-#     0.0.  The returned 'total' remains differentiable and must be used for SRPGR.
-#     """
-#     if features is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         out = {
-#             "total": z, "ce": z, "base_geometry": z,
-#             "base_gics": z, "base_gics_anchors": z, "base_gics_pos": z,
-#             "base_pgr": z, "base_compact": z, "base_center": z,
-#             "base_subspace": z, "base_band": z, "base_volume": z,
-#             "base_spectral_shape": z, "base_spectral_shape_raw": z,
-#             "base_spectral_shape_mean_similarity": z, "base_spectral_shape_pair_count": z,
-#             "base_spectral_shape_active": z,
-#         }
-#         return out if return_parts else z
-
-#     if features.dim() != 2:
-#         raise ValueError(f"base features must be [B,D], got {tuple(features.shape)}")
-#     _require_finite_tensor(features, "base.features")
-
-#     labels = _as_1d_long(labels, device=features.device)
-#     if labels.numel() != features.size(0):
-#         raise ValueError(f"base labels/features mismatch: labels={labels.numel()}, features={features.size(0)}")
-
-#     ce = safe_zero_like(features)
-#     if ce_weight > 0.0:
-#         if logits is None or not torch.is_tensor(logits):
-#             raise ValueError("logits are required when ce_weight > 0.")
-#         if logits.dim() != 2 or logits.size(0) != labels.numel():
-#             raise ValueError(f"logits must be [B,C] aligned with labels, got {tuple(logits.shape)}")
-#         ce = F.cross_entropy(logits, labels, label_smoothing=float(label_smoothing))
-
-#     # If physical spectra are present, they are the correct band reserve input.
-#     # This avoids PCA-30 band profiles competing with raw-200 spectral descriptors.
-#     band_for_pgr = band_summary
-#     if spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0 and bool(spectral_summary_is_physical):
-#         band_for_pgr = spectral_summary
-
-#     gics = base_geometry_involved_contrastive_loss(
-#         features,
-#         labels,
-#         key_features=key_features,
-#         weight=float(gics_weight),
-#         temperature=float(gics_temperature),
-#         return_parts=True,
-#     )
-
-#     pgr = prospective_geometry_reserve_loss(
-#         features,
-#         labels,
-#         band_summary=band_for_pgr,
-#         weight=float(pgr_weight),
-#         compact_weight=float(pgr_compact_weight),
-#         center_weight=float(pgr_center_weight),
-#         subspace_weight=float(pgr_subspace_weight),
-#         band_weight=float(pgr_band_weight),
-#         volume_weight=float(pgr_volume_weight),
-#         center_margin=float(pgr_center_margin),
-#         min_class_samples=int(min_class_samples),
-#         subspace_min_samples=int(subspace_min_samples),
-#         subspace_rank=int(subspace_rank),
-#         max_band_similarity=float(pgr_max_band_similarity),
-#         max_class_variance=float(pgr_max_class_variance),
-#         min_class_variance=float(pgr_min_class_variance),
-#         max_subspace_overlap=float(kwargs.get("subspace_overlap_max", pgr_max_subspace_overlap)),
-#         return_parts=True,
-#     )
-
-#     shape_raw = spectral_shape_discrimination_loss(
-#         spectral_summary,
-#         labels,
-#         features=features,
-#         spectral_summary_is_physical=bool(spectral_summary_is_physical),
-#         require_physical_summary=bool(require_physical_summary),
-#         min_samples=int(min_class_samples),
-#         max_shape_similarity=float(max_spectral_shape_similarity),
-#         risk_center_margin=float(pgr_center_margin),
-#         risk_weight=float(spectral_shape_risk_weight),
-#         return_parts=True,
-#     )
-#     shape_total = float(spectral_shape_weight) * _scalar(shape_raw.get("total", safe_zero_like(features)), features)
-
-#     gics_total = _scalar(gics.get("total", safe_zero_like(features)), features)
-#     pgr_total = _scalar(pgr.get("total", safe_zero_like(features)), features)
-#     base_geometry = float(base_geometry_weight) * (gics_total + pgr_total + shape_total)
-#     total = float(ce_weight) * ce + base_geometry
-
-#     if not return_parts:
-#         return total
-
-#     spectral_active = bool(spectral_summary_is_physical) and spectral_summary is not None and torch.is_tensor(spectral_summary) and spectral_summary.numel() > 0
-
-#     return {
-#         "total": total,
-#         "ce": ce.detach(),
-#         # Keep differentiable value for code that still uses this key; logs can detach later.
-#         "base_geometry": base_geometry,
-
-#         "base_gics": _scalar(gics.get("gics", safe_zero_like(features)), features).detach(),
-#         "base_gics_weighted": gics_total.detach(),
-#         "base_gics_anchors": _scalar(gics.get("valid_anchors", safe_zero_like(features)), features).detach(),
-#         "base_gics_pos": _scalar(gics.get("mean_positive_count", safe_zero_like(features)), features).detach(),
-
-#         "base_pgr": _scalar(pgr.get("pgr", safe_zero_like(features)), features).detach(),
-#         "base_pgr_weighted": pgr_total.detach(),
-#         "base_compact": _scalar(pgr.get("compact", safe_zero_like(features)), features).detach(),
-#         "base_center": _scalar(pgr.get("center", safe_zero_like(features)), features).detach(),
-#         "base_subspace": _scalar(pgr.get("subspace", safe_zero_like(features)), features).detach(),
-#         "base_band": _scalar(pgr.get("band", safe_zero_like(features)), features).detach(),
-#         "base_volume": _scalar(pgr.get("volume", safe_zero_like(features)), features).detach(),
-
-#         "base_spectral_shape": shape_total.detach(),
-#         "base_spectral_shape_raw": _scalar(shape_raw.get("total", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_mean_similarity": _scalar(shape_raw.get("mean_similarity", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_max_similarity": _scalar(shape_raw.get("max_similarity", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_pair_count": _scalar(shape_raw.get("pair_count", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_active": torch.tensor(float(spectral_active), device=features.device, dtype=features.dtype),
-
-#         "base_pgr_valid_class_count": _scalar(pgr.get("valid_class_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_subspace_pair_count": _scalar(pgr.get("subspace_pair_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_pair_count": _scalar(pgr.get("band_pair_count", safe_zero_like(features)), features).detach(),
-#         "base_pgr_volume_factor": _scalar(pgr.get("volume_factor", safe_zero_like(features)), features).detach(),
-#         "base_pgr_subspace_max_overlap": _scalar(pgr.get("subspace_max_overlap", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_max_similarity": _scalar(pgr.get("band_max_similarity", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_guided_conflict_mean": _scalar(pgr.get("band_guided_conflict_mean", safe_zero_like(features)), features).detach(),
-#         "base_pgr_band_guided_conflict_max": _scalar(pgr.get("band_guided_conflict_max", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_guided_conflict_mean": _scalar(shape_raw.get("guided_conflict_mean", safe_zero_like(features)), features).detach(),
-#         "base_spectral_shape_guided_conflict_max": _scalar(shape_raw.get("guided_conflict_max", safe_zero_like(features)), features).detach(),
-#     }
-
-
-# def unified_spectral_geometry_loss(
-#     *,
-#     phase: str,
-#     labels: torch.Tensor,
-#     logits: Optional[torch.Tensor] = None,
-#     features: Optional[torch.Tensor] = None,
-#     key_features: Optional[torch.Tensor] = None,
-#     band_summary: Optional[torch.Tensor] = None,
-#     spectral_summary: Optional[torch.Tensor] = None,
-#     spectral_summary_is_physical: bool = False,
-#     return_parts: bool = True,
-#     **kwargs: Any,
-# ) -> Dict[str, torch.Tensor] | torch.Tensor:
-#     """Public loss entry used by BasePhaseTrainer.
-
-#     Incremental training should use explicit geometry_energy_matrix + margin
-#     losses, not a monolithic hidden loss stack.
-#     """
-#     p = str(phase).strip().lower()
-#     if p not in {"base", "phase0", "phase_0", "0"}:
+#     token = str(value).replace(" ", "")
+#     if token not in _DIRECT_FACTORIZATIONS:
 #         raise RuntimeError(
-#             "unified_spectral_geometry_loss currently owns only the base phase. "
-#             "For incremental PG-RGA, use geometry_energy_matrix(), "
-#             "geometry_energy_margin_loss(), and old_new_invasion_loss()."
+#             "loss expects direct HSI joint energy p(z|c)p(q|z,c); "
+#             "finite-difference tangent/response energy is incompatible"
 #         )
-#     return base_geometry_preparation_loss(
-#         logits=logits,
-#         features=features,
-#         labels=labels,
-#         key_features=key_features,
-#         band_summary=band_summary,
-#         spectral_summary=spectral_summary,
-#         spectral_summary_is_physical=spectral_summary_is_physical,
-#         return_parts=return_parts,
-#         **kwargs,
-#     )
 
 
-# class UnifiedSpectralGeometryLoss:
-#     """Thin callable wrapper for compatibility with older code."""
-
-#     def __init__(self, **defaults: Any) -> None:
-#         self.defaults = dict(defaults)
-
-#     def __call__(self, **kwargs: Any):
-#         merged = dict(self.defaults)
-#         merged.update(kwargs)
-#         return unified_spectral_geometry_loss(**merged)
-
-
-# # -----------------------------------------------------------------------------
-# # Incremental margin losses used by PG-RGA
-# # -----------------------------------------------------------------------------
-
-# def geometry_energy_margin_loss(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     margin: float = 0.25,
-#     valid_mask: Optional[torch.Tensor] = None,
-# ) -> torch.Tensor:
-#     del valid_mask
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         return safe_zero_like(labels if torch.is_tensor(labels) else None)
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,S], got {tuple(energy.shape)}")
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= energy.size(1)):
-#         raise RuntimeError("labels outside local energy range")
-#     true_e = energy.gather(1, y.view(-1, 1)).squeeze(1)
-#     true_mask = torch.zeros_like(energy, dtype=torch.bool).scatter(1, y.view(-1, 1), True)
-#     nearest_wrong = energy.masked_fill(true_mask, float("inf")).min(dim=1).values
-#     loss = F.relu(true_e + float(margin) - nearest_wrong)
-#     finite = torch.isfinite(loss)
-#     return loss[finite].mean() if bool(finite.any().item()) else energy.sum() * 0.0
+# def _energy(value: torch.Tensor, *, name: str) -> torch.Tensor:
+#     if not torch.is_tensor(value):
+#         raise TypeError(f"{name} must be a tensor")
+#     if value.dim() != 2 or value.size(0) == 0 or value.size(1) < 2:
+#         raise ValueError(
+#             f"{name} must be non-empty [N,C] with C>=2, got {tuple(value.shape)}"
+#         )
+#     if not torch.is_floating_point(value):
+#         raise TypeError(f"{name} must use a floating dtype")
+#     if not torch.isfinite(value).all():
+#         raise RuntimeError(f"{name} contains NaN/Inf")
+#     return value
 
 
-# def old_new_invasion_loss(
-#     energy: torch.Tensor,
-#     labels: torch.Tensor,
-#     old_class_count: int,
-#     margin: float = 0.25,
-#     valid_mask: Optional[torch.Tensor] = None,
-# ) -> torch.Tensor:
-#     del valid_mask
-#     if energy is None or not torch.is_tensor(energy) or energy.numel() == 0:
-#         return safe_zero_like(labels if torch.is_tensor(labels) else None)
-#     if energy.dim() != 2:
-#         raise RuntimeError(f"energy must be [B,S], got {tuple(energy.shape)}")
-#     C = int(energy.size(1))
-#     old = int(max(0, min(int(old_class_count), C)))
-#     if old <= 0 or old >= C:
-#         return energy.sum() * 0.0
-#     y = labels.to(device=energy.device).long().flatten()
-#     if y.numel() != energy.size(0):
-#         raise RuntimeError("labels/energy batch mismatch")
-#     if y.numel() and (int(y.min().item()) < 0 or int(y.max().item()) >= C):
-#         raise RuntimeError("labels outside local energy range")
-#     true_e = energy.gather(1, y.view(-1, 1)).squeeze(1)
-#     old_min = energy[:, :old].min(dim=1).values
-#     new_min = energy[:, old:].min(dim=1).values
-#     is_old = y < old
-#     opposite = torch.where(is_old, new_min, old_min)
-#     loss = F.relu(true_e + float(margin) - opposite)
-#     finite = torch.isfinite(loss)
-#     return loss[finite].mean() if bool(finite.any().item()) else energy.sum() * 0.0
-
-
-# # -----------------------------------------------------------------------------
-# # Base diagnostics
-# # -----------------------------------------------------------------------------
-
-# @torch.no_grad()
-# def base_center_overlap_diagnostics(
-#     features: torch.Tensor,
-#     labels: torch.Tensor,
+# def _targets(
+#     value: torch.Tensor,
 #     *,
-#     normalize: bool = True,
-#     min_samples: int = 2,
-# ) -> Dict[str, torch.Tensor]:
-#     if features is None or labels is None or not torch.is_tensor(features) or features.numel() == 0:
-#         z = safe_zero_like(features)
-#         return {"compact": z, "mean_center_margin": z, "min_center_margin": z, "num_classes": z}
+#     sample_count: int,
+#     class_count: int,
+#     device: torch.device,
+#     name: str,
+# ) -> torch.Tensor:
+#     if not torch.is_tensor(value):
+#         raise TypeError(f"{name} must be a tensor")
+#     result = value.to(device=device, dtype=torch.long).flatten()
+#     if result.numel() != sample_count:
+#         raise ValueError(
+#             f"{name} has {result.numel()} entries; expected {sample_count}"
+#         )
+#     invalid = (result < 0) | (result >= class_count)
+#     if bool(invalid.any().item()):
+#         bad = torch.unique(result[invalid]).detach().cpu().tolist()
+#         raise ValueError(
+#             f"{name} contains seen-local columns outside [0,{class_count - 1}]: {bad}"
+#         )
+#     return result
 
-#     z = F.normalize(features, dim=1, eps=1e-6) if normalize else features
-#     y = _as_1d_long(labels, device=z.device)
-#     centers, _, _ = _class_centers(z, y, min_samples=min_samples)
 
-#     compact_terms = []
-#     for cls in torch.unique(y, sorted=True):
-#         m = y == cls
-#         if int(m.sum().item()) >= int(min_samples):
-#             xc = z[m]
-#             compact_terms.append((xc - xc.mean(dim=0, keepdim=True)).pow(2).sum(dim=1).mean())
-#     compact = torch.stack(compact_terms).mean() if compact_terms else z.sum() * 0.0
-
-#     if centers.size(0) < 2:
-#         mean_margin = z.sum() * 0.0
-#         min_margin = z.sum() * 0.0
+# def _class_mask(
+#     value: Optional[torch.Tensor],
+#     *,
+#     class_count: int,
+#     device: torch.device,
+#     name: str,
+#     default: bool,
+#     require_any: bool,
+# ) -> torch.Tensor:
+#     if value is None:
+#         result = torch.full(
+#             (class_count,), default, device=device, dtype=torch.bool
+#         )
 #     else:
-#         dist = torch.cdist(centers, centers, p=2)
-#         eye = torch.eye(dist.size(0), device=dist.device, dtype=torch.bool)
-#         pair = dist[~eye]
-#         mean_margin = pair.mean()
-#         min_margin = pair.min()
+#         result = torch.as_tensor(
+#             value, device=device, dtype=torch.bool
+#         ).flatten()
+#     if result.numel() != class_count:
+#         raise ValueError(f"{name} must contain C={class_count} values")
+#     if require_any and not bool(result.any().item()):
+#         raise ValueError(f"{name} must select at least one class")
+#     return result
 
+
+# def _weights(
+#     value: Optional[torch.Tensor],
+#     *,
+#     sample_count: int,
+#     device: torch.device,
+#     dtype: torch.dtype,
+#     name: str,
+# ) -> torch.Tensor:
+#     if value is None:
+#         return torch.ones(sample_count, device=device, dtype=dtype)
+#     result = torch.as_tensor(
+#         value, device=device, dtype=dtype
+#     ).flatten()
+#     if result.numel() != sample_count:
+#         raise ValueError(
+#             f"{name} has {result.numel()} entries; expected {sample_count}"
+#         )
+#     if not torch.isfinite(result).all():
+#         raise ValueError(f"{name} contains NaN/Inf")
+#     if bool((result < 0.0).any().item()):
+#         raise ValueError(f"{name} must be non-negative")
+#     if float(result.sum().detach().item()) <= 0.0:
+#         raise ValueError(f"{name} sums to zero")
+#     return result
+
+
+# def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+#     eps = torch.finfo(values.dtype).eps
+#     return (values * weights).sum() / weights.sum().clamp_min(eps)
+
+
+# def _class_balanced_mean(
+#     values: torch.Tensor,
+#     targets: torch.Tensor,
+#     weights: torch.Tensor,
+# ) -> torch.Tensor:
+#     terms: List[torch.Tensor] = []
+#     for class_id in torch.unique(targets, sorted=True):
+#         selected = targets.eq(class_id)
+#         class_weights = weights[selected]
+#         if float(class_weights.sum().detach().item()) <= 0.0:
+#             raise RuntimeError(
+#                 f"class {int(class_id.item())} has zero effective sample weight"
+#             )
+#         terms.append(_weighted_mean(values[selected], class_weights))
+#     if not terms:
+#         raise RuntimeError("class-balanced reduction received no samples")
+#     return torch.stack(terms).mean()
+
+
+# def _reduce(
+#     values: torch.Tensor,
+#     targets: torch.Tensor,
+#     weights: torch.Tensor,
+#     *,
+#     class_balanced: bool,
+# ) -> torch.Tensor:
+#     if class_balanced:
+#         return _class_balanced_mean(values, targets, weights)
+#     return _weighted_mean(values, weights)
+
+
+# def _scalar_optional(
+#     value: Optional[Union[torch.Tensor, Mapping[str, torch.Tensor]]],
+#     *,
+#     name: str,
+#     reference: torch.Tensor,
+# ) -> torch.Tensor:
+#     if value is None:
+#         return reference.sum() * 0.0
+#     result = value.get("total") if isinstance(value, Mapping) else value
+#     if not torch.is_tensor(result) or result.dim() != 0:
+#         raise TypeError(f"{name} must be a scalar tensor or mapping with 'total'")
+#     if not torch.isfinite(result):
+#         raise RuntimeError(f"{name} is NaN/Inf")
+#     return result
+
+
+# def joint_energy_margin_loss(
+#     joint_energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     margin: float = 0.50,
+#     temperature: float = 0.15,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     valid_class_mask: Optional[torch.Tensor] = None,
+#     rival_class_mask: Optional[torch.Tensor] = None,
+#     rival_indices: Optional[torch.Tensor] = None,
+#     class_balanced: bool = True,
+#     joint_factorization: Optional[str] = "p(z|c)p(q|z,c)",
+#     return_parts: bool = True,
+# ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+#     """Soft margin on the exact deployed joint energy.
+
+#     `targets`, `rival_indices`, and masks use seen-local classifier columns.
+#     Lower energy is better.  For each sample, the protected gap is
+
+#         gap = E_rival - E_target.
+
+#     The nearest allowed rival is selected unless `rival_indices` is supplied.
+#     """
+#     _validate_factorization(joint_factorization)
+#     energy = _energy(joint_energy, name="joint_energy")
+#     n, c = energy.shape
+#     y = _targets(
+#         targets,
+#         sample_count=n,
+#         class_count=c,
+#         device=energy.device,
+#         name="targets",
+#     )
+#     margin_value = _nonnegative(margin, name="margin")
+#     tau = _positive(temperature, name="temperature")
+#     weights = _weights(
+#         sample_weights,
+#         sample_count=n,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#         name="sample_weights",
+#     )
+#     valid = _class_mask(
+#         valid_class_mask,
+#         class_count=c,
+#         device=energy.device,
+#         name="valid_class_mask",
+#         default=True,
+#         require_any=True,
+#     )
+#     rivals_allowed = _class_mask(
+#         rival_class_mask,
+#         class_count=c,
+#         device=energy.device,
+#         name="rival_class_mask",
+#         default=True,
+#         require_any=True,
+#     )
+#     if not bool(valid.index_select(0, y).all().item()):
+#         raise RuntimeError("targets reference invalid class columns")
+
+#     allowed = (valid & rivals_allowed)[None, :].expand_as(energy).clone()
+#     allowed.scatter_(1, y[:, None], False)
+#     if not bool(allowed.any(dim=1).all().item()):
+#         raise RuntimeError("one or more samples have no allowed rival class")
+
+#     if rival_indices is None:
+#         rival_energy, rivals = energy.masked_fill(
+#             ~allowed, float("inf")
+#         ).min(dim=1)
+#     else:
+#         rivals = _targets(
+#             rival_indices,
+#             sample_count=n,
+#             class_count=c,
+#             device=energy.device,
+#             name="rival_indices",
+#         )
+#         chosen_allowed = allowed.gather(1, rivals[:, None]).squeeze(1)
+#         if not bool(chosen_allowed.all().item()):
+#             bad = torch.nonzero(
+#                 ~chosen_allowed, as_tuple=False
+#             ).flatten().detach().cpu().tolist()
+#             raise ValueError(
+#                 "rival_indices contain target or excluded columns; "
+#                 f"bad sample indices={bad[:20]}"
+#             )
+#         rival_energy = energy.gather(1, rivals[:, None]).squeeze(1)
+
+#     true_energy = energy.gather(1, y[:, None]).squeeze(1)
+#     gap = rival_energy - true_energy
+#     deficiency = margin_value - gap
+#     per_sample = tau * F.softplus(deficiency / tau)
+#     total = _reduce(
+#         per_sample, y, weights, class_balanced=class_balanced
+#     )
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("joint-energy margin loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+
+#     margin_violations = _reduce(
+#         gap.lt(margin_value).to(energy.dtype),
+#         y,
+#         weights,
+#         class_balanced=class_balanced,
+#     )
+#     classification_violations = _reduce(
+#         gap.le(0.0).to(energy.dtype),
+#         y,
+#         weights,
+#         class_balanced=class_balanced,
+#     )
+#     mean_gap = _reduce(
+#         gap, y, weights, class_balanced=class_balanced
+#     )
 #     return {
-#         "compact": compact.detach(),
-#         "mean_center_margin": mean_margin.detach(),
-#         "min_center_margin": min_margin.detach(),
-#         "num_classes": torch.tensor(float(centers.size(0)), device=z.device, dtype=z.dtype),
+#         "total": total,
+#         "per_sample": per_sample,
+#         "true_energy": true_energy,
+#         "rival_energy": rival_energy,
+#         "rival_indices": rivals.detach(),
+#         "gap": gap,
+#         "mean_gap": mean_gap.detach(),
+#         "q05_gap": torch.quantile(gap.detach(), 0.05),
+#         "minimum_gap": gap.min().detach(),
+#         "margin_violation_rate": margin_violations.detach(),
+#         "classification_violation_rate": classification_violations.detach(),
+#         "accuracy": energy.argmin(dim=1).eq(y).float().mean().detach(),
+#     }
+
+
+# def old_to_new_boundary_loss(
+#     old_joint_energy: torch.Tensor,
+#     old_targets: torch.Tensor,
+#     *,
+#     new_class_mask: torch.Tensor,
+#     margin: float = 0.25,
+#     temperature: float = 0.15,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     class_balanced: bool = True,
+#     return_parts: bool = True,
+# ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+#     """Prevent provisional new rows from invading aggregate old replay.
+
+#     Rivals are *restricted to new-class columns*.  This restriction is essential:
+#     if another immutable old row were selected as the closest rival, the replay
+#     loss could have no gradient with respect to the trainable candidate rows.
+#     """
+#     energy = _energy(old_joint_energy, name="old_joint_energy")
+#     n, c = energy.shape
+#     y = _targets(
+#         old_targets,
+#         sample_count=n,
+#         class_count=c,
+#         device=energy.device,
+#         name="old_targets",
+#     )
+#     new_mask = _class_mask(
+#         new_class_mask,
+#         class_count=c,
+#         device=energy.device,
+#         name="new_class_mask",
+#         default=False,
+#         require_any=True,
+#     )
+#     if bool(new_mask.index_select(0, y).any().item()):
+#         raise RuntimeError("old_targets include a new-class column")
+#     result = joint_energy_margin_loss(
+#         energy,
+#         y,
+#         margin=margin,
+#         temperature=temperature,
+#         sample_weights=sample_weights,
+#         rival_class_mask=new_mask,
+#         class_balanced=class_balanced,
+#         return_parts=True,
+#     )
+#     assert isinstance(result, dict)
+#     if not return_parts:
+#         return result["total"]
+#     return {
+#         **result,
+#         "old_to_new_invasion_rate": result[
+#             "classification_violation_rate"
+#         ],
+#     }
+
+
+# def candidate_trust_region_loss(
+#     *,
+#     feature_mean_deltas: Mapping[int, torch.Tensor],
+#     feature_log_eigval_deltas: Mapping[int, torch.Tensor],
+#     feature_log_residual_deltas: Mapping[int, torch.Tensor],
+#     spectral_mean_deltas: Mapping[int, torch.Tensor],
+#     spectral_log_eigval_deltas: Mapping[int, torch.Tensor],
+#     spectral_log_residual_deltas: Mapping[int, torch.Tensor],
+#     feature_mean_scale: float = 0.25,
+#     feature_log_variance_scale: float = 0.15,
+#     spectral_mean_scale: float = 0.25,
+#     spectral_log_variance_scale: float = 0.15,
+#     class_weights: Optional[Mapping[int, float]] = None,
+#     return_parts: bool = True,
+# ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+#     """Prefer small candidate-row corrections inside the bank's hard bounds.
+
+#     This objective is used only when candidate-row deltas are trainable.  The
+#     GeometryBank correction limits remain the hard safety mechanism.
+#     """
+#     groups: Tuple[
+#         Tuple[str, Mapping[int, torch.Tensor], float], ...
+#     ] = (
+#         ("feature_mean", feature_mean_deltas, _positive(
+#             feature_mean_scale, name="feature_mean_scale"
+#         )),
+#         ("feature_log_eigval", feature_log_eigval_deltas, _positive(
+#             feature_log_variance_scale, name="feature_log_variance_scale"
+#         )),
+#         ("feature_log_residual", feature_log_residual_deltas, _positive(
+#             feature_log_variance_scale, name="feature_log_variance_scale"
+#         )),
+#         ("spectral_mean", spectral_mean_deltas, _positive(
+#             spectral_mean_scale, name="spectral_mean_scale"
+#         )),
+#         ("spectral_log_eigval", spectral_log_eigval_deltas, _positive(
+#             spectral_log_variance_scale, name="spectral_log_variance_scale"
+#         )),
+#         ("spectral_log_residual", spectral_log_residual_deltas, _positive(
+#             spectral_log_variance_scale, name="spectral_log_variance_scale"
+#         )),
+#     )
+#     key_sets = [set(int(key) for key in mapping) for _, mapping, _ in groups]
+#     if not key_sets or not key_sets[0]:
+#         raise ValueError("candidate delta mappings are empty")
+#     expected = key_sets[0]
+#     for (name, _, _), keys in zip(groups, key_sets):
+#         if keys != expected:
+#             raise RuntimeError(f"{name}_deltas keys do not match candidate classes")
+
+#     reference: Optional[torch.Tensor] = None
+#     for _, mapping, _ in groups:
+#         for tensor in mapping.values():
+#             if not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
+#                 raise TypeError("candidate deltas must be floating tensors")
+#             if not torch.isfinite(tensor).all():
+#                 raise RuntimeError("candidate deltas contain NaN/Inf")
+#             reference = tensor if reference is None else reference
+#     assert reference is not None
+#     device, dtype = reference.device, reference.dtype
+
+#     class_terms: List[torch.Tensor] = []
+#     class_gains: List[torch.Tensor] = []
+#     component_values: Dict[str, List[torch.Tensor]] = {
+#         name: [] for name, _, _ in groups
+#     }
+#     for class_id in sorted(expected):
+#         components: List[torch.Tensor] = []
+#         for name, mapping, scale in groups:
+#             tensor = mapping[class_id]
+#             if tensor.device != device:
+#                 raise RuntimeError("all candidate deltas must share one device")
+#             normalized = tensor.to(dtype=dtype) / scale
+#             term = (
+#                 F.smooth_l1_loss(
+#                     normalized,
+#                     torch.zeros_like(normalized),
+#                     reduction="mean",
+#                     beta=1.0,
+#                 )
+#                 if normalized.numel()
+#                 else normalized.sum() * 0.0
+#             )
+#             component_values[name].append(term)
+#             components.append(term)
+#         class_term = torch.stack(components).mean()
+#         gain = 1.0 if class_weights is None else _nonnegative(
+#             class_weights[class_id], name=f"class_weights[{class_id}]"
+#         )
+#         if gain <= 0.0:
+#             continue
+#         class_terms.append(class_term)
+#         class_gains.append(torch.tensor(gain, device=device, dtype=dtype))
+
+#     if not class_terms:
+#         raise ValueError("all candidate class weights are zero")
+#     terms = torch.stack(class_terms)
+#     gains = torch.stack(class_gains)
+#     total = _weighted_mean(terms, gains)
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("candidate trust-region loss is not finite")
+#     if not return_parts:
+#         return total
+#     output: Dict[str, torch.Tensor] = {
+#         "total": total,
+#         "mean_class_penalty": terms.mean().detach(),
+#         "maximum_class_penalty": terms.max().detach(),
+#     }
+#     for name, values in component_values.items():
+#         output[f"{name}_penalty"] = torch.stack(values).mean().detach()
+#     return output
+
+
+# def base_geometry_loss(
+#     base_logits: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     query_joint_energy: Optional[torch.Tensor] = None,
+#     query_targets: Optional[torch.Tensor] = None,
+#     ce_sample_weights: Optional[torch.Tensor] = None,
+#     query_sample_weights: Optional[torch.Tensor] = None,
+#     geometry_weight: float = 0.25,
+#     geometry_margin: float = 0.50,
+#     temperature: float = 0.20,
+#     label_smoothing: float = 0.0,
+#     class_balanced: bool = True,
+#     return_parts: bool = True,
+# ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+#     """Temporary base CE plus optional held-out joint-energy preparation."""
+#     if not torch.is_tensor(base_logits) or base_logits.dim() != 2:
+#         raise ValueError("base_logits must be [N,C]")
+#     if not torch.isfinite(base_logits).all():
+#         raise RuntimeError("base_logits contain NaN/Inf")
+#     n, c = base_logits.shape
+#     y = _targets(
+#         targets,
+#         sample_count=n,
+#         class_count=c,
+#         device=base_logits.device,
+#         name="targets",
+#     )
+#     weights = _weights(
+#         ce_sample_weights,
+#         sample_count=n,
+#         device=base_logits.device,
+#         dtype=base_logits.dtype,
+#         name="ce_sample_weights",
+#     )
+#     smoothing = _nonnegative(label_smoothing, name="label_smoothing")
+#     if smoothing >= 1.0:
+#         raise ValueError("label_smoothing must be smaller than one")
+#     ce_per_sample = F.cross_entropy(
+#         base_logits,
+#         y,
+#         reduction="none",
+#         label_smoothing=smoothing,
+#     )
+#     ce = _reduce(
+#         ce_per_sample, y, weights, class_balanced=class_balanced
+#     )
+
+#     geometry_result: Optional[Dict[str, torch.Tensor]] = None
+#     geometry = base_logits.sum() * 0.0
+#     if query_joint_energy is not None or query_targets is not None:
+#         if query_joint_energy is None or query_targets is None:
+#             raise ValueError(
+#                 "query_joint_energy and query_targets must be provided together"
+#             )
+#         geometry_result = joint_energy_margin_loss(
+#             query_joint_energy,
+#             query_targets,
+#             margin=geometry_margin,
+#             temperature=temperature,
+#             sample_weights=query_sample_weights,
+#             class_balanced=class_balanced,
+#             return_parts=True,
+#         )
+#         assert isinstance(geometry_result, dict)
+#         geometry = geometry_result["total"]
+
+#     geometry_gain = _nonnegative(geometry_weight, name="geometry_weight")
+#     total = ce + geometry_gain * geometry
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("base geometry loss is not finite")
+#     if not return_parts:
+#         return total
+#     zero = total.detach() * 0.0
+#     return {
+#         "total": total,
+#         "ce": ce,
+#         "joint_geometry": geometry,
+#         "ce_accuracy": base_logits.argmax(dim=1).eq(y).float().mean().detach(),
+#         "joint_mean_gap": (
+#             geometry_result["mean_gap"] if geometry_result is not None else zero
+#         ),
+#     }
+
+
+# def incremental_geometry_loss(
+#     new_joint_energy: torch.Tensor,
+#     new_targets: torch.Tensor,
+#     *,
+#     old_boundary_joint_energy: torch.Tensor,
+#     old_boundary_targets: torch.Tensor,
+#     new_class_mask: torch.Tensor,
+#     new_sample_weights: Optional[torch.Tensor] = None,
+#     old_boundary_weights: Optional[torch.Tensor] = None,
+#     trust_region: Optional[
+#         Union[torch.Tensor, Mapping[str, torch.Tensor]]
+#     ] = None,
+#     new_margin: float = 0.50,
+#     old_boundary_margin: float = 0.25,
+#     temperature: float = 0.15,
+#     new_weight: float = 1.0,
+#     old_boundary_weight: float = 1.0,
+#     trust_region_weight: float = 1e-3,
+#     class_balanced: bool = True,
+#     return_parts: bool = True,
+# ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+#     """Final incremental objective for candidate-row refinement.
+
+#     The classification component is normalized by its active weights, keeping
+#     its scale stable when the new/replay balance is changed.  The trust term is
+#     added separately because it regularizes parameter displacement rather than
+#     classification risk.
+#     """
+#     new_result = joint_energy_margin_loss(
+#         new_joint_energy,
+#         new_targets,
+#         margin=new_margin,
+#         temperature=temperature,
+#         sample_weights=new_sample_weights,
+#         class_balanced=class_balanced,
+#         return_parts=True,
+#     )
+#     assert isinstance(new_result, dict)
+#     old_result = old_to_new_boundary_loss(
+#         old_boundary_joint_energy,
+#         old_boundary_targets,
+#         new_class_mask=new_class_mask,
+#         margin=old_boundary_margin,
+#         temperature=temperature,
+#         sample_weights=old_boundary_weights,
+#         class_balanced=class_balanced,
+#         return_parts=True,
+#     )
+#     assert isinstance(old_result, dict)
+
+#     new_gain = _positive(new_weight, name="new_weight")
+#     replay_gain = _positive(
+#         old_boundary_weight, name="old_boundary_weight"
+#     )
+#     classification = (
+#         new_gain * new_result["total"]
+#         + replay_gain * old_result["total"]
+#     ) / (new_gain + replay_gain)
+
+#     trust = _scalar_optional(
+#         trust_region,
+#         name="trust_region",
+#         reference=classification,
+#     )
+#     trust_gain = _nonnegative(
+#         trust_region_weight, name="trust_region_weight"
+#     )
+#     total = classification + trust_gain * trust
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("incremental geometry loss is not finite")
+#     if not return_parts:
+#         return total
+#     return {
+#         "total": total,
+#         "classification": classification,
+#         "new_margin": new_result["total"],
+#         "old_to_new_boundary": old_result["total"],
+#         "trust_region": trust,
+#         "new_mean_gap": new_result["mean_gap"],
+#         "new_q05_gap": new_result["q05_gap"],
+#         "old_to_new_mean_gap": old_result["mean_gap"],
+#         "old_to_new_q05_gap": old_result["q05_gap"],
+#         "new_classification_violation_rate": new_result[
+#             "classification_violation_rate"
+#         ],
+#         "old_to_new_invasion_rate": old_result[
+#             "old_to_new_invasion_rate"
+#         ],
 #     }
 
 
 # @torch.no_grad()
-# def base_gics_diagnostics(features: torch.Tensor, labels: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-#     out = base_geometry_involved_contrastive_loss(features, labels, weight=1.0, return_parts=True, **kwargs)
+# def pairwise_directional_invasion_matrix(
+#     joint_energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     valid_class_mask: Optional[torch.Tensor] = None,
+#     sample_weights: Optional[torch.Tensor] = None,
+# ) -> Dict[str, torch.Tensor]:
+#     """Diagnostic ordered source-to-rival invasion rates."""
+#     energy = _energy(joint_energy, name="joint_energy")
+#     n, c = energy.shape
+#     y = _targets(
+#         targets,
+#         sample_count=n,
+#         class_count=c,
+#         device=energy.device,
+#         name="targets",
+#     )
+#     valid = _class_mask(
+#         valid_class_mask,
+#         class_count=c,
+#         device=energy.device,
+#         name="valid_class_mask",
+#         default=True,
+#         require_any=True,
+#     )
+#     if not bool(valid.index_select(0, y).all().item()):
+#         raise RuntimeError("targets reference invalid class columns")
+#     weights = _weights(
+#         sample_weights,
+#         sample_count=n,
+#         device=energy.device,
+#         dtype=torch.float64,
+#         name="sample_weights",
+#     )
+#     invasion = torch.zeros((c, c), device=energy.device, dtype=torch.float64)
+#     q05 = torch.full_like(invasion, float("nan"))
+#     source_weight = torch.zeros(c, device=energy.device, dtype=torch.float64)
+#     for source in range(c):
+#         if not bool(valid[source].item()):
+#             continue
+#         selected = y.eq(source)
+#         if not bool(selected.any().item()):
+#             continue
+#         local_weights = weights[selected]
+#         denominator = local_weights.sum().clamp_min(
+#             torch.finfo(torch.float64).eps
+#         )
+#         source_weight[source] = denominator
+#         true = energy[selected, source]
+#         for rival in range(c):
+#             if rival == source or not bool(valid[rival].item()):
+#                 continue
+#             gap = energy[selected, rival] - true
+#             invasion[source, rival] = (
+#                 gap.le(0.0).double() * local_weights
+#             ).sum() / denominator
+#             q05[source, rival] = torch.quantile(gap.double(), 0.05)
+#     off_diagonal = (
+#         valid[:, None]
+#         & valid[None, :]
+#         & ~torch.eye(c, device=energy.device, dtype=torch.bool)
+#     )
+#     values = invasion[off_diagonal]
 #     return {
-#         "gics": out["gics"].detach(),
-#         "valid_anchors": out["valid_anchors"].detach(),
-#         "positive_pairs": out["mean_positive_count"].detach(),
+#         "invasion_matrix": invasion,
+#         "gap_q05_matrix": q05,
+#         "source_weight": source_weight,
+#         "maximum_directional_invasion": (
+#             values.max() if values.numel() else invasion.new_tensor(0.0)
+#         ),
+#         "mean_directional_invasion": (
+#             values.mean() if values.numel() else invasion.new_tensor(0.0)
+#         ),
 #     }
 
 
-# def base_supcon_diagnostics(*args: Any, **kwargs: Any):
-#     return base_gics_diagnostics(*args, **kwargs)
+# # Project-facing aliases.
+# hsi_joint_energy_margin_loss = joint_energy_margin_loss
+# hsi_boundary_replay_loss = old_to_new_boundary_loss
+# hsi_candidate_trust_region_loss = candidate_trust_region_loss
+# base_hsi_geometry_objective = base_geometry_loss
+# incremental_hsi_geometry_objective = incremental_geometry_loss
+
+# # Narrow migration aliases.  They all resolve to the direct-descriptor rule.
+# phase_consistent_conditional_joint_consolidation_loss = joint_energy_margin_loss
+# phase_consistent_spectral_geometry_consolidation_loss = joint_energy_margin_loss
+# pc_stgb_loss = joint_energy_margin_loss
+# pc_sgc_loss = joint_energy_margin_loss
+# candidate_descriptor_trust_region_loss = candidate_trust_region_loss
 
 
-# # -----------------------------------------------------------------------------
-# # Disabled legacy boundary helper
-# # -----------------------------------------------------------------------------
+# def _retired(name: str, replacement: str):
+#     def fail(*_args, **_kwargs):
+#         raise RuntimeError(f"{name} is retired. {replacement}")
 
-# def sample_boundary_geometry_features(*args: Any, **kwargs: Any):
-#     raise RuntimeError(
-#         "sample_boundary_geometry_features is not part of main path. "
-#         "Use GeometryBank synthetic replay, not boundary replay."
+#     fail.__name__ = name
+#     return fail
+
+
+# # These objectives duplicate the two exact margins or belong to the removed
+# # tangent-response architecture.  Explicit failure is safer than silent reuse.
+# hsi_two_sided_invasion_loss = _retired(
+#     "hsi_two_sided_invasion_loss",
+#     "new-sample all-rival margin plus old_to_new_boundary_loss already protect both directions",
+# )
+# two_sided_old_new_invasion_loss = hsi_two_sided_invasion_loss
+# hsi_candidate_topology_barrier_loss = _retired(
+#     "hsi_candidate_topology_barrier_loss",
+#     "use GeometryBank pairwise_structure only as a diagnostic in the frozen-coordinate main method",
+# )
+# joint_energy_boundary_certificate_loss = _retired(
+#     "joint_energy_boundary_certificate_loss",
+#     "use aggregate boundary/risk-directed replay with old_to_new_boundary_loss",
+# )
+# spectral_tangent_step_consistency_loss = _retired(
+#     "spectral_tangent_step_consistency_loss",
+#     "the deployed method uses direct spectral descriptors, not finite-difference tangents",
+# )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# from __future__ import annotations
+
+# from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+
+# import math
+
+# import torch
+# import torch.nn.functional as F
+
+
+# __all__ = [
+#     "phase_consistent_conditional_joint_consolidation_loss",
+#     "phase_consistent_spectral_geometry_consolidation_loss",
+#     "pc_stgb_loss",
+#     "pc_sgc_loss",
+#     "joint_energy_boundary_certificate_loss",
+#     "two_sided_old_new_invasion_loss",
+#     "spectral_tangent_step_consistency_loss",
+#     "candidate_descriptor_trust_region_loss",
+#     "pairwise_directional_invasion_matrix",
+# ]
+
+
+# # =============================================================================
+# # Shared validation and weighted reductions
+# # =============================================================================
+
+
+# def _require_energy_matrix(value: torch.Tensor, *, name: str) -> torch.Tensor:
+#     if not torch.is_tensor(value):
+#         raise TypeError(f"{name} must be a tensor")
+#     if value.dim() != 2 or value.size(0) == 0 or value.size(1) < 2:
+#         raise ValueError(
+#             f"{name} must be a non-empty [N,C] tensor with C>=2; "
+#             f"got {tuple(value.shape)}"
+#         )
+#     if not torch.is_floating_point(value):
+#         raise TypeError(f"{name} must use a floating dtype")
+#     if not torch.isfinite(value).all():
+#         bad = int((~torch.isfinite(value)).sum().detach().cpu().item())
+#         raise RuntimeError(f"{name} contains {bad} NaN/Inf values")
+#     return value
+
+
+# def _require_targets(
+#     value: torch.Tensor,
+#     *,
+#     sample_count: int,
+#     class_count: int,
+#     device: torch.device,
+#     name: str = "targets",
+# ) -> torch.Tensor:
+#     if not torch.is_tensor(value):
+#         raise TypeError(f"{name} must be a tensor")
+#     targets = value.to(device=device, dtype=torch.long).flatten()
+#     if targets.numel() != int(sample_count):
+#         raise ValueError(
+#             f"{name} contains {targets.numel()} values; expected {sample_count}"
+#         )
+#     if targets.numel() == 0:
+#         raise ValueError(f"{name} is empty")
+#     invalid = (targets < 0) | (targets >= int(class_count))
+#     if bool(invalid.any().item()):
+#         bad = torch.unique(targets[invalid]).detach().cpu().tolist()
+#         raise ValueError(
+#             f"{name} contains class columns outside [0,{class_count - 1}]: {bad}"
+#         )
+#     return targets
+
+
+# def _require_nonnegative_finite(value: float, *, name: str) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result < 0.0:
+#         raise ValueError(f"{name} must be finite and non-negative, got {value!r}")
+#     return result
+
+
+# def _require_positive_finite(value: float, *, name: str) -> float:
+#     result = float(value)
+#     if not math.isfinite(result) or result <= 0.0:
+#         raise ValueError(f"{name} must be finite and positive, got {value!r}")
+#     return result
+
+
+# def _require_valid_class_mask(
+#     value: Optional[torch.Tensor],
+#     *,
+#     class_count: int,
+#     device: torch.device,
+# ) -> torch.Tensor:
+#     if value is None:
+#         return torch.ones(class_count, device=device, dtype=torch.bool)
+#     mask = torch.as_tensor(value, device=device, dtype=torch.bool).flatten()
+#     if mask.numel() != int(class_count):
+#         raise ValueError(
+#             f"valid_class_mask contains {mask.numel()} values; expected {class_count}"
+#         )
+#     if int(mask.sum().item()) < 2:
+#         raise RuntimeError("at least two valid class columns are required")
+#     return mask
+
+
+# def _require_partition_mask(
+#     value: torch.Tensor,
+#     *,
+#     class_count: int,
+#     device: torch.device,
+#     name: str,
+# ) -> torch.Tensor:
+#     mask = torch.as_tensor(value, device=device, dtype=torch.bool).flatten()
+#     if mask.numel() != int(class_count):
+#         raise ValueError(f"{name} must contain C={class_count} values")
+#     if not bool(mask.any().item()):
+#         raise ValueError(f"{name} must contain at least one class")
+#     return mask
+
+
+# def _require_sample_weights(
+#     value: Optional[torch.Tensor],
+#     *,
+#     sample_count: int,
+#     device: torch.device,
+#     dtype: torch.dtype,
+# ) -> torch.Tensor:
+#     if value is None:
+#         return torch.ones(sample_count, device=device, dtype=dtype)
+#     weights = torch.as_tensor(value, device=device, dtype=dtype).flatten()
+#     if weights.numel() != int(sample_count):
+#         raise ValueError(
+#             f"sample_weights contain {weights.numel()} values; expected {sample_count}"
+#         )
+#     if not torch.isfinite(weights).all():
+#         raise ValueError("sample_weights contain NaN/Inf")
+#     if bool((weights < 0.0).any().item()):
+#         raise ValueError("sample_weights must be non-negative")
+#     if float(weights.sum().detach().item()) <= 0.0:
+#         raise ValueError("sample_weights sum to zero")
+#     return weights
+
+
+# def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+#     epsilon = torch.finfo(values.dtype).eps
+#     return (values * weights).sum() / weights.sum().clamp_min(epsilon)
+
+
+# def _weighted_population_variance(
+#     values: torch.Tensor,
+#     weights: torch.Tensor,
+#     mean: Optional[torch.Tensor] = None,
+# ) -> torch.Tensor:
+#     center = _weighted_mean(values, weights) if mean is None else mean
+#     epsilon = torch.finfo(values.dtype).eps
+#     return (
+#         weights * (values - center).square()
+#     ).sum() / weights.sum().clamp_min(epsilon)
+
+
+# def _effective_sample_size(weights: torch.Tensor) -> torch.Tensor:
+#     epsilon = torch.finfo(weights.dtype).eps
+#     numerator = weights.sum().square()
+#     denominator = weights.square().sum().clamp_min(epsilon)
+#     return numerator / denominator
+
+
+# def _class_balanced_weighted_mean(
+#     values: torch.Tensor,
+#     targets: torch.Tensor,
+#     sample_weights: torch.Tensor,
+# ) -> torch.Tensor:
+#     terms: List[torch.Tensor] = []
+#     for class_id in torch.unique(targets, sorted=True):
+#         mask = targets.eq(class_id)
+#         class_weights = sample_weights[mask]
+#         if float(class_weights.sum().detach().item()) <= 0.0:
+#             raise RuntimeError(
+#                 f"class {int(class_id.item())} has zero total sample weight"
+#             )
+#         terms.append(_weighted_mean(values[mask], class_weights))
+#     if not terms:
+#         raise RuntimeError("class-balanced reduction received no classes")
+#     return torch.stack(terms).mean()
+
+
+# def _require_pair_matrix(
+#     value: Optional[torch.Tensor],
+#     *,
+#     class_count: int,
+#     device: torch.device,
+#     dtype: torch.dtype,
+#     name: str,
+#     default: Optional[float] = None,
+#     boolean: bool = False,
+# ) -> Optional[torch.Tensor]:
+#     if value is None:
+#         if default is None:
+#             return None
+#         if boolean:
+#             return torch.full(
+#                 (class_count, class_count),
+#                 bool(default),
+#                 device=device,
+#                 dtype=torch.bool,
+#             )
+#         return torch.full(
+#             (class_count, class_count),
+#             float(default),
+#             device=device,
+#             dtype=dtype,
+#         )
+#     if boolean:
+#         matrix = torch.as_tensor(value, device=device, dtype=torch.bool)
+#     else:
+#         matrix = torch.as_tensor(value, device=device, dtype=dtype)
+#     if matrix.shape != (class_count, class_count):
+#         raise ValueError(
+#             f"{name} must be [C,C]; got {tuple(matrix.shape)} for C={class_count}"
+#         )
+#     if not boolean:
+#         if not torch.isfinite(matrix).all():
+#             raise RuntimeError(f"{name} contains NaN/Inf")
+#         if bool((matrix < 0.0).any().item()):
+#             raise ValueError(f"{name} must be non-negative")
+#         matrix = matrix.detach()
+#     return matrix
+
+
+# def _validate_joint_factorization(value: Optional[str]) -> None:
+#     if value is None:
+#         return
+#     token = str(value).replace(" ", "")
+#     accepted = {
+#         "p(z|c)prod_kp(g_k|z,c)",
+#         "p(z,g|c)=p(z|c)prod_kp(g_k|z,c)",
+#     }
+#     if token not in accepted:
+#         raise RuntimeError(
+#             "loss received energy from an incompatible factorization; "
+#             "PC-STGB requires p(z|c)prod_k p(g_k|z,c)"
+#         )
+
+
+# # =============================================================================
+# # Exact deployed-energy consolidation
+# # =============================================================================
+
+
+# def phase_consistent_conditional_joint_consolidation_loss(
+#     joint_energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     margin: float,
+#     temperature: float = 0.20,
+#     pair_margin_matrix: Optional[torch.Tensor] = None,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     rival_indices: Optional[torch.Tensor] = None,
+#     valid_class_mask: Optional[torch.Tensor] = None,
+#     class_balanced: bool = True,
+#     joint_factorization: Optional[str] = None,
+#     return_parts: bool = True,
+# ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+#     """PC-STGB margin on the exact deployed conditional joint energy.
+
+#     The caller must pass
+
+#         E_c(z,g) = E_c^occ(z) + beta_T E_c^tan(g | z).
+
+#     No feature distance, prototype distance, or independently computed response
+#     score is reconstructed inside this loss.  The same objective is therefore
+#     valid for held-out base tuples, current new tuples, and coupled old replay.
+#     """
+#     _validate_joint_factorization(joint_factorization)
+#     energy = _require_energy_matrix(joint_energy, name="joint_energy")
+#     sample_count, class_count = energy.shape
+#     y = _require_targets(
+#         targets,
+#         sample_count=sample_count,
+#         class_count=class_count,
+#         device=energy.device,
 #     )
+#     margin_value = _require_nonnegative_finite(margin, name="margin")
+#     temperature_value = _require_positive_finite(temperature, name="temperature")
+
+#     valid = _require_valid_class_mask(
+#         valid_class_mask,
+#         class_count=class_count,
+#         device=energy.device,
+#     )
+#     target_valid = valid.index_select(0, y)
+#     if not bool(target_valid.all().item()):
+#         bad = torch.unique(y[~target_valid]).detach().cpu().tolist()
+#         raise RuntimeError(f"targets reference invalid class columns: {bad}")
+
+#     weights = _require_sample_weights(
+#         sample_weights,
+#         sample_count=sample_count,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#     )
+#     pair_margins = _require_pair_matrix(
+#         pair_margin_matrix,
+#         class_count=class_count,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#         name="pair_margin_matrix",
+#     )
+
+#     true_energy = energy.gather(1, y[:, None]).squeeze(1)
+#     rival_mask = valid[None, :].expand_as(energy).clone()
+#     rival_mask.scatter_(1, y[:, None], False)
+#     if not bool(rival_mask.any(dim=1).all().item()):
+#         raise RuntimeError("at least one sample has no valid rival class")
+
+#     if rival_indices is None:
+#         masked = energy.masked_fill(~rival_mask, float("inf"))
+#         rival_energy, rivals = masked.min(dim=1)
+#     else:
+#         rivals = _require_targets(
+#             rival_indices,
+#             sample_count=sample_count,
+#             class_count=class_count,
+#             device=energy.device,
+#             name="rival_indices",
+#         )
+#         invalid = rivals.eq(y) | ~valid.index_select(0, rivals)
+#         if bool(invalid.any().item()):
+#             bad = torch.nonzero(invalid, as_tuple=False).flatten().detach().cpu().tolist()
+#             raise ValueError(
+#                 "rival_indices must reference valid non-target columns; "
+#                 f"bad sample indices={bad[:20]}"
+#             )
+#         rival_energy = energy.gather(1, rivals[:, None]).squeeze(1)
+
+#     gap = rival_energy - true_energy
+#     required_margin = energy.new_full((sample_count,), margin_value)
+#     if pair_margins is not None:
+#         required_margin = torch.maximum(required_margin, pair_margins[y, rivals])
+
+#     deficiency = required_margin - gap
+#     per_sample = temperature_value * F.softplus(deficiency / temperature_value)
+
+#     reducer = _class_balanced_weighted_mean if class_balanced else _weighted_mean
+#     if class_balanced:
+#         total = reducer(per_sample, y, weights)
+#         mean_gap = reducer(gap, y, weights)
+#         margin_violation = reducer(gap.lt(required_margin).to(energy.dtype), y, weights)
+#         classification_violation = reducer(gap.le(0.0).to(energy.dtype), y, weights)
+#     else:
+#         total = reducer(per_sample, weights)
+#         mean_gap = reducer(gap, weights)
+#         margin_violation = reducer(gap.lt(required_margin).to(energy.dtype), weights)
+#         classification_violation = reducer(gap.le(0.0).to(energy.dtype), weights)
+
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("PC-STGB consolidation loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+
+#     collapse = torch.relu(-gap)
+#     return {
+#         "total": total,
+#         "per_sample": per_sample,
+#         "true_energy": true_energy,
+#         "rival_energy": rival_energy,
+#         "best_rival_energy": rival_energy,
+#         "rival_indices": rivals.detach(),
+#         "best_rival": rivals.detach(),
+#         "gap": gap,
+#         "required_margin": required_margin,
+#         "mean_gap": mean_gap.detach(),
+#         "q05_gap": torch.quantile(gap.detach(), 0.05),
+#         "minimum_gap": gap.min().detach(),
+#         "mean_required_margin": _weighted_mean(required_margin, weights).detach(),
+#         "margin_violation_rate": margin_violation.detach(),
+#         "classification_violation_rate": classification_violation.detach(),
+#         "mean_collapse_severity": _weighted_mean(collapse, weights).detach(),
+#         "maximum_collapse_severity": collapse.max().detach(),
+#         "active_class_count": valid.sum().to(energy.dtype).detach(),
+#         "sample_count": energy.new_tensor(float(sample_count)),
+#         "uses_exact_joint_energy": energy.new_tensor(True, dtype=torch.bool),
+#     }
+
+
+# # Public compatibility name used by existing trainer code.  It now implements
+# # the conditional PC-STGB objective rather than the old independent PC-SIRG rule.
+# phase_consistent_spectral_geometry_consolidation_loss = (
+#     phase_consistent_conditional_joint_consolidation_loss
+# )
+# pc_stgb_loss = phase_consistent_conditional_joint_consolidation_loss
+# pc_sgc_loss = phase_consistent_conditional_joint_consolidation_loss
+
+
+# # =============================================================================
+# # Robust pairwise decision-boundary certificate
+# # =============================================================================
+
+
+# def joint_energy_boundary_certificate_loss(
+#     joint_energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     margin: float = 0.0,
+#     temperature: float = 0.10,
+#     confidence_multiplier: float = 1.0,
+#     pair_margin_matrix: Optional[torch.Tensor] = None,
+#     pair_mask: Optional[torch.Tensor] = None,
+#     pair_weights: Optional[torch.Tensor] = None,
+#     valid_class_mask: Optional[torch.Tensor] = None,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     minimum_samples_per_source: int = 2,
+#     joint_factorization: Optional[str] = None,
+#     return_parts: bool = True,
+# ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+#     """Protect a lower confidence bound of each ordered joint-energy gap.
+
+#     For source class ``c`` and rival ``j``:
+
+#         Delta_cj = E_j - E_c
+#         LCB_cj   = mean(Delta_cj) - kappa * std(Delta_cj)
+
+#     The distributional standard deviation is used deliberately rather than the
+#     standard error.  The objective therefore protects the lower tail of the
+#     class region, not merely confidence in the estimated mean.
+
+#     This is the boundary reserve for PC-STGB.  It uses the same conditional
+#     joint energy as inference and does not construct a second Euclidean
+#     ellipsoid or manually scale tangent responses.
+#     """
+#     _validate_joint_factorization(joint_factorization)
+#     energy = _require_energy_matrix(joint_energy, name="joint_energy")
+#     n, c = energy.shape
+#     y = _require_targets(targets, sample_count=n, class_count=c, device=energy.device)
+#     margin_value = _require_nonnegative_finite(margin, name="margin")
+#     temperature_value = _require_positive_finite(temperature, name="temperature")
+#     kappa = _require_nonnegative_finite(
+#         confidence_multiplier, name="confidence_multiplier"
+#     )
+#     minimum_support = int(minimum_samples_per_source)
+#     if minimum_support < 2:
+#         raise ValueError("minimum_samples_per_source must be at least two")
+
+#     valid = _require_valid_class_mask(
+#         valid_class_mask, class_count=c, device=energy.device
+#     )
+#     if not bool(valid.index_select(0, y).all().item()):
+#         raise RuntimeError("targets reference invalid class columns")
+#     weights = _require_sample_weights(
+#         sample_weights,
+#         sample_count=n,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#     )
+#     margins = _require_pair_matrix(
+#         pair_margin_matrix,
+#         class_count=c,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#         name="pair_margin_matrix",
+#     )
+#     selected = _require_pair_matrix(
+#         pair_mask,
+#         class_count=c,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#         name="pair_mask",
+#         default=1.0,
+#         boolean=True,
+#     )
+#     assert selected is not None
+#     selected = selected.clone()
+#     selected.fill_diagonal_(False)
+#     selected &= valid[:, None] & valid[None, :]
+
+#     configured_weights = _require_pair_matrix(
+#         pair_weights,
+#         class_count=c,
+#         device=energy.device,
+#         dtype=energy.dtype,
+#         name="pair_weights",
+#         default=1.0,
+#     )
+#     assert configured_weights is not None
+
+#     nan_matrix = energy.new_full((c, c), float("nan"))
+#     gap_mean_matrix = nan_matrix.clone()
+#     gap_std_matrix = nan_matrix.clone()
+#     gap_lcb_matrix = nan_matrix.clone()
+#     gap_q05_matrix = nan_matrix.clone()
+#     required_margin_matrix = nan_matrix.clone()
+#     violation_matrix = energy.new_zeros((c, c))
+#     classification_invasion_matrix = energy.new_zeros((c, c))
+#     effective_n_matrix = energy.new_zeros((c, c))
+
+#     pair_losses: List[torch.Tensor] = []
+#     active_weights: List[torch.Tensor] = []
+#     lcb_values: List[torch.Tensor] = []
+#     required_values: List[torch.Tensor] = []
+#     pair_indices: List[torch.Tensor] = []
+
+#     for source in range(c):
+#         if not bool(valid[source].item()):
+#             continue
+#         source_mask = y.eq(source)
+#         if int(source_mask.sum().item()) < minimum_support:
+#             continue
+#         local_weights = weights[source_mask]
+#         effective_n = _effective_sample_size(local_weights)
+#         if float(effective_n.detach().item()) < float(minimum_support):
+#             continue
+#         true = energy[source_mask, source]
+#         for rival in range(c):
+#             if not bool(selected[source, rival].item()):
+#                 continue
+#             gap = energy[source_mask, rival] - true
+#             mean = _weighted_mean(gap, local_weights)
+#             variance = _weighted_population_variance(gap, local_weights, mean)
+#             std = torch.sqrt(variance.clamp_min(0.0) + torch.finfo(gap.dtype).eps)
+#             lcb = mean - kappa * std
+#             required = energy.new_tensor(margin_value)
+#             if margins is not None:
+#                 required = torch.maximum(required, margins[source, rival])
+#             deficiency = required - lcb
+#             pair_loss = temperature_value * F.softplus(
+#                 deficiency / temperature_value
+#             )
+#             pair_weight = configured_weights[source, rival]
+#             if float(pair_weight.detach().item()) <= 0.0:
+#                 continue
+
+#             pair_losses.append(pair_loss)
+#             active_weights.append(pair_weight)
+#             lcb_values.append(lcb)
+#             required_values.append(required)
+#             pair_indices.append(
+#                 torch.tensor([source, rival], device=energy.device, dtype=torch.long)
+#             )
+
+#             gap_mean_matrix[source, rival] = mean
+#             gap_std_matrix[source, rival] = std
+#             gap_lcb_matrix[source, rival] = lcb
+#             gap_q05_matrix[source, rival] = torch.quantile(gap.detach(), 0.05)
+#             required_margin_matrix[source, rival] = required
+#             violation_matrix[source, rival] = lcb.lt(required).to(energy.dtype)
+#             classification_invasion_matrix[source, rival] = (
+#                 gap.le(0.0).to(energy.dtype) * local_weights
+#             ).sum() / local_weights.sum().clamp_min(torch.finfo(energy.dtype).eps)
+#             effective_n_matrix[source, rival] = effective_n
+
+#     zero = energy.sum() * 0.0
+#     if not pair_losses:
+#         result = {
+#             "total": zero,
+#             "pair_count": zero.detach(),
+#             "mean_lcb": zero.detach(),
+#             "minimum_lcb": zero.detach(),
+#             "q05_lcb": zero.detach(),
+#             "certificate_violation_rate": zero.detach(),
+#             "classification_invasion_rate": zero.detach(),
+#             "gap_mean_matrix": gap_mean_matrix.detach(),
+#             "gap_std_matrix": gap_std_matrix.detach(),
+#             "gap_lcb_matrix": gap_lcb_matrix.detach(),
+#             "gap_q05_matrix": gap_q05_matrix.detach(),
+#             "required_margin_matrix": required_margin_matrix.detach(),
+#             "certificate_violation_matrix": violation_matrix.detach(),
+#             "classification_invasion_matrix": classification_invasion_matrix.detach(),
+#             "effective_sample_size_matrix": effective_n_matrix.detach(),
+#             "pair_indices": torch.empty((0, 2), device=energy.device, dtype=torch.long),
+#         }
+#         return result if return_parts else zero
+
+#     loss_vector = torch.stack(pair_losses)
+#     pair_weight_vector = torch.stack(active_weights).to(loss_vector)
+#     total = _weighted_mean(loss_vector, pair_weight_vector)
+#     lcb_vector = torch.stack(lcb_values)
+#     required_vector = torch.stack(required_values)
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("boundary certificate loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+
+#     active_invasion = classification_invasion_matrix[
+#         torch.isfinite(gap_lcb_matrix)
+#     ]
+#     return {
+#         "total": total,
+#         "pair_count": energy.new_tensor(float(len(pair_losses))),
+#         "mean_lcb": lcb_vector.mean().detach(),
+#         "minimum_lcb": lcb_vector.min().detach(),
+#         "q05_lcb": torch.quantile(lcb_vector.detach(), 0.05),
+#         "mean_required_margin": required_vector.mean().detach(),
+#         "certificate_violation_rate": lcb_vector.lt(required_vector).to(energy.dtype).mean().detach(),
+#         "classification_invasion_rate": active_invasion.mean().detach(),
+#         "gap_mean_matrix": gap_mean_matrix.detach(),
+#         "gap_std_matrix": gap_std_matrix.detach(),
+#         "gap_lcb_matrix": gap_lcb_matrix.detach(),
+#         "gap_q05_matrix": gap_q05_matrix.detach(),
+#         "required_margin_matrix": required_margin_matrix.detach(),
+#         "certificate_violation_matrix": violation_matrix.detach(),
+#         "classification_invasion_matrix": classification_invasion_matrix.detach(),
+#         "effective_sample_size_matrix": effective_n_matrix.detach(),
+#         "pair_indices": torch.stack(pair_indices),
+#     }
+
+
+# # =============================================================================
+# # Exact two-sided old/new invasion control
+# # =============================================================================
+
+
+# def _cross_partition_direction(
+#     energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     rival_mask: torch.Tensor,
+#     sample_weights: torch.Tensor,
+#     margin: float,
+#     temperature: float,
+#     class_balanced: bool,
+#     name: str,
+# ) -> Dict[str, torch.Tensor]:
+#     true = energy.gather(1, targets[:, None]).squeeze(1)
+#     masked = energy.masked_fill(~rival_mask.view(1, -1), float("inf"))
+#     rival_energy, rival_indices = masked.min(dim=1)
+#     if not torch.isfinite(rival_energy).all():
+#         raise RuntimeError(f"{name} has no valid rival partition")
+#     gap = rival_energy - true
+#     per_sample = temperature * F.softplus((margin - gap) / temperature)
+#     if class_balanced:
+#         total = _class_balanced_weighted_mean(per_sample, targets, sample_weights)
+#         mean_gap = _class_balanced_weighted_mean(gap, targets, sample_weights)
+#         violation = _class_balanced_weighted_mean(
+#             gap.lt(margin).to(energy.dtype), targets, sample_weights
+#         )
+#         invasion = _class_balanced_weighted_mean(
+#             gap.le(0.0).to(energy.dtype), targets, sample_weights
+#         )
+#     else:
+#         total = _weighted_mean(per_sample, sample_weights)
+#         mean_gap = _weighted_mean(gap, sample_weights)
+#         violation = _weighted_mean(gap.lt(margin).to(energy.dtype), sample_weights)
+#         invasion = _weighted_mean(gap.le(0.0).to(energy.dtype), sample_weights)
+#     return {
+#         "total": total,
+#         "gap": gap,
+#         "per_sample": per_sample,
+#         "rival_indices": rival_indices.detach(),
+#         "mean_gap": mean_gap.detach(),
+#         "q05_gap": torch.quantile(gap.detach(), 0.05),
+#         "minimum_gap": gap.min().detach(),
+#         "margin_violation_rate": violation.detach(),
+#         "invasion_rate": invasion.detach(),
+#     }
+
+
+# def two_sided_old_new_invasion_loss(
+#     old_joint_energy: torch.Tensor,
+#     old_targets: torch.Tensor,
+#     new_joint_energy: torch.Tensor,
+#     new_targets: torch.Tensor,
+#     *,
+#     old_class_mask: torch.Tensor,
+#     new_class_mask: torch.Tensor,
+#     margin: float = 0.0,
+#     temperature: float = 0.20,
+#     old_to_new_weight: float = 1.0,
+#     new_to_old_weight: float = 1.0,
+#     old_sample_weights: Optional[torch.Tensor] = None,
+#     new_sample_weights: Optional[torch.Tensor] = None,
+#     class_balanced: bool = True,
+#     joint_factorization: Optional[str] = None,
+#     return_parts: bool = True,
+# ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+#     """Control both directions of old/new interference using exact energy.
+
+#     * old -> new: a new candidate row must not steal coupled old replay;
+#     * new -> old: committed old rows must not absorb current real samples.
+
+#     Both matrices must use the same seen-class column order and the exact
+#     conditional joint energy returned by the PC-STGB classifier.
+#     """
+#     _validate_joint_factorization(joint_factorization)
+#     old_energy = _require_energy_matrix(old_joint_energy, name="old_joint_energy")
+#     new_energy = _require_energy_matrix(new_joint_energy, name="new_joint_energy")
+#     if old_energy.size(1) != new_energy.size(1):
+#         raise ValueError("old and new joint energies must use the same class columns")
+#     c = old_energy.size(1)
+#     old_mask = _require_partition_mask(
+#         old_class_mask, class_count=c, device=old_energy.device, name="old_class_mask"
+#     )
+#     new_mask = _require_partition_mask(
+#         new_class_mask, class_count=c, device=old_energy.device, name="new_class_mask"
+#     )
+#     if old_energy.device != new_energy.device:
+#         raise RuntimeError("old and new joint energies must share one device")
+#     new_mask = new_mask.to(new_energy.device)
+#     if bool((old_mask & new_mask).any().item()):
+#         raise ValueError("old_class_mask and new_class_mask overlap")
+#     if not bool((old_mask | new_mask).all().item()):
+#         raise ValueError("old/new class masks must partition every energy column")
+
+#     old_y = _require_targets(
+#         old_targets,
+#         sample_count=old_energy.size(0),
+#         class_count=c,
+#         device=old_energy.device,
+#         name="old_targets",
+#     )
+#     new_y = _require_targets(
+#         new_targets,
+#         sample_count=new_energy.size(0),
+#         class_count=c,
+#         device=new_energy.device,
+#         name="new_targets",
+#     )
+#     if not bool(old_mask.index_select(0, old_y).all().item()):
+#         raise RuntimeError("old_targets contain non-old class columns")
+#     if not bool(new_mask.index_select(0, new_y).all().item()):
+#         raise RuntimeError("new_targets contain non-new class columns")
+
+#     margin_value = _require_nonnegative_finite(margin, name="margin")
+#     temperature_value = _require_positive_finite(temperature, name="temperature")
+#     old_direction_weight = _require_nonnegative_finite(
+#         old_to_new_weight, name="old_to_new_weight"
+#     )
+#     new_direction_weight = _require_nonnegative_finite(
+#         new_to_old_weight, name="new_to_old_weight"
+#     )
+#     if old_direction_weight + new_direction_weight <= 0.0:
+#         raise ValueError("at least one directional weight must be positive")
+
+#     old_weights = _require_sample_weights(
+#         old_sample_weights,
+#         sample_count=old_energy.size(0),
+#         device=old_energy.device,
+#         dtype=old_energy.dtype,
+#     )
+#     new_weights = _require_sample_weights(
+#         new_sample_weights,
+#         sample_count=new_energy.size(0),
+#         device=new_energy.device,
+#         dtype=new_energy.dtype,
+#     )
+
+#     old_to_new = _cross_partition_direction(
+#         old_energy,
+#         old_y,
+#         rival_mask=new_mask.to(old_energy.device),
+#         sample_weights=old_weights,
+#         margin=margin_value,
+#         temperature=temperature_value,
+#         class_balanced=class_balanced,
+#         name="old_to_new",
+#     )
+#     new_to_old = _cross_partition_direction(
+#         new_energy,
+#         new_y,
+#         rival_mask=old_mask.to(new_energy.device),
+#         sample_weights=new_weights,
+#         margin=margin_value,
+#         temperature=temperature_value,
+#         class_balanced=class_balanced,
+#         name="new_to_old",
+#     )
+#     total = (
+#         old_direction_weight * old_to_new["total"]
+#         + new_direction_weight * new_to_old["total"]
+#     ) / (old_direction_weight + new_direction_weight)
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("two-sided invasion loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+#     return {
+#         "total": total,
+#         "old_to_new_total": old_to_new["total"],
+#         "new_to_old_total": new_to_old["total"],
+#         "old_to_new_gap": old_to_new["gap"],
+#         "new_to_old_gap": new_to_old["gap"],
+#         "old_to_new_rival_indices": old_to_new["rival_indices"],
+#         "new_to_old_rival_indices": new_to_old["rival_indices"],
+#         "old_to_new_mean_gap": old_to_new["mean_gap"],
+#         "new_to_old_mean_gap": new_to_old["mean_gap"],
+#         "old_to_new_q05_gap": old_to_new["q05_gap"],
+#         "new_to_old_q05_gap": new_to_old["q05_gap"],
+#         "old_to_new_minimum_gap": old_to_new["minimum_gap"],
+#         "new_to_old_minimum_gap": new_to_old["minimum_gap"],
+#         "old_to_new_margin_violation_rate": old_to_new["margin_violation_rate"],
+#         "new_to_old_margin_violation_rate": new_to_old["margin_violation_rate"],
+#         "old_to_new_invasion_rate": old_to_new["invasion_rate"],
+#         "new_to_old_invasion_rate": new_to_old["invasion_rate"],
+#     }
+
+
+# # =============================================================================
+# # Physical finite-difference validity regularizer
+# # =============================================================================
+
+
+# def spectral_tangent_step_consistency_loss(
+#     coarse_responses: torch.Tensor,
+#     fine_responses: torch.Tensor,
+#     *,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     magnitude_weight: float = 0.5,
+#     direction_weight: float = 0.5,
+#     minimum_reference_norm: float = 1e-6,
+#     return_parts: bool = True,
+# ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+#     """Check whether two central-difference step sizes estimate one tangent.
+
+#     ``coarse_responses`` and ``fine_responses`` must be computed from the same
+#     original samples and intervention definitions, for example with step sizes
+#     ``h`` and ``h/2``.  This regularizer validates the local derivative object;
+#     it is not a classifier and cannot replace the exact joint-energy losses.
+#     """
+#     if not torch.is_tensor(coarse_responses) or not torch.is_tensor(fine_responses):
+#         raise TypeError("coarse_responses and fine_responses must be tensors")
+#     if coarse_responses.shape != fine_responses.shape or coarse_responses.dim() != 3:
+#         raise ValueError("response tensors must have identical [N,K,D] shapes")
+#     if not torch.is_floating_point(coarse_responses):
+#         raise TypeError("response tensors must use a floating dtype")
+#     if fine_responses.device != coarse_responses.device:
+#         raise RuntimeError("response tensors must share one device")
+#     fine = fine_responses.to(dtype=coarse_responses.dtype)
+#     if not torch.isfinite(coarse_responses).all() or not torch.isfinite(fine).all():
+#         raise RuntimeError("response tensors contain NaN/Inf")
+
+#     magnitude_gain = _require_nonnegative_finite(magnitude_weight, name="magnitude_weight")
+#     direction_gain = _require_nonnegative_finite(direction_weight, name="direction_weight")
+#     if magnitude_gain + direction_gain <= 0.0:
+#         raise ValueError("at least one consistency component must be active")
+#     floor = _require_positive_finite(
+#         minimum_reference_norm, name="minimum_reference_norm"
+#     )
+#     weights = _require_sample_weights(
+#         sample_weights,
+#         sample_count=coarse_responses.size(0),
+#         device=coarse_responses.device,
+#         dtype=coarse_responses.dtype,
+#     )
+
+#     coarse_norm = coarse_responses.norm(dim=2)
+#     fine_norm = fine.norm(dim=2)
+#     reference = 0.5 * (coarse_norm + fine_norm)
+#     relative_magnitude_error = (coarse_norm - fine_norm).abs() / reference.clamp_min(floor)
+#     cosine = F.cosine_similarity(coarse_responses, fine, dim=2, eps=floor)
+#     direction_error = (1.0 - cosine).clamp_min(0.0)
+#     valid_direction = reference.gt(floor)
+#     direction_error = torch.where(valid_direction, direction_error, torch.zeros_like(direction_error))
+
+#     per_intervention = (
+#         magnitude_gain * relative_magnitude_error
+#         + direction_gain * direction_error
+#     ) / (magnitude_gain + direction_gain)
+#     per_sample = per_intervention.mean(dim=1)
+#     total = _weighted_mean(per_sample, weights)
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("spectral tangent consistency loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+#     return {
+#         "total": total,
+#         "per_sample": per_sample,
+#         "relative_magnitude_error": relative_magnitude_error,
+#         "direction_error": direction_error,
+#         "mean_relative_magnitude_error": relative_magnitude_error.mean().detach(),
+#         "mean_direction_error": direction_error.mean().detach(),
+#         "coarse_response_norm_mean": coarse_norm.mean().detach(),
+#         "fine_response_norm_mean": fine_norm.mean().detach(),
+#         "near_zero_response_rate": reference.le(floor).to(coarse_responses.dtype).mean().detach(),
+#     }
+
+
+# # =============================================================================
+# # Bounded candidate-descriptor trust region
+# # =============================================================================
+
+
+# def candidate_descriptor_trust_region_loss(
+#     *,
+#     mean_deltas: Mapping[int, torch.Tensor],
+#     log_eigval_deltas: Mapping[int, torch.Tensor],
+#     log_residual_deltas: Mapping[int, torch.Tensor],
+#     response_mean_deltas: Mapping[int, torch.Tensor],
+#     response_log_eigval_deltas: Mapping[int, torch.Tensor],
+#     response_log_residual_deltas: Mapping[int, torch.Tensor],
+#     mean_scales: Union[float, Mapping[int, float]] = 1.0,
+#     log_eigval_scales: Union[float, Mapping[int, float]] = 1.0,
+#     log_residual_scales: Union[float, Mapping[int, float]] = 1.0,
+#     response_mean_scales: Union[float, Mapping[int, float]] = 1.0,
+#     response_log_eigval_scales: Union[float, Mapping[int, float]] = 1.0,
+#     response_log_residual_scales: Union[float, Mapping[int, float]] = 1.0,
+#     class_weights: Optional[Mapping[int, float]] = None,
+#     return_parts: bool = True,
+# ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+#     """Regularize provisional new-row corrections using uncertainty scales.
+
+#     The scales should be derived from bootstrap uncertainty or from the same
+#     statistically justified limits used by ``GeometryBank.refine_candidate_joint_rows``.
+#     This loss does not replace the bank's hard bounds.  It makes zero/small
+#     corrections preferable inside those bounds and prevents descriptor
+#     refinement from exploiting old replay through unnecessarily large changes.
+#     """
+#     mappings: Tuple[Tuple[str, Mapping[int, torch.Tensor]], ...] = (
+#         ("mean", mean_deltas),
+#         ("log_eigval", log_eigval_deltas),
+#         ("log_residual", log_residual_deltas),
+#         ("response_mean", response_mean_deltas),
+#         ("response_log_eigval", response_log_eigval_deltas),
+#         ("response_log_residual", response_log_residual_deltas),
+#     )
+#     key_sets = [set(int(key) for key in mapping) for _, mapping in mappings]
+#     if not key_sets or not key_sets[0]:
+#         raise ValueError("candidate delta mappings are empty")
+#     expected = key_sets[0]
+#     for (name, _), keys in zip(mappings, key_sets):
+#         if keys != expected:
+#             raise RuntimeError(f"{name}_deltas keys do not match candidate classes")
+
+#     first_tensor: Optional[torch.Tensor] = None
+#     for _, mapping in mappings:
+#         for tensor in mapping.values():
+#             if not torch.is_tensor(tensor):
+#                 raise TypeError("candidate deltas must be tensors")
+#             if not torch.is_floating_point(tensor):
+#                 raise TypeError("candidate deltas must use floating dtypes")
+#             if not torch.isfinite(tensor).all():
+#                 raise RuntimeError("candidate deltas contain NaN/Inf")
+#             if first_tensor is None:
+#                 first_tensor = tensor
+#     assert first_tensor is not None
+#     device, dtype = first_tensor.device, first_tensor.dtype
+#     for _, mapping in mappings:
+#         for tensor in mapping.values():
+#             if tensor.device != device:
+#                 raise RuntimeError("all candidate deltas must share one device")
+
+#     def resolve_scale(
+#         configured: Union[float, Mapping[int, float]],
+#         class_id: int,
+#         name: str,
+#     ) -> float:
+#         value = configured[class_id] if isinstance(configured, Mapping) else configured
+#         return _require_positive_finite(float(value), name=f"{name}[{class_id}]")
+
+#     scale_configs: Tuple[Tuple[str, Union[float, Mapping[int, float]]], ...] = (
+#         ("mean", mean_scales),
+#         ("log_eigval", log_eigval_scales),
+#         ("log_residual", log_residual_scales),
+#         ("response_mean", response_mean_scales),
+#         ("response_log_eigval", response_log_eigval_scales),
+#         ("response_log_residual", response_log_residual_scales),
+#     )
+
+#     class_terms: List[torch.Tensor] = []
+#     class_weight_values: List[torch.Tensor] = []
+#     component_accumulator: Dict[str, List[torch.Tensor]] = {
+#         name: [] for name, _ in mappings
+#     }
+#     ordered_ids = sorted(expected)
+#     for class_id in ordered_ids:
+#         component_terms: List[torch.Tensor] = []
+#         for (name, mapping), (_, configured_scale) in zip(mappings, scale_configs):
+#             tensor = mapping[class_id].to(dtype=dtype)
+#             scale = resolve_scale(configured_scale, class_id, name)
+#             normalized_square = (tensor / scale).square()
+#             term = normalized_square.mean() if normalized_square.numel() else tensor.sum() * 0.0
+#             component_accumulator[name].append(term)
+#             component_terms.append(term)
+#         class_term = torch.stack(component_terms).mean()
+#         class_weight = 1.0 if class_weights is None else float(class_weights[class_id])
+#         class_weight = _require_nonnegative_finite(
+#             class_weight, name=f"class_weights[{class_id}]"
+#         )
+#         if class_weight <= 0.0:
+#             continue
+#         class_terms.append(class_term)
+#         class_weight_values.append(
+#             torch.tensor(class_weight, device=device, dtype=dtype)
+#         )
+
+#     if not class_terms:
+#         raise ValueError("all candidate class weights are zero")
+#     terms = torch.stack(class_terms)
+#     weights = torch.stack(class_weight_values)
+#     total = _weighted_mean(terms, weights)
+#     if total.dim() != 0 or not torch.isfinite(total):
+#         raise RuntimeError("candidate trust-region loss is not a finite scalar")
+#     if not return_parts:
+#         return total
+
+#     output: Dict[str, torch.Tensor] = {
+#         "total": total,
+#         "class_count": torch.tensor(float(len(class_terms)), device=device, dtype=dtype),
+#         "mean_class_penalty": terms.mean().detach(),
+#         "maximum_class_penalty": terms.max().detach(),
+#     }
+#     for name, values in component_accumulator.items():
+#         output[f"{name}_penalty"] = torch.stack(values).mean().detach()
+#     return output
+
+
+# # =============================================================================
+# # Boundary-risk diagnostics
+# # =============================================================================
+
+
+# @torch.no_grad()
+# def pairwise_directional_invasion_matrix(
+#     joint_energy: torch.Tensor,
+#     targets: torch.Tensor,
+#     *,
+#     valid_class_mask: Optional[torch.Tensor] = None,
+#     sample_weights: Optional[torch.Tensor] = None,
+#     joint_factorization: Optional[str] = None,
+# ) -> Dict[str, torch.Tensor]:
+#     """Measure ordered source-to-rival invasion under deployed joint energy."""
+#     _validate_joint_factorization(joint_factorization)
+#     energy = _require_energy_matrix(joint_energy, name="joint_energy")
+#     n, c = energy.shape
+#     y = _require_targets(targets, sample_count=n, class_count=c, device=energy.device)
+#     valid = _require_valid_class_mask(
+#         valid_class_mask, class_count=c, device=energy.device
+#     )
+#     if not bool(valid.index_select(0, y).all().item()):
+#         raise RuntimeError("directional invasion targets reference invalid rows")
+#     weights = _require_sample_weights(
+#         sample_weights,
+#         sample_count=n,
+#         device=energy.device,
+#         dtype=torch.float64,
+#     )
+
+#     invasion = torch.zeros((c, c), device=energy.device, dtype=torch.float64)
+#     source_weight = torch.zeros(c, device=energy.device, dtype=torch.float64)
+#     gap_q05 = torch.full((c, c), float("nan"), device=energy.device, dtype=torch.float64)
+#     for source in range(c):
+#         if not bool(valid[source].item()):
+#             continue
+#         mask = y.eq(source)
+#         if not bool(mask.any().item()):
+#             continue
+#         local_weights = weights[mask]
+#         denominator = local_weights.sum().clamp_min(torch.finfo(torch.float64).eps)
+#         source_weight[source] = denominator
+#         true = energy[mask, source]
+#         for rival in range(c):
+#             if rival == source or not bool(valid[rival].item()):
+#                 continue
+#             gap = energy[mask, rival] - true
+#             invaded = gap.le(0.0).to(torch.float64)
+#             invasion[source, rival] = (invaded * local_weights).sum() / denominator
+#             gap_q05[source, rival] = torch.quantile(gap.double(), 0.05)
+
+#     offdiag_mask = (
+#         valid[:, None]
+#         & valid[None, :]
+#         & ~torch.eye(c, device=energy.device, dtype=torch.bool)
+#     )
+#     offdiag = invasion[offdiag_mask]
+#     return {
+#         "invasion_matrix": invasion,
+#         "gap_q05_matrix": gap_q05,
+#         "source_weight": source_weight,
+#         "source_counts": source_weight,
+#         "maximum_directional_invasion": (
+#             offdiag.max() if offdiag.numel() else invasion.new_tensor(0.0)
+#         ),
+#         "mean_directional_invasion": (
+#             offdiag.mean() if offdiag.numel() else invasion.new_tensor(0.0)
+#         ),
+#     }
+
+
+# # =============================================================================
+# # Explicit guards for incompatible objectives
+# # =============================================================================
+
+
+# def _retired_loss(name: str, replacement: str) -> Callable[..., Any]:
+#     def retired(*_: Any, **__: Any) -> Any:
+#         raise RuntimeError(
+#             f"{name} constructs an objective outside the conditional PC-STGB "
+#             f"decision model. {replacement}"
+#         )
+
+#     retired.__name__ = name
+#     return retired
+
+
+# response_conditioned_directional_clearance_reserve_loss = _retired_loss(
+#     "response_conditioned_directional_clearance_reserve_loss",
+#     "Use joint_energy_boundary_certificate_loss() on the exact conditional "
+#     "joint energy instead of a second mean/std Euclidean boundary model.",
+# )
+# pc_sirg_overlap_reserve_loss = response_conditioned_directional_clearance_reserve_loss
+
+# base_geometry_preparation_loss = _retired_loss(
+#     "base_geometry_preparation_loss",
+#     "Use phase_consistent_conditional_joint_consolidation_loss() and "
+#     "joint_energy_boundary_certificate_loss().",
+# )
+# base_geometry_involved_contrastive_loss = _retired_loss(
+#     "base_geometry_involved_contrastive_loss",
+#     "Use held-out conditional joint-energy consolidation.",
+# )
+# prospective_geometry_reserve_loss = _retired_loss(
+#     "prospective_geometry_reserve_loss",
+#     "Use joint_energy_boundary_certificate_loss() in every phase.",
+# )
+# prospective_admission_loss = _retired_loss(
+#     "prospective_admission_loss",
+#     "Use the same joint-energy consolidation, certificate, and two-sided "
+#     "invasion objectives for current real and coupled old replay tuples.",
+# )
+# spectral_conditioned_margin_matrix = _retired_loss(
+#     "spectral_conditioned_margin_matrix",
+#     "Build pair-specific margins externally from certified joint-energy gap "
+#     "statistics; do not construct a second spectral score.",
+# )
+# spectral_conditioned_geometry_consistency_loss = _retired_loss(
+#     "spectral_conditioned_geometry_consistency_loss",
+#     "Use spectral_tangent_step_consistency_loss() only to validate finite "
+#     "differences, and use conditional joint energy for classification.",
+# )
+# cross_fitted_joint_spectral_feature_loss = _retired_loss(
+#     "cross_fitted_joint_spectral_feature_loss",
+#     "Use the bank's occupancy-conditioned tangent factorization.",
+# )
+# geometry_energy_matrix = _retired_loss(
+#     "geometry_energy_matrix",
+#     "The GeometryBank/classifier is the sole energy authority.",
+# )
+# incremental_low_rank_boundary_loss = _retired_loss(
+#     "incremental_low_rank_boundary_loss",
+#     "Use joint_energy_boundary_certificate_loss() and "
+#     "two_sided_old_new_invasion_loss().",
+# )
+# incremental_geometry_training_loss = incremental_low_rank_boundary_loss

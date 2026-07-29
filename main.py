@@ -1,39 +1,87 @@
 from __future__ import annotations
+
+"""Main entry point for transport-verified factor-geometry NECIL-HSI.
+
+This driver executes the complete class-incremental protocol:
+
+    phase 0:
+        CE warm-up + cross-fitted factor-geometry shaping
+
+    phase t > 0:
+        controlled late-layer plasticity
+        + analytical branchwise coordinate registration
+        + exact old-row pushforward
+        + current-query risk-guided factor-energy separation
+
+After every accepted phase it saves:
+* cumulative held-out test metrics;
+* separate GT and predicted-GT maps;
+* qualitative all-seen-labeled GT and prediction maps;
+* confusion matrices and class-wise metrics;
+* geometry pair-risk/overlap diagnostics;
+* spectral-spatial factor-bank diagnostics;
+* base or incremental training dynamics;
+* cumulative NECIL forgetting/BWT summaries.
+
+Preprocessing is fitted only on phase-0 training pixels and then frozen.
+Incremental training loaders expose only current-phase classes. Cumulative
+validation/test loaders expose only classes seen at the requested phase.
+"""
+
 import argparse
 import copy
 import csv
-import inspect
+import gc
 import json
+import math
 import os
 import random
 import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data.hsi_dataloader_pytorch import ImageCubes, LoadHSIData
-from data.incremental_dataset import IncrementalHSIDataset
+from data.hsi_dataloader_pytorch import (
+    ExtractLabeledPixelIndex,
+    FitHSIPreprocessor,
+    LoadRawHSIData,
+    SaveHSIPreprocessor,
+)
 from models.necil_model import NECILModel
 from trainers.trainer import Trainer
 from utils.eval import (
-    NECILEvaluator,
-    calculate_metrics_torch,
-    make_json_serializable,
-    predictions_from_seen_local_scores,
-    save_classification_report,
-    validate_seen_local_outputs,
-)
-from utils.visualize import plot_training_history, predict_phase_grid
+        NECILEvaluator,
+        evaluate_factor_geometry_loader,
+        geometry_bank_diagnostics,
+        geometry_sampling_health,
+        save_classification_report,
+        save_json,
+    )
+
+from utils.visualize import (
+        build_geometry_overlap_review,
+        plot_necil_phase_summary,
+        plot_phase_training_dynamics,
+        predict_phase_grid,
+        save_classification_diagnostics,
+        save_geometry_pair_diagnostics,
+        save_spectral_spatial_geometry_diagnostics,
+        save_transport_diagnostics,
+    )
 
 
-STACK_BUILD_ID = "SCTGR-ENERGY-CONTRACT-2026-07-07-R2"
+STACK_BUILD_ID = "HSI-FACTOR-GEOMETRY-NECIL-V2"
+METHOD_NAME = "Transport-verified spectral-spatial factor geometry"
+CLASSIFICATION_FACTORIZATION = "p(z|c)"
+SPECTRAL_RELATION_FACTORIZATION = "p(h|c)"
 
-DATASET_INFO = {
+DATASET_INFO: Dict[str, Dict[str, Any]] = {
     "IP": {"name": "Indian Pines", "bands": 200, "classes": 16},
     "SA": {"name": "Salinas", "bands": 204, "classes": 16},
     "PU": {"name": "Pavia University", "bands": 103, "classes": 9},
@@ -49,2075 +97,2063 @@ DATASET_INFO = {
 }
 
 
-# -----------------------------------------------------------------------------
-# Robust utilities
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Generic configuration helpers
+# =============================================================================
 
 
-def str2bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
+def str2bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
         return False
-    s = str(v).strip().lower()
-    if s in {"true", "1", "yes", "y", "t", "on"}:
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "y", "on", "t"}:
         return True
-    if s in {"false", "0", "no", "n", "f", "off", "none", "null", ""}:
+    if token in {"0", "false", "no", "n", "off", "f", ""}:
         return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v!r}")
+    raise argparse.ArgumentTypeError(
+        f"invalid boolean value: {value!r}"
+    )
 
 
-def parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
-    if seed_list_str is None or str(seed_list_str).strip() == "":
+def parse_int_list(raw: Optional[str], *, name: str) -> Optional[List[int]]:
+    if raw is None or not str(raw).strip():
         return None
-    return [int(s.strip()) for s in str(seed_list_str).split(",") if s.strip()]
-
-
-def _json_safe(obj: Any) -> Any:
-    try:
-        return make_json_serializable(obj)
-    except Exception:
-        pass
-    if torch.is_tensor(obj):
-        x = obj.detach().cpu()
-        return x.item() if x.numel() == 1 else x.tolist()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (np.integer, np.floating)):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    return str(obj)
-
-
-def save_json(path: str, data: Any) -> str:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(_json_safe(data), f, indent=2, sort_keys=True)
-    return path
+    values = [
+        int(token.strip())
+        for token in str(raw).split(",")
+        if token.strip()
+    ]
+    if len(values) != len(set(values)):
+        raise ValueError(f"{name} contains duplicates: {values}")
+    return values
 
 
 def namespace_to_dict(args: argparse.Namespace) -> Dict[str, Any]:
     return copy.deepcopy(vars(args))
 
 
-def _set_resolved(args: argparse.Namespace, name: str, value: Any, reasons: Dict[str, str], reason: str) -> None:
-    old = getattr(args, name, None)
-    if old != value or not hasattr(args, name):
-        setattr(args, name, value)
-        reasons[name] = reason
+def json_safe(value: Any) -> Any:
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu()
+        return tensor.item() if tensor.numel() == 1 else tensor.tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {
+            str(key): json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe(item) for item in sorted(value, key=str)]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
-def compute_config_diff(
-    original: Dict[str, Any],
-    resolved: Dict[str, Any],
-    reasons: Optional[Dict[str, str]] = None,
-) -> List[Dict[str, Any]]:
-    reasons = reasons or {}
-    rows: List[Dict[str, Any]] = []
-    for k in sorted(set(original.keys()) | set(resolved.keys())):
-        if original.get(k) != resolved.get(k):
-            rows.append({
-                "name": k,
-                "original": _json_safe(original.get(k)),
-                "resolved": _json_safe(resolved.get(k)),
-                "reason": reasons.get(k, "resolved_config"),
-            })
-    return rows
-
-
-def normalize_classifier_mode(mode: Optional[str]) -> str:
-    """Normalize every public geometry alias to the strict classifier token.
-
-    The repaired classifier/model/trainer use ``geometry_only`` as the explicit
-    method-contract string. ``geometry`` is accepted from older commands, but it
-    is semantically identical and must be normalized before the trainer identity
-    check. Otherwise main.py incorrectly reports a method-identity mutation even
-    though the classifier path did not change.
-    """
-    m = str(mode or "geometry_only").lower().strip()
-    aliases = {
-        "": "geometry_only",
-        "none": "geometry_only",
-        "geo": "geometry_only",
-        "geometry": "geometry_only",
-        "geometry_only": "geometry_only",
-        "geometry-only": "geometry_only",
-        "feature_geometry": "geometry_only",
-        "low_rank_geometry": "geometry_only",
-        "srgp": "geometry_only",
-        "srgp_geometry": "geometry_only",
-        "spectral_geometry": "geometry_only",
-        "spectral_residual_geometry": "geometry_only",
-        "calibrated": "geometry_only",
-        "calibrated_geometry": "geometry_only",
-    }
-    m = aliases.get(m, m)
-    if m != "geometry_only":
-        raise ValueError(f"Unsupported classifier mode {mode!r}. Use geometry_only/geometry.")
-    return m
-
-
-def normalize_incremental_update_mode(mode: Optional[str]) -> str:
-    """Normalize the only valid incremental architecture token."""
-    raw = str(mode or "spectral_coupled_geometry_replay").lower().strip()
-    aliases = {
-        "": "spectral_coupled_geometry_replay",
-        "none": "spectral_coupled_geometry_replay",
-        "main": "spectral_coupled_geometry_replay",
-        "clean": "spectral_coupled_geometry_replay",
-        "descriptor": "spectral_coupled_geometry_replay",
-        "descriptor_only": "spectral_coupled_geometry_replay",
-        "descriptor_refinement": "spectral_coupled_geometry_replay",
-        "scbgr": "spectral_coupled_geometry_replay",
-        "sctgr": "spectral_coupled_geometry_replay",
-        "spectral_coupled": "spectral_coupled_geometry_replay",
-        "spectral_coupled_replay": "spectral_coupled_geometry_replay",
-        "spectral_coupled_geometry_replay": "spectral_coupled_geometry_replay",
-    }
-    forbidden = {
-        "adapter", "gated_adapter", "geometry_adapter", "geometry_gated_adapter",
-        "g2rpa", "g2-rpa", "transport", "geometry_transport",
-    }
-    if raw in forbidden:
-        raise ValueError(
-            f"incremental_update_mode={raw!r} selects a removed architecture. "
-            "Use spectral_coupled_geometry_replay."
+def atomic_json(path: str, value: Any) -> str:
+    absolute = os.path.abspath(path)
+    os.makedirs(os.path.dirname(absolute), exist_ok=True)
+    temporary = absolute + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(
+            json_safe(value),
+            stream,
+            indent=2,
+            sort_keys=True,
         )
-    out = aliases.get(raw, raw)
-    if out != "spectral_coupled_geometry_replay":
-        raise ValueError(
-            f"Unsupported --incremental_update_mode={mode!r}. "
-            "Use spectral_coupled_geometry_replay."
-        )
-    return out
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, absolute)
+    return absolute
 
-# -----------------------------------------------------------------------------
-# Parser and resolved configuration
-# -----------------------------------------------------------------------------
+
+def set_seed(seed: int, deterministic: bool) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    elif torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+
+def resolve_device(value: Any) -> str:
+    token = str(value).strip().lower()
+    if token == "gpu":
+        token = "cuda"
+    requested = torch.device(token)
+    if requested.type == "cpu":
+        return "cpu"
+    if requested.type != "cuda":
+        raise RuntimeError(
+            f"unsupported device type {requested.type!r}"
+        )
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"device={value!r} requests CUDA, but CUDA is unavailable"
+        )
+    index = (
+        torch.cuda.current_device()
+        if requested.index is None
+        else int(requested.index)
+    )
+    if not 0 <= index < torch.cuda.device_count():
+        raise RuntimeError(
+            f"requested cuda:{index}, but only "
+            f"{torch.cuda.device_count()} devices are visible"
+        )
+    torch.cuda.set_device(index)
+    return f"cuda:{index}"
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Spectral-Coupled Tangent Geometry Replay with new-row descriptor adaptation for strict non-exemplar HSI class-incremental learning",
+        description=(
+            "Strict exemplar-free HSI class-incremental learning with "
+            "transport-verified spectral-spatial factor geometry."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    main = parser.add_argument_group("A. Core experiment")
-    main.add_argument("--dataset", type=str, default="IP", choices=DATASET_INFO.keys())
-    main.add_argument("--data_dir", type=str, default="./datasets")
-    main.add_argument("--save_dir", type=str, default="./results_sctgr")
-    main.add_argument("--patch_size", type=int, default=11)
-    main.add_argument("--train_ratio", type=float, default=0.2)
-    main.add_argument("--val_ratio", type=float, default=0.1)
-    main.add_argument("--min_train_per_class", type=int, default=20)
-    main.add_argument("--no_pca", action="store_true")
-    main.add_argument("--pca_components", type=int, default=30)
-    main.add_argument("--reduction_method", type=str, default="PCA")
-    main.add_argument("--base_classes", type=int, default=None)
-    main.add_argument("--increment", type=int, default=None)
-    main.add_argument("--epochs_base", type=int, default=80)
-    main.add_argument("--epochs_inc", type=int, default=30)
-    main.add_argument("--batch_size", type=int, default=64)
-    main.add_argument("--lr", type=float, default=1e-4)
-    main.add_argument("--lr_inc", type=float, default=1e-4)
-    main.add_argument("--weight_decay", type=float, default=1e-4)
-    main.add_argument("--seed", type=int, default=42)
-    main.add_argument("--num_runs", type=int, default=1)
-    main.add_argument("--seed_list", type=str, default="")
-    main.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    main.add_argument("--num_workers", type=int, default=0)
-    main.add_argument("--base_only", type=str2bool, default=False)
-    main.add_argument("--max_train_phase", type=int, default=-1)
-    main.add_argument("--max_phases", type=int, default=0)
+    experiment = parser.add_argument_group("A. Incremental experiment")
+    experiment.add_argument(
+        "--dataset",
+        type=str,
+        default="IP",
+        choices=sorted(DATASET_INFO),
+    )
+    experiment.add_argument("--data_dir", type=str, default="./datasets")
+    experiment.add_argument(
+        "--save_dir",
+        type=str,
+        default="./results_factor_geometry_necil",
+    )
+    experiment.add_argument("--patch_size", type=int, default=11)
+    experiment.add_argument("--train_ratio", type=float, default=0.20)
+    experiment.add_argument("--val_ratio", type=float, default=0.10)
+    experiment.add_argument("--min_train_per_class", type=int, default=20)
+    experiment.add_argument("--base_classes", type=int, default=6)
+    experiment.add_argument("--increment", type=int, default=5)
+    experiment.add_argument(
+        "--class_order",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated complete original class-ID permutation. "
+            "Empty uses the natural order."
+        ),
+    )
+    experiment.add_argument("--shuffle_order", type=str2bool, default=False)
+    experiment.add_argument("--base_only", type=str2bool, default=False)
+    experiment.add_argument(
+        "--maximum_phase",
+        type=int,
+        default=-1,
+        help="-1 executes every phase.",
+    )
+    experiment.add_argument("--epochs_base", type=int, default=80)
+    experiment.add_argument("--epochs_inc", type=int, default=15)
+    experiment.add_argument("--batch_size", type=int, default=64)
+    experiment.add_argument("--eval_batch_size", type=int, default=128)
+    experiment.add_argument("--lr", type=float, default=1e-4)
+    experiment.add_argument("--lr_inc", type=float, default=1e-4)
+    experiment.add_argument("--weight_decay", type=float, default=1e-4)
+    experiment.add_argument("--resume_checkpoint", type=str, default="")
+    experiment.add_argument("--seed", type=int, default=42)
+    experiment.add_argument("--num_runs", type=int, default=1)
+    experiment.add_argument("--seed_list", type=str, default="")
+    experiment.add_argument("--device", type=str, default="cuda:0")
+    experiment.add_argument("--num_workers", type=int, default=0)
+    experiment.add_argument("--deterministic", type=str2bool, default=False)
 
-    model = parser.add_argument_group("B. Backbone and GeometryBank")
-    model.add_argument("--d_model", type=int, default=128)
-    model.add_argument("--d_state", type=int, default=16)
-    model.add_argument("--d_conv", type=int, default=4)
-    model.add_argument("--expand", type=int, default=2)
-    model.add_argument("--num_spectral_layers", type=int, default=3)
-    model.add_argument("--num_layers", type=int, default=3)
-    model.add_argument("--dropout", type=float, default=0.1)
-    model.add_argument("--projection_dropout", type=float, default=0.1)
-    model.add_argument("--backbone_norm", type=str, default="layer", choices=["layer", "rms"])
-    model.add_argument("--stem_norm_groups", type=int, default=8)
-    model.add_argument("--ssm_residual_scale_init", type=float, default=0.7)
-    model.add_argument("--fusion_residual_scale", type=float, default=0.3)
-    model.add_argument("--backbone_output_dropout", type=float, default=0.0)
-    model.add_argument("--subspace_rank", type=int, default=5)
-    model.add_argument("--geom_var_floor", type=float, default=5e-4)
-    model.add_argument("--geometry_variance_shrinkage", type=float, default=0.25)
-    model.add_argument("--geometry_max_variance_ratio", type=float, default=50.0)
-    model.add_argument("--geometry_min_reliability", type=float, default=0.05)
-    model.add_argument("--rank_energy_threshold", type=float, default=0.90)
-    model.add_argument("--rank_eigen_ratio_threshold", type=float, default=1e-2)
-    model.add_argument("--min_active_rank", type=int, default=1)
-    model.add_argument("--normalize_geometry_features", type=str2bool, default=True)
-    model.add_argument("--geometry_feature_scale", type=float, default=0.0)
-    model.add_argument("--geometry_feature_clamp", type=float, default=0.0)
-    model.add_argument("--subspace_extract_batch_size", type=int, default=256)
-    model.add_argument("--spectral_geometry_rank", type=int, default=5)
-    model.add_argument("--spectral_rank_energy_threshold", type=float, default=0.95)
-    model.add_argument("--spectral_rank_eigen_ratio_threshold", type=float, default=1e-3)
-    model.add_argument("--spectral_variance_floor", type=float, default=1e-6)
-    model.add_argument("--coupling_ridge", type=float, default=1e-3)
-    model.add_argument("--coupling_min_reliability", type=float, default=0.20)
-    model.add_argument("--spectral_tangent_clip", type=float, default=2.5)
-    model.add_argument("--replay_candidate_multiplier", type=int, default=4)
+    preprocessing = parser.add_argument_group("B. Leakage-safe preprocessing")
+    preprocessing.add_argument("--no_pca", action="store_true")
+    preprocessing.add_argument("--reduction_method", type=str, default="PCA")
+    preprocessing.add_argument("--pca_components", type=int, default=30)
+    preprocessing.add_argument("--pca_whiten", type=str2bool, default=False)
 
-    base = parser.add_argument_group("C. Mandatory base objective")
-    base.add_argument("--base_ce_weight", type=float, default=1.0)
-    base.add_argument("--base_srpgr_weight", type=float, default=1.0)
-    base.add_argument("--base_gics_weight", type=float, default=0.20)
-    base.add_argument("--base_gics_temperature", type=float, default=0.07)
-    base.add_argument("--base_energy_margin_weight", type=float, default=0.15)
-    base.add_argument("--base_energy_margin", type=float, default=0.25)
+    backbone = parser.add_argument_group("C. Dual-branch HSI backbone")
+    backbone.add_argument("--d_model", type=int, default=128)
+    backbone.add_argument("--spectral_feature_dim", type=int, default=32)
+    backbone.add_argument("--spatial_feature_dim", type=int, default=32)
+    backbone.add_argument("--d_state", type=int, default=16)
+    backbone.add_argument("--d_conv", type=int, default=3)
+    backbone.add_argument("--expand", type=int, default=2)
+    backbone.add_argument("--num_layers", type=int, default=3)
+    backbone.add_argument("--num_spectral_layers", type=int, default=3)
+    backbone.add_argument("--num_spatial_layers", type=int, default=3)
+    backbone.add_argument("--dropout", type=float, default=0.10)
+    backbone.add_argument("--projection_dropout", type=float, default=0.0)
+    backbone.add_argument("--backbone_norm", type=str, default="rms")
+    backbone.add_argument("--stem_norm_groups", type=int, default=8)
+    backbone.add_argument("--ssm_residual_scale_init", type=float, default=0.50)
+    backbone.add_argument("--ssm_kernel_dropout", type=float, default=0.0)
+
+    geometry = parser.add_argument_group("D. Factor GeometryBank")
+    geometry.add_argument("--subspace_rank", type=int, default=5)
+    geometry.add_argument("--spectral_resample_length", type=int, default=32)
+    geometry.add_argument(
+        "--spectral_derivative_weight",
+        type=float,
+        default=0.50,
+    )
+    geometry.add_argument("--geom_var_floor", type=float, default=1e-4)
+    geometry.add_argument(
+        "--geometry_variance_floor_relative",
+        type=float,
+        default=1e-3,
+    )
+    geometry.add_argument(
+        "--geometry_minimum_variance_shrinkage",
+        type=float,
+        default=0.10,
+    )
+    geometry.add_argument(
+        "--geometry_extra_rare_class_shrinkage",
+        type=float,
+        default=0.35,
+    )
+    geometry.add_argument("--geometry_shrinkage_tau", type=float, default=20.0)
+    geometry.add_argument("--factor_fit_iterations", type=int, default=3)
+    geometry.add_argument(
+        "--whitened_eigen_excess_threshold",
+        type=float,
+        default=0.50,
+    )
+    geometry.add_argument(
+        "--rank_energy_threshold",
+        type=float,
+        default=0.95,
+    )
+    geometry.add_argument(
+        "--rank_eigen_ratio_threshold",
+        type=float,
+        default=1e-3,
+    )
+    geometry.add_argument(
+        "--geometry_volume_weight",
+        type=float,
+        default=0.50,
+    )
+    geometry.add_argument("--energy_temperature", type=float, default=1.0)
+    geometry.add_argument(
+        "--robust_geometry_iterations",
+        type=int,
+        default=3,
+    )
+    geometry.add_argument(
+        "--robust_geometry_huber_delta",
+        type=float,
+        default=2.5,
+    )
+    geometry.add_argument("--spatial_purity_power", type=float, default=1.0)
+    geometry.add_argument(
+        "--geometry_reliability_sample_strength",
+        type=float,
+        default=20.0,
+    )
+    geometry.add_argument(
+        "--maximum_geometry_reconstruction_error",
+        type=float,
+        default=0.75,
+    )
+    geometry.add_argument(
+        "--minimum_geometry_effective_dimension",
+        type=float,
+        default=1.25,
+    )
+
+    base = parser.add_argument_group("E. Base factor-geometry training")
+    base.add_argument("--base_ce_warmup_epochs", type=int, default=10)
+    base.add_argument("--base_geometry_ramp_epochs", type=int, default=10)
+    base.add_argument("--base_geometry_weight", type=float, default=1.0)
+    base.add_argument("--base_geometry_margin", type=float, default=0.50)
+    base.add_argument("--base_risk_strength", type=float, default=0.50)
+    base.add_argument(
+        "--base_geometry_temperature",
+        type=float,
+        default=0.50,
+    )
+    base.add_argument(
+        "--base_maximum_pair_margin",
+        type=float,
+        default=None,
+    )
+    base.add_argument("--geometry_batch_classes", type=int, default=0)
+    base.add_argument("--geometry_samples_per_class", type=int, default=8)
+    base.add_argument("--base_steps_per_epoch", type=int, default=0)
+    base.add_argument(
+        "--base_min_samples_per_class_in_batch",
+        type=int,
+        default=6,
+    )
+    base.add_argument("--base_oof_folds", type=int, default=3)
+    base.add_argument("--base_eval_every", type=int, default=1)
+    base.add_argument("--base_early_stop_patience", type=int, default=0)
+    base.add_argument(
+        "--base_use_geometry_balanced_sampler",
+        type=str2bool,
+        default=True,
+    )
     base.add_argument("--base_class_balance", type=str2bool, default=True)
-    base.add_argument("--base_gics_key_noise_std", type=float, default=0.0)
-    base.add_argument("--base_gics_key_scale_jitter", type=float, default=0.0)
-    base.add_argument("--base_gics_key_band_drop", type=float, default=0.0)
-    base.add_argument("--base_gics_key_spatial_drop", type=float, default=0.0)
-    base.add_argument("--pgr_weight", type=float, default=0.10)
-    base.add_argument("--pgr_compact_weight", type=float, default=0.15)
-    base.add_argument("--pgr_center_weight", type=float, default=0.25)
-    base.add_argument("--pgr_subspace_weight", type=float, default=0.15)
-    base.add_argument("--pgr_band_weight", type=float, default=0.05)
-    base.add_argument("--pgr_volume_weight", type=float, default=0.05)
-    base.add_argument("--pgr_center_margin", type=float, default=1.10)
-    base.add_argument("--pgr_band_overlap_max", type=float, default=0.65)
-    base.add_argument("--pgr_max_subspace_overlap", type=float, default=0.55)
-    base.add_argument("--pgr_min_class_variance", type=float, default=0.015)
-    base.add_argument("--pgr_max_class_variance", type=float, default=0.75)
-    base.add_argument("--pgr_min_class_samples", type=int, default=3)
-    base.add_argument("--pgr_subspace_min_samples", type=int, default=6)
-    base.add_argument("--pgr_subspace_rank", type=int, default=3)
-    base.add_argument("--base_spectral_shape_weight", type=float, default=0.05)
-    base.add_argument("--base_max_spectral_shape_similarity", type=float, default=0.75)
-    base.add_argument("--base_spectral_shape_risk_weight", type=float, default=1.0)
-    base.add_argument("--base_require_physical_spectral_shape", type=str2bool, default=True)
-    base.add_argument("--strict_base_component_coverage", type=str2bool, default=True)
+    base.add_argument(
+        "--base_use_cosine_scheduler",
+        type=str2bool,
+        default=True,
+    )
+    base.add_argument("--base_min_lr_ratio", type=float, default=0.05)
+    base.add_argument("--label_smoothing", type=float, default=0.0)
+    base.add_argument("--grad_clip_base", type=float, default=5.0)
+    base.add_argument(
+        "--base_diagnostic_samples_per_class",
+        type=int,
+        default=32,
+    )
+    base.add_argument("--base_admission_enforce", type=str2bool, default=False)
+    base.add_argument(
+        "--base_min_factor_gain_over_prototype",
+        type=float,
+        default=0.0,
+    )
+    base.add_argument(
+        "--base_min_factor_gain_over_diagonal",
+        type=float,
+        default=0.0,
+    )
+    base.add_argument(
+        "--base_admission_min_class_accuracy",
+        type=float,
+        default=0.0,
+    )
+    base.add_argument(
+        "--base_admission_max_classification_violation",
+        type=float,
+        default=1.0,
+    )
 
-    inc = parser.add_argument_group("D. Spectral-coupled replay and new-row descriptor adaptation")
-    inc.add_argument("--incremental_update_mode", type=str, default="spectral_coupled_geometry_replay")
-    inc.add_argument("--use_spectral_coupled_replay", type=str2bool, default=True)
-    inc.add_argument("--gfa_weight", type=float, default=1.0)
-    inc.add_argument("--gfa_samples_per_class", type=int, default=48)
-    inc.add_argument("--gfa_reliability_gated", type=str2bool, default=True)
-    inc.add_argument("--gfa_parallel_scale", type=float, default=0.95)
-    inc.add_argument("--gfa_residual_scale", type=float, default=0.25)
-    inc.add_argument("--replay_min_per_class", type=int, default=24)
-    inc.add_argument("--replay_max_per_class", type=int, default=64)
-    inc.add_argument("--core_replay_ratio", type=float, default=0.85)
-    inc.add_argument("--directed_replay_min_ratio", type=float, default=0.10)
-    inc.add_argument("--directed_replay_max_ratio", type=float, default=0.40)
-    inc.add_argument("--pair_risk_topk", type=int, default=3)
-    inc.add_argument("--pair_risk_temperature", type=float, default=0.75)
-    inc.add_argument("--replay_energy_filter", type=str2bool, default=True)
-    inc.add_argument("--replay_energy_filter_multiplier", type=int, default=3)
-    inc.add_argument("--replay_resample_rounds", type=int, default=4)
-    inc.add_argument("--replay_core_accept_margin", type=float, default=0.0)
-    inc.add_argument("--replay_directed_max_margin", type=float, default=1.0e9)
-    inc.add_argument("--replay_risk_weight", type=float, default=0.75)
-    inc.add_argument("--replay_unreliability_weight", type=float, default=0.50)
-    inc.add_argument("--joint_old_new_ce_weight", type=float, default=1.0)
-    inc.add_argument("--geometry_energy_margin_weight", type=float, default=0.30)
-    inc.add_argument("--geometry_energy_margin", type=float, default=0.30)
-    inc.add_argument("--old_new_invasion_weight", type=float, default=0.50)
-    inc.add_argument("--old_new_geometry_margin", type=float, default=0.35)
-    inc.add_argument("--refine_new_descriptors", type=str2bool, default=True)
-    inc.add_argument("--use_descriptor_refinement", type=str2bool, default=True)
-    inc.add_argument("--descriptor_refine_steps", type=int, default=20)
-    inc.add_argument("--descriptor_refine_steps_per_epoch", type=int, default=None)
-    inc.add_argument("--descriptor_refine_lr", type=float, default=1e-3)
-    inc.add_argument("--descriptor_refine_grad_clip", type=float, default=1.0)
-    inc.add_argument("--descriptor_trust_weight", type=float, default=0.80)
-    inc.add_argument("--descriptor_refine_max_mean_shift", type=float, default=0.30)
-    inc.add_argument("--descriptor_refine_max_logvar_shift", type=float, default=0.50)
-    inc.add_argument("--descriptor_subspace_collision_weight", type=float, default=0.10)
-    inc.add_argument("--descriptor_subspace_overlap_max", type=float, default=0.35)
-    inc.add_argument("--descriptor_center_margin_weight", type=float, default=0.05)
-    inc.add_argument("--descriptor_center_collision_weight", type=float, default=0.05)
-    inc.add_argument("--descriptor_center_margin", type=float, default=0.50)
-    inc.add_argument("--descriptor_volume_weight", type=float, default=0.03)
-    inc.add_argument("--descriptor_volume_control_weight", type=float, default=0.03)
-    inc.add_argument("--descriptor_volume_margin", type=float, default=0.0)
+    incremental = parser.add_argument_group(
+        "F. Incremental geometry transport"
+    )
+    incremental.add_argument(
+        "--incremental_controlled_plasticity",
+        type=str2bool,
+        default=True,
+    )
+    incremental.add_argument(
+        "--incremental_crossfit_folds",
+        type=int,
+        default=3,
+    )
+    incremental.add_argument(
+        "--incremental_steps_per_epoch",
+        type=int,
+        default=3,
+    )
+    incremental.add_argument(
+        "--incremental_geometry_weight",
+        type=float,
+        default=1.0,
+    )
+    incremental.add_argument(
+        "--incremental_coordinate_weight",
+        type=float,
+        default=0.10,
+    )
+    incremental.add_argument(
+        "--incremental_parameter_trust_weight",
+        type=float,
+        default=0.0,
+    )
+    incremental.add_argument(
+        "--incremental_base_margin",
+        type=float,
+        default=0.50,
+    )
+    incremental.add_argument(
+        "--incremental_risk_strength",
+        type=float,
+        default=0.50,
+    )
+    incremental.add_argument(
+        "--incremental_geometry_temperature",
+        type=float,
+        default=0.50,
+    )
+    incremental.add_argument(
+        "--incremental_maximum_pair_margin",
+        type=float,
+        default=None,
+    )
+    incremental.add_argument(
+        "--incremental_weight_decay",
+        type=float,
+        default=1e-4,
+    )
+    incremental.add_argument(
+        "--incremental_grad_clip",
+        type=float,
+        default=5.0,
+    )
+    incremental.add_argument(
+        "--incremental_use_cosine_scheduler",
+        type=str2bool,
+        default=True,
+    )
+    incremental.add_argument(
+        "--incremental_min_lr_ratio",
+        type=float,
+        default=0.10,
+    )
+    incremental.add_argument(
+        "--incremental_admission_enforce",
+        type=str2bool,
+        default=False,
+    )
+    incremental.add_argument(
+        "--incremental_max_transport_closure_error",
+        type=float,
+        default=1e-5,
+    )
+    incremental.add_argument(
+        "--incremental_max_transport_normalized_rmse",
+        type=float,
+        default=1.50,
+    )
 
-    clf = parser.add_argument_group("E. Geometry classifier/evaluation")
-    clf.add_argument("--classifier_mode", type=str, default="geometry")
-    clf.add_argument("--base_classifier_mode", type=str, default=None)
-    clf.add_argument("--incremental_classifier_mode", type=str, default=None)
-    clf.add_argument("--eval_classifier_mode", type=str, default="geometry")
-    clf.add_argument("--logit_scale", type=float, default=8.0)
-    clf.add_argument("--loss_scale", type=float, default=None)
-    clf.add_argument("--residual_variance_scale", type=float, default=1.0)
-    clf.add_argument("--energy_normalize_by_dim", type=str2bool, default=True)
-    clf.add_argument("--use_logdet_energy", type=str2bool, default=False)
-    clf.add_argument("--logdet_energy_weight", type=float, default=0.0)
-    clf.add_argument("--center_logdet_energy", type=str2bool, default=False)
-    clf.add_argument("--use_reliability_penalty", type=str2bool, default=False)
-    clf.add_argument("--reliability_energy_weight", type=float, default=0.0)
-    clf.add_argument("--geometry_logit_clip", type=float, default=0.0)
-    clf.add_argument("--best_state_metric", type=str, default="geometry_score")
-    clf.add_argument("--label_smoothing", type=float, default=0.0)
-    clf.add_argument("--ce_logit_clip", type=float, default=50.0)
-    clf.add_argument("--grad_clip_base", type=float, default=1.0)
-    clf.add_argument("--grad_clip_inc", type=float, default=0.5)
+    transport = parser.add_argument_group(
+        "G. Evidence-gated branch registration"
+    )
+    transport.add_argument(
+        "--transport_minimum_scale_samples",
+        type=int,
+        default=8,
+    )
+    transport.add_argument(
+        "--transport_minimum_rotation_samples",
+        type=int,
+        default=None,
+    )
+    transport.add_argument(
+        "--transport_minimum_rank_fraction",
+        type=float,
+        default=0.50,
+    )
+    transport.add_argument(
+        "--transport_rank_tolerance",
+        type=float,
+        default=1e-4,
+    )
+    transport.add_argument(
+        "--transport_minimum_relative_improvement",
+        type=float,
+        default=0.02,
+    )
+    transport.add_argument(
+        "--transport_maximum_normalized_rmse",
+        type=float,
+        default=1.50,
+    )
+    transport.add_argument(
+        "--transport_minimum_scale",
+        type=float,
+        default=0.70,
+    )
+    transport.add_argument(
+        "--transport_maximum_scale",
+        type=float,
+        default=1.30,
+    )
 
-    spec = parser.add_argument_group("F. HSI spectral metadata")
-    spec.add_argument("--spectral_summary_mode", type=str, default="center", choices=["center", "mean"])
-    spec.add_argument("--spectral_summary_is_physical", type=str2bool, default=False)
-    spec.add_argument("--raw_spectral_summary_is_physical", type=str2bool, default=True)
-    spec.add_argument("--external_spectra_are_physical", type=str2bool, default=True)
-    spec.add_argument("--allow_nonphysical_spectral_summary", type=str2bool, default=False)
-    spec.add_argument("--spectral_require_physical_summary", type=str2bool, default=True)
-    spec.add_argument("--use_spectral_geometry", type=str2bool, default=False)
-    spec.add_argument("--spectral_energy_weight", type=float, default=0.0)
-    spec.add_argument("--spectral_derivative_weight", type=float, default=0.50)
-    spec.add_argument("--spectral_second_derivative_weight", type=float, default=0.25)
-    spec.add_argument("--band_energy_weight", type=float, default=0.0)
-    spec.add_argument("--require_raw_spectral_metadata", type=str2bool, default=True)
-
-    safety = parser.add_argument_group("G. Safety, diagnostics, visualization")
-    safety.add_argument("--strict_non_exemplar", type=str2bool, default=True)
-    safety.add_argument("--strict_feature_contract", type=str2bool, default=True)
-    safety.add_argument("--strict_updated_stack", type=str2bool, default=True)
-    safety.add_argument("--freeze_projection_during_incremental", type=str2bool, default=True)
-    safety.add_argument("--allow_incremental_projection_training", type=str2bool, default=False)
-    safety.add_argument("--freeze_classifier_during_incremental", type=str2bool, default=True)
-    safety.add_argument("--save_geometry_diagnostics", type=str2bool, default=True)
-    safety.add_argument("--save_classification_report", type=str2bool, default=True)
-    safety.add_argument("--save_final_classification_report", type=str2bool, default=True)
-    safety.add_argument("--skip_phase_maps", type=str2bool, default=False)
-    safety.add_argument("--viz_class_cmap", type=str, default="nipy_spectral")
-    safety.add_argument("--viz_background_color", type=str, default="#20252B")
-    safety.add_argument("--viz_save_numpy", type=str2bool, default=True)
-    safety.add_argument("--deterministic", type=str2bool, default=False)
-    safety.add_argument("--debug_verbose", type=str2bool, default=False)
-    safety.add_argument("--refresh_before_validation", type=str2bool, default=True)
-    safety.add_argument("--validation_refresh_every", type=int, default=1)
-    safety.add_argument("--base_geometry_refresh_every", type=int, default=1)
-    safety.add_argument("--print_base_geometry_diagnostics", type=str2bool, default=True)
-    safety.add_argument("--geometry_diag_anchors_per_class", type=int, default=64)
-    safety.add_argument("--geometry_diag_topk_pairs", type=int, default=20)
-    safety.add_argument("--geometry_diag_topk_bands", type=int, default=5)
-    safety.add_argument("--base_cert_min_geom_acc", type=float, default=95.0)
-    safety.add_argument("--base_cert_min_reliability", type=float, default=0.15)
-    safety.add_argument("--base_cert_min_mean_reliability", type=float, default=0.35)
-    safety.add_argument("--base_cert_max_subspace_overlap", type=float, default=0.55)
-    safety.add_argument("--base_cert_subspace_warn_overlap", type=float, default=0.72)
-    safety.add_argument("--base_cert_max_geometry_conflict", type=float, default=1.35)
-    safety.add_argument("--base_cert_max_geometry_conflict_soft", type=float, default=1.40)
-    safety.add_argument("--base_cert_max_guided_geometry_conflict", type=float, default=0.18)
-    safety.add_argument("--base_cert_max_band_similarity", type=float, default=0.90)
-    safety.add_argument("--base_cert_max_spectral_shape_similarity", type=float, default=0.85)
-
-    legacy = parser.add_argument_group("H. Legacy flags accepted but disabled")
-    legacy.add_argument("--use_geometry_transport", type=str2bool, default=False)
-    legacy.add_argument("--use_sglat_transport", type=str2bool, default=False)
-    legacy.add_argument("--transport_mode", type=str, default="new_row_only")
-    legacy.add_argument("--allow_old_model_transport", type=str2bool, default=False)
-    legacy.add_argument("--allow_transport_without_adapter", type=str2bool, default=False)
-    legacy.add_argument("--use_energy_calibrator", type=str2bool, default=False)
-    legacy.add_argument("--energy_calibrator_type", type=str, default="none")
-    legacy.add_argument("--energy_calibration_weight", type=float, default=0.0)
-    legacy.add_argument("--use_adaptive_boundary", type=str2bool, default=False)
-    legacy.add_argument("--use_incremental_adapter", type=str2bool, default=False)
-    legacy.add_argument("--adapter_bottleneck", type=int, default=32)
-    legacy.add_argument("--adapter_max_scale", type=float, default=0.0)
-    legacy.add_argument("--adapter_dropout", type=float, default=0.0)
-    legacy.add_argument("--adapter_gate_bias_init", type=float, default=-3.0)
-    legacy.add_argument("--adapter_lr", type=float, default=0.0)
-    legacy.add_argument("--adapter_weight_decay", type=float, default=0.0)
-    legacy.add_argument("--g2rpa_adapter_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_old_delta_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_old_gate_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_old_energy_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_old_margin_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_delta_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_new_gate_weight", type=float, default=0.0)
-    legacy.add_argument("--adapter_new_gate_target", type=float, default=0.0)
-    legacy.add_argument("--adapter_new_gate_max_target", type=float, default=0.0)
-    legacy.add_argument("--disable_incremental_adapter", type=str2bool, default=False)
-    legacy.add_argument("--use_geometry_calibrator", type=str2bool, default=False)
-    legacy.add_argument("--use_bicyc_geometry_cycle", type=str2bool, default=False)
-    legacy.add_argument("--bss_weight", type=float, default=0.0)
-    legacy.add_argument("--sym_bss_weight", type=float, default=0.0)
-    legacy.add_argument("--gdr_weight", type=float, default=0.0)
-    legacy.add_argument("--anchor_consistency_weight", type=float, default=0.0)
-    legacy.add_argument("--use_mssl_loss", type=str2bool, default=False)
-    legacy.add_argument("--unsafe_ablation_use_mssl_loss", type=str2bool, default=False)
-    legacy.add_argument("--mssl_weight", type=float, default=0.0)
-    legacy.add_argument("--mssl_inc_weight", type=float, default=0.0)
-    legacy.add_argument("--bank_refresh_every", type=int, default=0)
-    legacy.add_argument("--early_stop_patience", type=int, default=0)
-    legacy.add_argument("--base_early_stop_patience", type=int, default=0)
-    legacy.add_argument("--incremental_early_stop_patience", type=int, default=0)
-    legacy.add_argument("--eval_semantic_mode", type=str, default="identity")
-    legacy.add_argument("--use_pretrain_incremental_baseline", type=str2bool, default=False)
-    legacy.add_argument("--allow_unknown_legacy_args", type=str2bool, default=False)
-
+    output = parser.add_argument_group("H. Evaluation and visualization")
+    output.add_argument("--energy_margin", type=float, default=0.0)
+    output.add_argument("--save_raw_arrays", type=str2bool, default=False)
+    output.add_argument("--save_model_summary", type=str2bool, default=True)
+    output.add_argument("--save_visualizations", type=str2bool, default=True)
+    output.add_argument("--save_test_maps", type=str2bool, default=True)
+    output.add_argument("--save_all_labeled_maps", type=str2bool, default=True)
+    output.add_argument("--save_combined_maps", type=str2bool, default=True)
+    output.add_argument("--save_map_numpy", type=str2bool, default=True)
+    output.add_argument("--visualization_batch_size", type=int, default=256)
+    output.add_argument("--visualization_dpi", type=int, default=300)
+    output.add_argument("--viz_class_cmap", type=str, default="nipy_spectral")
+    output.add_argument("--viz_background_color", type=str, default="#20252B")
+    output.add_argument("--debug_verbose", type=str2bool, default=False)
     return parser
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = build_parser()
-    args, unknown = parser.parse_known_args(argv)
-    args._unknown_args = unknown
-    return args
+def parse_args(
+    argv: Optional[Sequence[str]] = None,
+) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
-def resolve_experiment_config(args: argparse.Namespace) -> Tuple[argparse.Namespace, List[Dict[str, Any]], Dict[str, Any]]:
-    original = namespace_to_dict(args)
-    resolved = argparse.Namespace(**copy.deepcopy(original))
-    reasons: Dict[str, str] = {}
+def resolve_config(args: argparse.Namespace) -> argparse.Namespace:
+    resolved = argparse.Namespace(**namespace_to_dict(args))
+    resolved.device = resolve_device(resolved.device)
+    resolved.strict_non_exemplar = True
+    return resolved
 
-    mode = normalize_incremental_update_mode(
-        getattr(resolved, "incremental_update_mode", "spectral_coupled_geometry_replay")
-    )
-    _set_resolved(resolved, "incremental_update_mode", mode, reasons, "sctgr_method_identity")
 
-    for key, value in {
-        "classifier_mode": "geometry_only",
-        "base_classifier_mode": "geometry_only",
-        "incremental_classifier_mode": "geometry_only",
-        "eval_classifier_mode": "geometry_only",
-    }.items():
-        _set_resolved(resolved, key, normalize_classifier_mode(value), reasons, "seen_local_geometry_classifier")
-
-    forced_true = {
-        "strict_non_exemplar": True,
-        "strict_feature_contract": True,
-        "strict_updated_stack": True,
-        "freeze_projection_during_incremental": True,
-        "freeze_classifier_during_incremental": True,
-        "base_class_balance": True,
-        "strict_base_component_coverage": True,
-        "use_spectral_coupled_replay": True,
-        "replay_energy_filter": True,
-        "refine_new_descriptors": True,
-        "use_descriptor_refinement": True,
-        "require_raw_spectral_metadata": True,
-        "base_require_physical_spectral_shape": True,
-    }
-    for k, v in forced_true.items():
-        _set_resolved(resolved, k, v, reasons, "sctgr_contract")
-
-    forced_false = {
-        "allow_incremental_projection_training": False,
-        "use_geometry_transport": False,
-        "use_sglat_transport": False,
-        "allow_old_model_transport": False,
-        "allow_transport_without_adapter": False,
-        "use_energy_calibrator": False,
-        "use_adaptive_boundary": False,
-        "use_incremental_adapter": False,
-        "disable_incremental_adapter": True,
-        "use_geometry_calibrator": False,
-        "use_bicyc_geometry_cycle": False,
-        "use_mssl_loss": False,
-        "use_pretrain_incremental_baseline": False,
-        "use_spectral_geometry": False,
-        "geometry_normalize_logits": False,
-        "allow_nonphysical_spectral_summary": False,
-        "use_logdet_energy": False,
-        "center_logdet_energy": False,
-        "use_reliability_penalty": False,
-    }
-    for k, v in forced_false.items():
-        _set_resolved(resolved, k, v, reasons, "removed_or_inconsistent_branch")
-
-    forced_values = {
-        "residual_variance_scale": 1.0,
-        "energy_normalize_by_dim": True,
-        "logdet_energy_weight": 0.0,
-        "reliability_energy_weight": 0.0,
-        "spectral_energy_weight": 0.0,
-        "band_energy_weight": 0.0,
-        "energy_calibration_weight": 0.0,
-        "bss_weight": 0.0,
-        "sym_bss_weight": 0.0,
-        "gdr_weight": 0.0,
-        "anchor_consistency_weight": 0.0,
-        "mssl_weight": 0.0,
-        "mssl_inc_weight": 0.0,
-        "bank_refresh_every": 0,
-        "early_stop_patience": 0,
-        "base_early_stop_patience": 0,
-        "incremental_early_stop_patience": 0,
-        "adapter_max_scale": 0.0,
-        "adapter_lr": 0.0,
-        "adapter_weight_decay": 0.0,
-        "g2rpa_adapter_weight": 0.0,
-        "adapter_old_delta_weight": 0.0,
-        "adapter_old_gate_weight": 0.0,
-        "adapter_old_energy_weight": 0.0,
-        "adapter_old_margin_weight": 0.0,
-        "adapter_delta_weight": 0.0,
-        "adapter_new_gate_weight": 0.0,
-        "adapter_new_gate_target": 0.0,
-        "adapter_new_gate_max_target": 0.0,
-    }
-    for k, v in forced_values.items():
-        _set_resolved(resolved, k, v, reasons, "strict_energy_or_removed_branch")
-
-    required_positive = {
-        "base_ce_weight": 1.0,
-        "base_srpgr_weight": 1.0,
-        "base_gics_weight": 0.20,
-        "base_energy_margin_weight": 0.15,
-        "base_energy_margin": 0.25,
-        "pgr_weight": 0.10,
-        "pgr_compact_weight": 0.15,
-        "pgr_center_weight": 0.25,
-        "pgr_subspace_weight": 0.15,
-        "pgr_band_weight": 0.05,
-        "pgr_volume_weight": 0.05,
-        "pgr_max_subspace_overlap": 0.55,
-        "pgr_min_class_variance": 0.015,
-        "spectral_geometry_rank": 5,
-        "coupling_ridge": 1e-3,
-        "coupling_min_reliability": 0.20,
-        "replay_candidate_multiplier": 4,
-        "replay_min_per_class": 24,
-        "replay_max_per_class": 64,
-        "pair_risk_topk": 3,
-    }
-    for k, fallback in required_positive.items():
-        if float(getattr(resolved, k, fallback)) <= 0.0:
-            _set_resolved(resolved, k, fallback, reasons, "mandatory_sctgr_component")
-
-    pca_active = (not bool(getattr(resolved, "no_pca", False))) and int(getattr(resolved, "pca_components", 0) or 0) > 0
-    if pca_active:
-        _set_resolved(resolved, "spectral_summary_is_physical", False, reasons, "pca_features_are_not_physical_spectra")
-    _set_resolved(resolved, "raw_spectral_summary_is_physical", True, reasons, "raw_center_spectrum_contract")
-    _set_resolved(resolved, "external_spectra_are_physical", True, reasons, "raw_center_spectrum_contract")
-
-    if getattr(resolved, "descriptor_refine_steps_per_epoch", None) is None:
-        _set_resolved(
-            resolved,
-            "descriptor_refine_steps_per_epoch",
-            int(getattr(resolved, "descriptor_refine_steps", 20)),
-            reasons,
-            "default_filled",
-        )
-    if getattr(resolved, "loss_scale", None) is None:
-        _set_resolved(resolved, "loss_scale", float(getattr(resolved, "logit_scale", 8.0)), reasons, "classifier_scale_alias")
-
-    if bool(getattr(resolved, "base_only", False)):
-        _set_resolved(resolved, "epochs_inc", 0, reasons, "base_only")
-        _set_resolved(resolved, "lr_inc", 0.0, reasons, "base_only")
-        _set_resolved(resolved, "best_state_metric", "geometry_score", reasons, "base_only")
-
-    method_identity = build_method_identity(resolved)
-    diff = compute_config_diff(original, namespace_to_dict(resolved), reasons)
-    return resolved, diff, method_identity
-
-def build_method_identity(args: argparse.Namespace) -> Dict[str, Any]:
-    return {
-        "method_name": "Spectral-Coupled Tangent Geometry Replay with New-Row Descriptor Adaptation for HSI NECIL",
-        "short_name": "SCTGR-HSI",
-        "main_path": True,
-        "incremental_update_mode": "spectral_coupled_geometry_replay",
-        "base": {
-            "temporary_ce_head": True,
-            "mandatory_balanced_ce": True,
-            "mandatory_gics": True,
-            "mandatory_pgr": ["compact", "center", "subspace", "band", "volume"],
-            "physical_spectral_shape_guidance": True,
-            "geometry_bank_space": "canonical_projected_z",
-            "paired_raw_spectral_geometry": True,
-            "spectral_to_feature_coupling": True,
-            "base_geometry_energy_margin": True,
-        },
-        "incremental": {
-            "frozen_backbone": True,
-            "frozen_projection": True,
-            "frozen_classifier": True,
-            "frozen_old_geometry_rows": True,
-            "spectral_consistent_core_replay": True,
-            "risk_directed_tangent_replay": True,
-            "energy_filtered_replay": True,
-            "new_row_descriptor_refinement_only": True,
-            "seen_local_geometry_classifier": True,
-            "joint_class_balanced_ce": True,
-            "geometry_energy_margin": True,
-            "bidirectional_old_new_invasion": True,
-        },
-        "energy_contract": {
-            "rank_normalized_parallel": True,
-            "residual_dimension_normalized": True,
-            "residual_variance_scale": 1.0,
-            "logdet_score_bias": False,
-            "centered_logdet_score_bias": False,
-            "reliability_score_bias": False,
-            "classifier_replay_loss_energy_identical": True,
-        },
-        "forbidden": {
-            "raw_exemplars": False,
-            "stored_old_features": False,
-            "kd_teacher": False,
-            "prototype_classifier": False,
-            "feature_adapter": False,
-            "old_row_transport": False,
-            "score_calibrator": False,
-            "adaptive_boundary": False,
-            "projection_plasticity": False,
-        },
-        "label_convention": {
-            "dataset_labels": "global_class_ids",
-            "geometry_bank_rows": "global_class_ids",
-            "classifier_logits": "seen_local_column_order",
-            "ce_targets": "seen_local_labels",
-            "evaluation_predictions": "mapped_to_global_class_ids",
-            "old_new_partition": "explicit_global_class_lists",
-        },
-        "raw_spectral_metadata_required": bool(getattr(args, "require_raw_spectral_metadata", True)),
-    }
-
-def validate_config(args: argparse.Namespace, *, num_classes: Optional[int] = None) -> None:
-    unknown_args = list(getattr(args, "_unknown_args", []) or [])
-    if unknown_args and not bool(getattr(args, "allow_unknown_legacy_args", False)):
-        raise ValueError(
-            "Unknown CLI arguments are forbidden because they can silently select a different method: "
-            + str(unknown_args)
-        )
-    if args.dataset not in DATASET_INFO:
-        raise ValueError(f"Unknown dataset {args.dataset!r}.")
-    if not bool(args.strict_non_exemplar):
-        raise ValueError("SCTGR requires --strict_non_exemplar true.")
+def validate_config(
+    args: argparse.Namespace,
+    *,
+    num_classes: Optional[int] = None,
+) -> None:
     if int(args.patch_size) <= 0 or int(args.patch_size) % 2 == 0:
-        raise ValueError("--patch_size must be a positive odd integer.")
-    if float(args.train_ratio) <= 0 or float(args.val_ratio) < 0 or float(args.train_ratio) + float(args.val_ratio) >= 1.0:
-        raise ValueError("Require 0 < train_ratio, 0 <= val_ratio, and train_ratio + val_ratio < 1.")
-    if int(args.epochs_base) <= 0 or int(args.epochs_inc) < 0:
-        raise ValueError("epochs_base must be > 0 and epochs_inc must be >= 0.")
-    if int(args.batch_size) <= 0 or int(args.d_model) <= 0:
-        raise ValueError("batch_size and d_model must be positive.")
-    if int(args.subspace_rank) <= 0 or int(args.subspace_rank) >= int(args.d_model):
-        raise ValueError("Require 0 < subspace_rank < d_model.")
-    if int(args.spectral_geometry_rank) <= 0:
-        raise ValueError("spectral_geometry_rank must be positive.")
-    if not bool(args.no_pca) and int(args.pca_components) <= 0:
-        raise ValueError("pca_components must be positive unless --no_pca is used.")
-    if float(args.geom_var_floor) <= 0 or float(args.spectral_variance_floor) <= 0:
-        raise ValueError("feature and spectral variance floors must be positive.")
-    if float(args.coupling_ridge) <= 0:
-        raise ValueError("coupling_ridge must be positive.")
-    if not (0.0 <= float(args.coupling_min_reliability) <= 1.0):
-        raise ValueError("coupling_min_reliability must be in [0,1].")
-    if normalize_incremental_update_mode(args.incremental_update_mode) != "spectral_coupled_geometry_replay":
-        raise ValueError("incremental_update_mode must be spectral_coupled_geometry_replay.")
-    if not bool(args.use_spectral_coupled_replay):
-        raise ValueError("SCTGR requires use_spectral_coupled_replay=true.")
-    if bool(args.allow_incremental_projection_training) or not bool(args.freeze_projection_during_incremental):
-        raise ValueError("Incremental projection training invalidates the frozen GeometryBank coordinate system.")
-    if not bool(args.freeze_classifier_during_incremental):
-        raise ValueError("The geometry classifier has no incremental trainable parameters and must remain frozen.")
-
-    forbidden_bool = [
-        "use_geometry_transport", "use_sglat_transport", "allow_old_model_transport",
-        "use_energy_calibrator", "use_adaptive_boundary", "use_incremental_adapter",
-        "use_geometry_calibrator", "use_bicyc_geometry_cycle", "use_spectral_geometry",
-        "use_mssl_loss",
-    ]
-    bad = [k for k in forbidden_bool if bool(getattr(args, k, False))]
-    if bad:
-        raise ValueError(f"Removed architecture branches must be false: {bad}")
-    if not bool(getattr(args, "disable_incremental_adapter", True)):
-        raise ValueError("disable_incremental_adapter must remain true.")
-
-    if abs(float(args.residual_variance_scale) - 1.0) > 1e-12:
-        raise ValueError("residual_variance_scale must be exactly 1.0 for classifier/replay/loss consistency.")
-    if not bool(args.energy_normalize_by_dim):
-        raise ValueError("energy_normalize_by_dim must remain true for the rank/residual normalized energy contract.")
+        raise ValueError("patch_size must be a positive odd integer")
+    if not 0.0 < float(args.train_ratio) < 1.0:
+        raise ValueError("train_ratio must lie in (0,1)")
+    if not 0.0 < float(args.val_ratio) < 1.0:
+        raise ValueError("val_ratio must lie in (0,1)")
+    if float(args.train_ratio) + float(args.val_ratio) >= 1.0:
+        raise ValueError(
+            "train_ratio + val_ratio must be smaller than one"
+        )
+    if int(args.base_classes) < 2:
+        raise ValueError("base_classes must be at least two")
+    if int(args.increment) <= 0:
+        raise ValueError("increment must be positive")
+    if int(args.epochs_base) <= 0 or int(args.epochs_inc) <= 0:
+        raise ValueError("base and incremental epochs must be positive")
+    if int(args.batch_size) <= 0 or int(args.eval_batch_size) <= 0:
+        raise ValueError("batch sizes must be positive")
+    if float(args.lr) <= 0.0 or float(args.lr_inc) <= 0.0:
+        raise ValueError("learning rates must be positive")
+    if int(args.spectral_feature_dim) <= 0:
+        raise ValueError("spectral_feature_dim must be positive")
+    if int(args.spatial_feature_dim) <= 0:
+        raise ValueError("spatial_feature_dim must be positive")
+    feature_dim = (
+        int(args.spectral_feature_dim)
+        + int(args.spatial_feature_dim)
+    )
+    if not 0 <= int(args.subspace_rank) <= feature_dim:
+        raise ValueError(
+            f"subspace_rank must lie in [0,{feature_dim}]"
+        )
     if (
-        bool(args.use_logdet_energy)
-        or float(args.logdet_energy_weight) != 0.0
-        or bool(args.center_logdet_energy)
+        int(args.geometry_samples_per_class) < 6
+        or int(args.geometry_samples_per_class) % 2 != 0
     ):
         raise ValueError(
-            "Log-determinant score bias is removed from the classifier. "
-            "Require use_logdet_energy=false, logdet_energy_weight=0.0, "
-            "and center_logdet_energy=false."
+            "geometry_samples_per_class must be even and at least six"
         )
-    if bool(args.use_reliability_penalty) or float(args.reliability_energy_weight) != 0.0:
-        raise ValueError("Reliability controls replay/trust, not classifier logits.")
-    if bool(args.spectral_summary_is_physical) and (not bool(args.no_pca)) and int(args.pca_components) > 0:
-        raise ValueError("PCA feature channels cannot be marked as physical wavelengths.")
-    if not bool(args.raw_spectral_summary_is_physical):
-        raise ValueError("Raw center spectra must be marked physical for spectral-coupled replay.")
-
-    for key in (
-        "base_ce_weight", "base_srpgr_weight", "base_gics_weight",
-        "base_energy_margin_weight", "base_energy_margin", "pgr_weight",
-        "pgr_compact_weight", "pgr_center_weight", "pgr_subspace_weight",
-        "pgr_band_weight", "pgr_volume_weight", "geometry_energy_margin_weight",
-        "geometry_energy_margin", "old_new_invasion_weight", "old_new_geometry_margin",
-        "descriptor_refine_steps", "descriptor_refine_lr", "descriptor_trust_weight",
-        "replay_min_per_class", "replay_max_per_class", "replay_candidate_multiplier",
+    if int(args.incremental_crossfit_folds) < 3:
+        raise ValueError(
+            "incremental_crossfit_folds must be at least three"
+        )
+    if int(args.min_train_per_class) < (
+        3 * int(args.incremental_crossfit_folds)
     ):
-        if float(getattr(args, key)) <= 0.0:
-            raise ValueError(f"{key} must be > 0 in the SCTGR main path.")
-    if int(args.replay_min_per_class) > int(args.replay_max_per_class):
-        raise ValueError("replay_min_per_class cannot exceed replay_max_per_class.")
-    if float(args.gfa_parallel_scale) <= 0.0 or float(args.gfa_residual_scale) < 0.0:
-        raise ValueError("gfa_parallel_scale must be > 0 and gfa_residual_scale must be >= 0.")
-    if int(args.replay_energy_filter_multiplier) <= 0 or int(args.replay_resample_rounds) <= 0:
-        raise ValueError("replay candidate multiplier and resample rounds must be positive.")
-    if not (0.0 <= float(args.directed_replay_min_ratio) <= float(args.directed_replay_max_ratio) <= 1.0):
-        raise ValueError("Require 0 <= directed_replay_min_ratio <= directed_replay_max_ratio <= 1.")
-    if not (0.0 <= float(args.core_replay_ratio) <= 1.0):
-        raise ValueError("core_replay_ratio must be in [0,1].")
-    if not (0.0 < float(args.pgr_max_subspace_overlap) <= 1.0):
-        raise ValueError("pgr_max_subspace_overlap must be in (0,1].")
-    if float(args.pgr_min_class_variance) >= float(args.pgr_max_class_variance):
-        raise ValueError("pgr_min_class_variance must be smaller than pgr_max_class_variance.")
-
+        raise ValueError(
+            "min_train_per_class must provide at least three samples "
+            "per incremental cross-fit role"
+        )
+    if not 0.0 <= float(args.label_smoothing) < 1.0:
+        raise ValueError("label_smoothing must lie in [0,1)")
+    if int(args.visualization_batch_size) <= 0:
+        raise ValueError("visualization_batch_size must be positive")
+    if int(args.visualization_dpi) <= 0:
+        raise ValueError("visualization_dpi must be positive")
     if num_classes is not None:
-        if int(num_classes) != int(DATASET_INFO[args.dataset]["classes"]):
+        if not 2 <= int(args.base_classes) <= int(num_classes):
             raise ValueError(
-                f"Loaded class count {num_classes} does not match DATASET_INFO[{args.dataset}]="
-                f"{DATASET_INFO[args.dataset]['classes']}."
+                f"base_classes must lie in [2,{num_classes}]"
             )
-        if args.base_classes is not None and (int(args.base_classes) <= 0 or int(args.base_classes) >= int(num_classes)):
-            raise ValueError(f"base_classes={args.base_classes} must be in [1,{num_classes - 1}].")
-        if args.increment is not None and int(args.increment) <= 0:
-            raise ValueError("increment must be positive.")
-    seeds = parse_seed_list(getattr(args, "seed_list", ""))
+        order = parse_int_list(
+            args.class_order,
+            name="class_order",
+        )
+        if order is not None:
+            if len(order) != int(num_classes):
+                raise ValueError(
+                    "class_order must contain a complete class permutation"
+                )
+            if set(order) != set(range(int(num_classes))):
+                raise ValueError(
+                    "class_order must be a permutation of original IDs"
+                )
+    seeds = parse_int_list(args.seed_list, name="seed_list")
     if seeds is not None and len(seeds) != int(args.num_runs):
-        raise ValueError(f"seed_list has {len(seeds)} seeds but num_runs={args.num_runs}.")
-    if int(args.num_runs) <= 0:
-        raise ValueError("num_runs must be >= 1.")
-
-def save_config_files(
-    save_root: str,
-    original: Dict[str, Any],
-    resolved: argparse.Namespace,
-    diff: List[Dict[str, Any]],
-    method_identity: Dict[str, Any],
-) -> Dict[str, str]:
-    os.makedirs(save_root, exist_ok=True)
-    paths = {
-        "config_original": save_json(os.path.join(save_root, "config_original.json"), original),
-        "config_resolved": save_json(os.path.join(save_root, "config_resolved.json"), namespace_to_dict(resolved)),
-        "config_diff": save_json(os.path.join(save_root, "config_diff.json"), diff),
-        "method_identity": save_json(os.path.join(save_root, "method_identity.json"), method_identity),
-    }
-    if getattr(resolved, "_unknown_args", None):
-        paths["unknown_args"] = save_json(os.path.join(save_root, "unknown_args.json"), {"unknown_args": list(resolved._unknown_args)})
-    return paths
-
-
-def print_config_summary(args: argparse.Namespace, diff: List[Dict[str, Any]], method_identity: Dict[str, Any]) -> None:
-    print("[Method]", method_identity["method_name"])
-    print(f"[Method] short_name={method_identity['short_name']} | update_mode={args.incremental_update_mode}")
-    print(f"[Classifier] base={args.base_classifier_mode} | incremental={args.incremental_classifier_mode} | eval={args.eval_classifier_mode}")
-    print(
-        f"[Energy] residual_scale={args.residual_variance_scale} | rank/dim normalized=True | "
-        f"logdet=False | centered_logdet=False | reliability_logit_bias=False"
-    )
-    print(
-        f"[Base] CE={args.base_ce_weight} | GICS={args.base_gics_weight} | PGR={args.pgr_weight} | "
-        f"margin={args.base_energy_margin_weight}@{args.base_energy_margin}"
-    )
-    print(
-        f"[Replay] target/class={args.gfa_samples_per_class} | range={args.replay_min_per_class}-{args.replay_max_per_class} | "
-        f"core={args.core_replay_ratio} | directed={args.directed_replay_min_ratio}-{args.directed_replay_max_ratio} | "
-        f"risk_topk={args.pair_risk_topk}"
-    )
-    print(
-        f"[Coupling] spectral_rank={args.spectral_geometry_rank} | ridge={args.coupling_ridge} | "
-        f"min_reliability={args.coupling_min_reliability} | tangent_clip={args.spectral_tangent_clip}"
-    )
-    print(
-        f"[Refinement] steps/epoch={args.descriptor_refine_steps_per_epoch} | lr={args.descriptor_refine_lr} | "
-        f"trust={args.descriptor_trust_weight}"
-    )
-    print("[Forbidden OFF] adapters | transport | calibrator | adaptive boundary | KD | raw exemplars | spectral classifier")
-    if getattr(args, "_unknown_args", None):
-        mode = "IGNORED BY USER OVERRIDE" if bool(getattr(args, "allow_unknown_legacy_args", False)) else "ERROR"
-        print(f"[UNKNOWN ARGS {mode}] {args._unknown_args}")
-    if diff:
-        print("[Config Diff] resolved changes:")
-        for row in diff[:40]:
-            print(f"  - {row['name']}: {row['original']} -> {row['resolved']} ({row['reason']})")
-        if len(diff) > 40:
-            print(f"  ... {len(diff) - 40} more changes saved in config_diff.json")
-
-# -----------------------------------------------------------------------------
-# Reproducibility and data loading
-# -----------------------------------------------------------------------------
-
-
-def set_seed(seed: int, deterministic: bool = False) -> None:
-    random.seed(int(seed))
-    np.random.seed(int(seed))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        try:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        except Exception:
-            pass
-    else:
-        torch.backends.cudnn.benchmark = True
-
-
-def load_hsi_dataset(args: argparse.Namespace) -> Dict[str, Any]:
-    apply_reduction = (not bool(args.no_pca)) and str(args.reduction_method).lower() != "none"
-    raw_hsi_physical = None
-    label_policy = None
-    try:
-        load_out = LoadHSIData(
-            method=args.dataset,
-            base_dir=args.data_dir,
-            apply_reduction=apply_reduction,
-            n_components=args.pca_components,
-            reduction_method=args.reduction_method,
-            return_label_policy=True,
-            return_raw_hsi=True,
+        raise ValueError(
+            "seed_list length must equal num_runs"
         )
-        if len(load_out) == 7:
-            hsi, gt, num_classes, target_names, has_bg, label_policy, raw_hsi_physical = load_out
-        else:
-            hsi, gt, num_classes, target_names, has_bg, label_policy = load_out
-    except TypeError:
-        hsi, gt, num_classes, target_names, has_bg = LoadHSIData(
-            method=args.dataset,
-            base_dir=args.data_dir,
-            apply_reduction=apply_reduction,
-            n_components=args.pca_components,
-            reduction_method=args.reduction_method,
+    if str(args.resume_checkpoint).strip() and int(args.num_runs) != 1:
+        raise ValueError(
+            "resume_checkpoint is supported only for one run"
         )
 
-    validate_config(args, num_classes=int(num_classes))
 
-    try:
-        cube_out = ImageCubes(
-            HSI=hsi,
-            GT=gt,
-            WS=args.patch_size,
-            removeZeroLabels=True,
-            has_background=has_bg,
-            num_classes=num_classes,
-            pytorch_format=True,
-            label_policy=label_policy,
-            return_center_spectra=True,
-            raw_hsi_for_spectra=raw_hsi_physical,
-        )
-        if len(cube_out) == 4:
-            patches, labels, coords, raw_center_spectra = cube_out
-        else:
-            patches, labels, coords = cube_out
-            raw_center_spectra = None
-    except TypeError:
-        patches, labels, coords = ImageCubes(
-            HSI=hsi,
-            GT=gt,
-            WS=args.patch_size,
-            removeZeroLabels=True,
-            has_background=has_bg,
-            num_classes=num_classes,
-            pytorch_format=True,
-        )
-        raw_center_spectra = None
+# =============================================================================
+# Incremental protocol and leakage-safe lazy patch manager
+# =============================================================================
 
-    labels_np = labels.detach().cpu().numpy() if torch.is_tensor(labels) else np.asarray(labels)
-    if np.any(labels_np < 0):
-        raise RuntimeError("Dataset labels must be non-negative global class IDs after background removal.")
 
-    args.num_bands = int(patches.shape[1])
-    args.max_classes = int(num_classes)
-    args.raw_spectral_summary_is_physical = bool(raw_center_spectra is not None)
-    if bool(getattr(args, "require_raw_spectral_metadata", True)) and raw_center_spectra is None:
+def _split_one_class(
+    indices: np.ndarray,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    minimum_train: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if values.size < 3:
         raise RuntimeError(
-            "SCTGR requires aligned raw physical center spectra. The loader returned none. "
-            "Update LoadHSIData/ImageCubes so PCA patches and raw center spectra are returned together."
+            "each class requires train, validation, and test samples"
         )
-    if raw_center_spectra is not None:
-        raw_arr = raw_center_spectra.detach().cpu().numpy() if torch.is_tensor(raw_center_spectra) else np.asarray(raw_center_spectra)
-        if raw_arr.ndim != 2 or raw_arr.shape[0] != labels_np.size:
-            raise RuntimeError(
-                f"Raw center spectra must be [N,S] aligned with labels; got {raw_arr.shape}, N={labels_np.size}."
+    rng = np.random.RandomState(int(seed))
+    values = rng.permutation(values)
+    count = int(values.size)
+    validation_count = max(
+        1,
+        int(round(count * float(val_ratio))),
+    )
+    train_count = max(
+        1,
+        int(minimum_train),
+        int(round(count * float(train_ratio))),
+    )
+    train_count = min(
+        train_count,
+        count - validation_count - 1,
+    )
+    if train_count < 1:
+        raise RuntimeError(
+            f"class split cannot allocate training data: n={count}"
+        )
+    remaining = count - train_count
+    validation_count = min(
+        validation_count,
+        remaining - 1,
+    )
+    test_count = count - train_count - validation_count
+    if validation_count < 1 or test_count < 1:
+        raise RuntimeError(
+            "class split must retain validation and test samples"
+        )
+    return (
+        values[:train_count].copy(),
+        values[train_count:train_count + validation_count].copy(),
+        values[train_count + validation_count:].copy(),
+    )
+
+
+def build_incremental_protocol(
+    input_labels: np.ndarray,
+    *,
+    class_count: int,
+    base_classes: int,
+    increment: int,
+    train_ratio: float,
+    val_ratio: float,
+    minimum_train: int,
+    seed: int,
+    shuffle_order: bool,
+    class_order: Optional[Sequence[int]],
+) -> Dict[str, Any]:
+    labels = np.asarray(input_labels, dtype=np.int64).reshape(-1)
+    original_ids = sorted(
+        int(value) for value in np.unique(labels).tolist()
+    )
+    if original_ids != list(range(int(class_count))):
+        raise RuntimeError(
+            "ExtractLabeledPixelIndex must return contiguous class IDs"
+        )
+
+    if class_order is not None:
+        order = [int(value) for value in class_order]
+        if len(order) != class_count or set(order) != set(original_ids):
+            raise ValueError(
+                "class_order must be a complete original-ID permutation"
             )
-        if not np.isfinite(raw_arr).all():
-            raise RuntimeError("Raw center spectra contain NaN/Inf values.")
+    elif shuffle_order:
+        rng = np.random.RandomState(int(seed))
+        order = [
+            int(value)
+            for value in rng.permutation(original_ids).tolist()
+        ]
+    else:
+        order = list(original_ids)
 
-    dataset_summary = {
-        "dataset": args.dataset,
-        "name": DATASET_INFO[args.dataset]["name"],
-        "expected_raw_bands": DATASET_INFO[args.dataset]["bands"],
-        "used_channels": int(patches.shape[1]),
-        "pca_active": bool(apply_reduction),
-        "pca_components": int(args.pca_components) if apply_reduction else 0,
-        "num_classes": int(num_classes),
-        "has_background": bool(has_bg),
-        "labeled_samples": int(labels_np.size),
-        "train_ratio": float(args.train_ratio),
-        "val_ratio": float(args.val_ratio),
-        "raw_physical_center_spectra_available": bool(raw_center_spectra is not None),
-        "raw_center_spectra_shape": list(raw_center_spectra.shape) if raw_center_spectra is not None and hasattr(raw_center_spectra, "shape") else None,
-        "label_policy": label_policy,
+    original_to_global = {
+        original_id: global_id
+        for global_id, original_id in enumerate(order)
     }
-    print("[Dataset]")
-    print(f"  name={dataset_summary['name']} | classes={num_classes} | used_channels={patches.shape[1]} | PCA={apply_reduction}")
-    print(f"  samples={dataset_summary['labeled_samples']} | raw_spectra={dataset_summary['raw_physical_center_spectra_available']}")
+    global_labels = np.asarray(
+        [original_to_global[int(value)] for value in labels],
+        dtype=np.int64,
+    )
+
+    phase_to_classes: Dict[int, List[int]] = {
+        0: list(range(int(base_classes)))
+    }
+    cursor = int(base_classes)
+    phase = 1
+    while cursor < class_count:
+        phase_to_classes[phase] = list(
+            range(
+                cursor,
+                min(cursor + int(increment), class_count),
+            )
+        )
+        cursor += int(increment)
+        phase += 1
+
+    split_by_class: Dict[int, Dict[str, np.ndarray]] = {}
+    class_counts: Dict[int, Dict[str, int]] = {}
+    for global_id in range(class_count):
+        indices = np.flatnonzero(
+            global_labels == global_id
+        ).astype(np.int64)
+        train, validation, test = _split_one_class(
+            indices,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            minimum_train=minimum_train,
+            seed=int(seed) + 1009 * global_id,
+        )
+        split_by_class[global_id] = {
+            "train": train,
+            "val": validation,
+            "test": test,
+            "all": indices,
+        }
+        class_counts[global_id] = {
+            "all": int(indices.size),
+            "train": int(train.size),
+            "val": int(validation.size),
+            "test": int(test.size),
+            "original_class_id": int(order[global_id]),
+            "introduction_phase": next(
+                phase_id
+                for phase_id, class_ids
+                in phase_to_classes.items()
+                if global_id in class_ids
+            ),
+        }
+
+    base_train_indices = np.concatenate(
+        [
+            split_by_class[class_id]["train"]
+            for class_id in phase_to_classes[0]
+        ]
+    ).astype(np.int64, copy=False)
     return {
-        "hsi": hsi,
-        "gt": gt,
-        "num_classes": int(num_classes),
-        "target_names": list(target_names),
-        "has_background": bool(has_bg),
-        "label_policy": label_policy,
-        "patches": patches,
-        "labels": labels,
-        "coords": coords,
-        "raw_center_spectra": raw_center_spectra,
-        "summary": dataset_summary,
+        "class_order_original_ids": order,
+        "original_to_global": original_to_global,
+        "global_to_original": {
+            global_id: original_id
+            for global_id, original_id in enumerate(order)
+        },
+        "global_labels": global_labels,
+        "phase_to_classes": phase_to_classes,
+        "num_phases": len(phase_to_classes),
+        "split_by_class": split_by_class,
+        "class_counts": class_counts,
+        "base_train_indices": base_train_indices,
     }
 
 
-def build_incremental_dataset(args: argparse.Namespace, data: Dict[str, Any]) -> IncrementalHSIDataset:
-    if args.base_classes is None:
-        args.base_classes = 6 if args.dataset in {"IP", "SA", "HC"} else max(2, data["num_classes"] // 2)
-    if args.increment is None:
-        remaining = max(1, data["num_classes"] - int(args.base_classes))
-        args.increment = 3 if remaining >= 3 else 1
-    validate_config(args, num_classes=data["num_classes"])
+class LazyHSIPatchDataset(Dataset):
+    def __init__(
+        self,
+        manager: "IncrementalHSIDatasetManager",
+        indices: Sequence[int],
+    ) -> None:
+        self.manager = manager
+        self.indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+        self.labels = manager.labels[self.indices]
 
-    kwargs = dict(
-        patches=data["patches"],
-        labels=data["labels"],
-        coords=data["coords"],
-        gt_shape=data["gt"].shape,
-        GT=data["gt"].copy().astype(np.int64),
+    def __len__(self) -> int:
+        return int(self.indices.size)
+
+    def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
+        sample_index = int(self.indices[int(item)])
+        row, column = self.manager.coords[sample_index]
+        radius = self.manager.patch_size // 2
+        row_padded = int(row) + radius
+        column_padded = int(column) + radius
+        processed = self.manager.processed_padded[
+            row_padded - radius:row_padded + radius + 1,
+            column_padded - radius:column_padded + radius + 1,
+            :,
+        ]
+        raw = self.manager.raw_padded[
+            row_padded - radius:row_padded + radius + 1,
+            column_padded - radius:column_padded + radius + 1,
+            :,
+        ]
+        return {
+            "image": torch.from_numpy(
+                np.moveaxis(processed, -1, 0).copy()
+            ).float(),
+            "raw_spectral_patch": torch.from_numpy(
+                np.moveaxis(raw, -1, 0).copy()
+            ).float(),
+            "label": torch.tensor(
+                int(self.manager.labels[sample_index]),
+                dtype=torch.long,
+            ),
+            "coord": torch.tensor(
+                self.manager.coords[sample_index],
+                dtype=torch.long,
+            ),
+            "sample_index": torch.tensor(
+                sample_index,
+                dtype=torch.long,
+            ),
+        }
+
+
+class IncrementalHSIDatasetManager:
+    """Phase-aware HSI dataset with strict training access.
+
+    Current-phase train and validation loaders contain only current classes.
+    Cumulative validation/test/all loaders contain only classes seen by the
+    requested phase. No trainer API exposes old training samples during an
+    incremental phase.
+    """
+
+    def __init__(
+        self,
+        *,
+        processed_cube: np.ndarray,
+        raw_physical_cube: np.ndarray,
+        labels: np.ndarray,
+        coords: np.ndarray,
+        protocol: Mapping[str, Any],
+        target_names: Sequence[str],
+        gt_shape: Sequence[int],
+        patch_size: int,
+        num_workers: int,
+        device: str,
+    ) -> None:
+        processed = np.ascontiguousarray(
+            processed_cube,
+            dtype=np.float32,
+        )
+        raw = np.ascontiguousarray(
+            raw_physical_cube,
+            dtype=np.float32,
+        )
+        if processed.ndim != 3 or raw.ndim != 3:
+            raise ValueError("HSI cubes must be [H,W,C]")
+        if processed.shape[:2] != raw.shape[:2]:
+            raise ValueError("processed and raw cube shapes differ")
+        self.patch_size = int(patch_size)
+        if self.patch_size <= 0 or self.patch_size % 2 == 0:
+            raise ValueError("patch_size must be positive and odd")
+        radius = self.patch_size // 2
+        self.processed_padded = np.pad(
+            processed,
+            ((radius, radius), (radius, radius), (0, 0)),
+            mode="reflect",
+        )
+        self.raw_padded = np.pad(
+            raw,
+            ((radius, radius), (radius, radius), (0, 0)),
+            mode="reflect",
+        )
+        self.labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+        self.coords = np.asarray(coords, dtype=np.int64)
+        if self.coords.shape != (self.labels.size, 2):
+            raise ValueError("coords must align with labels")
+        self.phase_to_classes = {
+            int(phase): [int(value) for value in class_ids]
+            for phase, class_ids
+            in protocol["phase_to_classes"].items()
+        }
+        self.num_phases = len(self.phase_to_classes)
+        self.class_to_phase = {
+            class_id: phase
+            for phase, class_ids in self.phase_to_classes.items()
+            for class_id in class_ids
+        }
+        self.split_by_class = {
+            int(class_id): {
+                str(split): np.asarray(indices, dtype=np.int64)
+                for split, indices in values.items()
+            }
+            for class_id, values
+            in protocol["split_by_class"].items()
+        }
+        self.target_names = [str(value) for value in target_names]
+        self.total_class_count = len(self.target_names)
+        self.gt_shape = tuple(int(value) for value in gt_shape)
+        self.num_workers = int(num_workers)
+        self.pin_memory = str(device).startswith("cuda")
+        self.current_phase = 0
+        self.finalized_phases: List[int] = []
+
+    def start_phase(self, phase: int) -> None:
+        phase = int(phase)
+        if phase not in self.phase_to_classes:
+            raise RuntimeError(f"phase {phase} is outside the schedule")
+        accepted = max(self.finalized_phases, default=-1)
+        if phase > 0 and accepted != phase - 1:
+            raise RuntimeError(
+                f"phase {phase} requires finalized phase {phase - 1}; "
+                f"accepted={accepted}"
+            )
+        self.current_phase = phase
+
+    def finalize_phase(self, phase: int) -> None:
+        phase = int(phase)
+        if phase != self.current_phase:
+            raise RuntimeError(
+                "cannot finalize a phase that is not active"
+            )
+        if phase not in self.finalized_phases:
+            self.finalized_phases.append(phase)
+            self.finalized_phases.sort()
+
+    @contextmanager
+    def memory_build_context(self, phase: int) -> Iterator[None]:
+        if int(phase) != self.current_phase:
+            raise RuntimeError(
+                "memory context phase does not match active phase"
+            )
+        yield
+
+    def get_seen_classes(self, phase: int) -> List[int]:
+        phase = int(phase)
+        if phase not in self.phase_to_classes:
+            raise RuntimeError(f"phase {phase} is outside the schedule")
+        output: List[int] = []
+        for index in range(phase + 1):
+            output.extend(self.phase_to_classes[index])
+        return output
+
+    def get_old_classes(self, phase: int) -> List[int]:
+        if int(phase) == 0:
+            return []
+        new_set = set(self.phase_to_classes[int(phase)])
+        return [
+            class_id
+            for class_id in self.get_seen_classes(int(phase))
+            if class_id not in new_set
+        ]
+
+    def get_new_classes(self, phase: int) -> List[int]:
+        return list(self.phase_to_classes[int(phase)])
+
+    def _indices(
+        self,
+        *,
+        class_ids: Sequence[int],
+        split: str,
+    ) -> np.ndarray:
+        token = str(split).strip().lower()
+        aliases = {
+            "validation": "val",
+            "all_labeled": "all",
+            "full": "all",
+        }
+        token = aliases.get(token, token)
+        if token not in {"train", "val", "test", "all"}:
+            raise ValueError(f"unsupported split {split!r}")
+        parts = [
+            self.split_by_class[int(class_id)][token]
+            for class_id in class_ids
+        ]
+        return np.concatenate(parts).astype(np.int64, copy=False)
+
+    def _loader(
+        self,
+        indices: np.ndarray,
+        *,
+        batch_size: int,
+        shuffle: bool,
+    ) -> DataLoader:
+        dataset = LazyHSIPatchDataset(self, indices)
+        return DataLoader(
+            dataset,
+            batch_size=int(batch_size),
+            shuffle=bool(shuffle),
+            drop_last=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
+
+    def get_phase_dataloader(
+        self,
+        phase: int,
+        *,
+        split: str,
+        batch_size: int,
+        shuffle: bool,
+    ) -> DataLoader:
+        phase = int(phase)
+        class_ids = self.phase_to_classes[phase]
+        return self._loader(
+            self._indices(class_ids=class_ids, split=split),
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+
+    def get_cumulative_dataloader(
+        self,
+        phase: int,
+        *,
+        split: str,
+        batch_size: int,
+        shuffle: bool,
+    ) -> DataLoader:
+        return self._loader(
+            self._indices(
+                class_ids=self.get_seen_classes(int(phase)),
+                split=split,
+            ),
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+
+
+def load_hsi_data(args: argparse.Namespace) -> Dict[str, Any]:
+    (
+        raw_hsi,
+        gt,
+        num_classes,
+        raw_target_names,
+        _,
+        label_policy,
+    ) = LoadRawHSIData(
+        method=args.dataset,
+        base_dir=args.data_dir,
+    )
+    validate_config(args, num_classes=int(num_classes))
+    raw_hsi = np.asarray(raw_hsi, dtype=np.float32)
+    gt = np.asarray(gt)
+    input_labels, input_coords = ExtractLabeledPixelIndex(
+        gt,
+        label_policy=label_policy,
+    )
+    protocol = build_incremental_protocol(
+        input_labels,
+        class_count=int(num_classes),
         base_classes=int(args.base_classes),
         increment=int(args.increment),
         train_ratio=float(args.train_ratio),
         val_ratio=float(args.val_ratio),
+        minimum_train=int(args.min_train_per_class),
         seed=int(args.seed),
-        device=str(args.device),
-        min_train_per_class=int(args.min_train_per_class),
-        strict_non_exemplar=bool(args.strict_non_exemplar),
-    )
-    optional = {
-        "num_workers": int(args.num_workers),
-        "target_names": data["target_names"],
-        "label_policy": data.get("label_policy"),
-        "return_metadata": True,
-        "include_metadata": True,
-        "raw_spectra": data.get("raw_center_spectra"),
-        "center_spectra": data.get("raw_center_spectra"),
-        "spectra_are_physical": bool(data.get("raw_center_spectra") is not None and args.raw_spectral_summary_is_physical),
-    }
-    sig = inspect.signature(IncrementalHSIDataset.__init__)
-    for k, v in optional.items():
-        if k in sig.parameters:
-            kwargs[k] = v
-    dataset = IncrementalHSIDataset(**kwargs)
-    validate_incremental_dataset(dataset, args, data["num_classes"])
-    print_incremental_protocol(dataset)
-    return dataset
-
-
-def phase_to_classes_as_list(dataset: Any) -> List[List[int]]:
-    if not hasattr(dataset, "phase_to_classes"):
-        raise RuntimeError("Incremental dataset must expose phase_to_classes.")
-    ptc = getattr(dataset, "phase_to_classes")
-    if isinstance(ptc, dict):
-        phases = sorted(int(k) for k in ptc.keys())
-        expected = list(range(len(phases)))
-        if phases != expected:
-            raise RuntimeError(f"phase_to_classes keys must be contiguous 0..P-1, got {phases}")
-        return [[int(c) for c in list(ptc[p])] for p in phases]
-    if isinstance(ptc, (list, tuple)):
-        return [[int(c) for c in list(v)] for v in ptc]
-    raise RuntimeError(f"Unsupported phase_to_classes type: {type(ptc)}")
-
-
-def validate_incremental_dataset(dataset: Any, args: argparse.Namespace, num_classes: int) -> None:
-    phases = phase_to_classes_as_list(dataset)
-    if not phases:
-        raise RuntimeError("phase_to_classes is empty.")
-    all_classes: List[int] = []
-    for p_idx, cls_list in enumerate(phases):
-        if not cls_list:
-            raise RuntimeError(f"Phase {p_idx} has no classes.")
-        all_classes.extend(cls_list)
-    if len(all_classes) != len(set(all_classes)):
-        dup = sorted(c for c in set(all_classes) if all_classes.count(c) > 1)
-        raise RuntimeError(f"A class appears in more than one phase: {dup}")
-    expected = set(range(int(num_classes)))
-    actual = set(all_classes)
-    if actual != expected:
-        raise RuntimeError(f"Phase classes must cover exactly 0..{num_classes - 1}; missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
-    if hasattr(dataset, "assert_non_exemplar"):
-        dataset.assert_non_exemplar()
-    if not bool(args.strict_non_exemplar):
-        raise RuntimeError("strict_non_exemplar must be true.")
-    for a, b in [("train_indices", "val_indices"), ("train_indices", "test_indices"), ("val_indices", "test_indices")]:
-        if hasattr(dataset, a) and hasattr(dataset, b):
-            overlap = sorted(set(map(int, getattr(dataset, a))) & set(map(int, getattr(dataset, b))))
-            if overlap:
-                raise RuntimeError(f"Dataset split leakage: {a} and {b} overlap. First overlaps={overlap[:20]}")
-
-
-def print_incremental_protocol(dataset: Any) -> None:
-    print("[Incremental Protocol]")
-    for p_idx, cls_list in enumerate(phase_to_classes_as_list(dataset)):
-        print(f"  phase_{p_idx}_classes={list(map(int, cls_list))}")
-
-
-def resolve_target_names(dataset: Any, raw_target_names: List[str]) -> List[str]:
-    if hasattr(dataset, "inv_label_map"):
-        names = []
-        for sid in range(int(getattr(dataset, "num_classes", len(raw_target_names)))):
-            input_label = int(dataset.inv_label_map[sid])
-            names.append(raw_target_names[input_label] if input_label < len(raw_target_names) else f"Class {sid}")
-        return names
-    return list(raw_target_names)
-
-
-# -----------------------------------------------------------------------------
-# Model / trainer / evaluator
-# -----------------------------------------------------------------------------
-
-
-
-def assert_strict_energy_contract(args: argparse.Namespace, *, context: str) -> None:
-    """Fail fast if any component can select a different geometry energy."""
-    failures: List[str] = []
-    if abs(float(getattr(args, "residual_variance_scale", 1.0)) - 1.0) > 1e-12:
-        failures.append(
-            f"residual_variance_scale={getattr(args, 'residual_variance_scale', None)!r}"
-        )
-    if not bool(getattr(args, "energy_normalize_by_dim", True)):
-        failures.append("energy_normalize_by_dim=false")
-    if bool(getattr(args, "use_logdet_energy", False)):
-        failures.append("use_logdet_energy=true")
-    if abs(float(getattr(args, "logdet_energy_weight", 0.0))) > 0.0:
-        failures.append(
-            f"logdet_energy_weight={getattr(args, 'logdet_energy_weight', None)!r}"
-        )
-    if bool(getattr(args, "center_logdet_energy", False)):
-        failures.append("center_logdet_energy=true")
-    if bool(getattr(args, "use_reliability_penalty", False)):
-        failures.append("use_reliability_penalty=true")
-    if abs(float(getattr(args, "reliability_energy_weight", 0.0))) > 0.0:
-        failures.append(
-            f"reliability_energy_weight={getattr(args, 'reliability_energy_weight', None)!r}"
-        )
-    if failures:
-        raise RuntimeError(
-            f"{context}: strict SCTGR energy contract violated: " + ", ".join(failures)
-        )
-
-
-def _read_energy_contract(obj: Any) -> Dict[str, Any]:
-    return {
-        "residual_variance_scale": float(getattr(obj, "residual_variance_scale", 1.0)),
-        "energy_normalize_by_dim": bool(
-            getattr(obj, "energy_normalize_by_dim", getattr(obj, "normalize_energy_by_dim", True))
+        shuffle_order=bool(args.shuffle_order),
+        class_order=parse_int_list(
+            args.class_order,
+            name="class_order",
         ),
-        "use_logdet_energy": bool(getattr(obj, "use_logdet_energy", False)),
-        "logdet_energy_weight": float(getattr(obj, "logdet_energy_weight", 0.0)),
-        "center_logdet_energy": bool(getattr(obj, "center_logdet_energy", False)),
-        "use_reliability_penalty": bool(getattr(obj, "use_reliability_penalty", False)),
-        "reliability_energy_weight": float(getattr(obj, "reliability_energy_weight", 0.0)),
-    }
+    )
 
-
-def assert_model_energy_contract(model: torch.nn.Module) -> None:
-    """Verify that model and classifier use the same strict replay energy."""
-    expected = {
-        "residual_variance_scale": 1.0,
-        "energy_normalize_by_dim": True,
-        "use_logdet_energy": False,
-        "logdet_energy_weight": 0.0,
-        "center_logdet_energy": False,
-        "use_reliability_penalty": False,
-        "reliability_energy_weight": 0.0,
-    }
-    failures: List[str] = []
-    for owner_name, owner in (
-        ("model", model),
-        ("classifier", getattr(model, "classifier", None)),
+    coords = np.asarray(input_coords, dtype=np.int64)
+    fit_mask = np.zeros(gt.shape[:2], dtype=bool)
+    fit_coords = coords[protocol["base_train_indices"]]
+    fit_mask[fit_coords[:, 0], fit_coords[:, 1]] = True
+    if int(fit_mask.sum()) != int(
+        protocol["base_train_indices"].size
     ):
-        if owner is None:
-            failures.append(f"{owner_name}=missing")
-            continue
-        state = _read_energy_contract(owner)
-        for key, wanted in expected.items():
-            got = state[key]
-            if isinstance(wanted, float):
-                if abs(float(got) - wanted) > 1e-12:
-                    failures.append(f"{owner_name}.{key}={got!r}, expected {wanted!r}")
-            elif bool(got) != bool(wanted):
-                failures.append(f"{owner_name}.{key}={got!r}, expected {wanted!r}")
-    if failures:
         raise RuntimeError(
-            "Model/classifier energy contract mismatch: " + "; ".join(failures)
+            "preprocessing fit mask does not match base training samples"
         )
 
-
-def build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-    assert_strict_energy_contract(args, context="build_model(args)")
-    model = NECILModel(args).to(device)
-    assert_model_energy_contract(model)
-    if int(getattr(model, "d_model", args.d_model)) != int(args.d_model):
-        raise RuntimeError(f"model.d_model={getattr(model, 'd_model', None)} != args.d_model={args.d_model}")
-    gb = getattr(model, "geometry_bank", None)
-    if gb is None:
-        raise RuntimeError("Model must expose geometry_bank.")
-    bank_rank = getattr(gb, "rank", getattr(gb, "subspace_rank", None))
-    if bank_rank is not None and int(bank_rank) != int(args.subspace_rank):
-        raise RuntimeError(f"GeometryBank rank {bank_rank} != subspace_rank {args.subspace_rank}")
-    if getattr(model, "classifier", None) is None:
-        raise RuntimeError("Model must expose classifier.")
-
-    required_model = (
-        "assert_method_identity", "extract_projected_features", "compute_logits_from_features",
-        "sample_geometry_replay", "set_incremental_mode", "export_memory_snapshot",
+    use_reduction = (
+        not bool(args.no_pca)
+        and str(args.reduction_method).strip().lower()
+        not in {"", "none", "identity"}
     )
-    missing_model = [name for name in required_model if not hasattr(model, name)]
-    if missing_model:
-        raise RuntimeError(f"Model is not the updated SCTGR stack; missing APIs: {missing_model}")
-    required_bank = (
-        "build_candidate_geometry_rows", "commit_candidate_geometry_rows", "sample_replay",
-        "assert_bank_valid", "get_valid_mask",
+    (
+        processed_cube,
+        normalized_physical_cube,
+        preprocessing_state,
+    ) = FitHSIPreprocessor(
+        raw_hsi,
+        fit_mask=fit_mask,
+        apply_reduction=use_reduction,
+        reduction_method=str(args.reduction_method),
+        n_components=int(args.pca_components),
+        whiten=bool(args.pca_whiten),
+        fit_scope="phase0_train_only",
     )
-    missing_bank = [name for name in required_bank if not hasattr(gb, name)]
-    if missing_bank:
-        raise RuntimeError(f"GeometryBank is not replay-ready; missing APIs: {missing_bank}")
-    if getattr(model, "geometry_plastic_adapter", None) is not None:
-        raise RuntimeError("Feature adapter module is forbidden in SCTGR.")
+    preprocessing_path = SaveHSIPreprocessor(
+        os.path.join(
+            os.path.abspath(str(args.save_dir)),
+            "preprocessing_state.npz",
+        ),
+        preprocessing_state,
+    )
 
-    model.incremental_update_mode = "spectral_coupled_geometry_replay"
-    for name, value in {
-        "use_geometry_gated_adapter": False,
-        "use_incremental_adapter": False,
-        "use_geometry_calibrator": False,
-        "use_energy_calibrator": False,
-        "use_geometry_transport": False,
-        "use_sglat_transport": False,
-        "use_adaptive_boundary": False,
-    }.items():
-        if hasattr(model, name):
-            setattr(model, name, value)
-    model.assert_method_identity()
-    print("[Model]")
-    print(f"  feature_dim={args.d_model} | feature_rank={args.subspace_rank} | spectral_rank={args.spectral_geometry_rank}")
-    print(f"  classifier={type(model.classifier).__name__} | update_mode=spectral_coupled_geometry_replay")
-    print("  incremental_trainability=new_descriptor_tensors_only | backbone/projection/classifier frozen")
+    args.num_bands = int(processed_cube.shape[2])
+    args.raw_num_bands = int(normalized_physical_cube.shape[2])
+    args.max_classes = int(num_classes)
+    target_names = [
+        str(raw_target_names[original_id])
+        for original_id in protocol["class_order_original_ids"]
+    ]
+
+    summary = {
+        "stack_build_id": STACK_BUILD_ID,
+        "method": METHOD_NAME,
+        "classification_factorization": CLASSIFICATION_FACTORIZATION,
+        "spectral_relation_factorization": (
+            SPECTRAL_RELATION_FACTORIZATION
+        ),
+        "dataset": str(args.dataset),
+        "dataset_name": DATASET_INFO[str(args.dataset)]["name"],
+        "class_count": int(num_classes),
+        "phase_to_classes": protocol["phase_to_classes"],
+        "class_order_original_ids": protocol[
+            "class_order_original_ids"
+        ],
+        "class_counts": protocol["class_counts"],
+        "raw_sensor_bands": int(normalized_physical_cube.shape[2]),
+        "model_input_channels": int(processed_cube.shape[2]),
+        "patch_size": int(args.patch_size),
+        "pca_active": bool(use_reduction),
+        "preprocessing_fit_scope": "phase0_train_only",
+        "preprocessing_fit_pixel_count": int(fit_mask.sum()),
+        "preprocessing_state_path": preprocessing_path,
+        "training_access_policy": (
+            "phase train loader exposes current classes only"
+        ),
+        "cumulative_evaluation_policy": (
+            "validation/test/all expose seen classes only"
+        ),
+        "stores_old_training_exemplars_in_geometry_memory": False,
+    }
+    del raw_hsi
+    gc.collect()
+    return {
+        "processed_cube": np.ascontiguousarray(
+            processed_cube,
+            dtype=np.float32,
+        ),
+        "raw_physical_cube": np.ascontiguousarray(
+            normalized_physical_cube,
+            dtype=np.float32,
+        ),
+        "labels": protocol["global_labels"],
+        "coords": coords,
+        "protocol": protocol,
+        "target_names": target_names,
+        "gt_shape": tuple(gt.shape[:2]),
+        "summary": summary,
+    }
+
+
+def build_dataset(
+    args: argparse.Namespace,
+    data: Mapping[str, Any],
+) -> IncrementalHSIDatasetManager:
+    return IncrementalHSIDatasetManager(
+        processed_cube=data["processed_cube"],
+        raw_physical_cube=data["raw_physical_cube"],
+        labels=data["labels"],
+        coords=data["coords"],
+        protocol=data["protocol"],
+        target_names=data["target_names"],
+        gt_shape=data["gt_shape"],
+        patch_size=int(args.patch_size),
+        num_workers=int(args.num_workers),
+        device=str(args.device),
+    )
+
+
+# =============================================================================
+# Model and phase reports
+# =============================================================================
+
+
+def build_model(args: argparse.Namespace) -> NECILModel:
+    model = NECILModel(args).to(torch.device(args.device))
+    model.assert_architecture_contract()
+    summary = model.architecture_summary()
+    if summary.get(
+        "classification_factorization"
+    ) != CLASSIFICATION_FACTORIZATION:
+        raise RuntimeError(
+            "model classification factorization is inconsistent"
+        )
+    if summary.get(
+        "spectral_relation_factorization"
+    ) != SPECTRAL_RELATION_FACTORIZATION:
+        raise RuntimeError(
+            "model spectral relation is inconsistent"
+        )
+    if summary.get("joint_feature") != "direct_[z_s;z_p]":
+        raise RuntimeError(
+            "model does not expose direct spectral-spatial coordinates"
+        )
+    if bool(summary.get("trainable_transport_network", True)):
+        raise RuntimeError(
+            "main driver rejects trainable transport networks"
+        )
+    if bool(summary.get("uses_geometry_replay_for_training", True)):
+        raise RuntimeError(
+            "main driver rejects geometry replay training"
+        )
+    if any(
+        parameter.requires_grad
+        for parameter in model.classifier.parameters()
+    ):
+        raise RuntimeError(
+            "deployed geometry classifier must be parameter-free"
+        )
     return model
 
-def _canonical_method_value(name: str, value: Any) -> Any:
-    """Canonicalize semantically equivalent method values for identity checks."""
-    if name in {"base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode", "classifier_mode"}:
-        return normalize_classifier_mode(value)
-    if name == "incremental_update_mode":
-        return normalize_incremental_update_mode(value)
-    if name in {"use_geometry_gated_adapter", "use_spectral_coupled_replay"}:
-        return bool(value)
-    return value
+
+def save_model_summary(
+    path: str,
+    model: NECILModel,
+) -> str:
+    total = sum(
+        int(parameter.numel())
+        for parameter in model.parameters()
+    )
+    trainable = sum(
+        int(parameter.numel())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    lines = [
+        f"Model: {model.__class__.__name__}",
+        f"Stack: {STACK_BUILD_ID}",
+        f"Method: {METHOD_NAME}",
+        f"Classification: {CLASSIFICATION_FACTORIZATION}",
+        (
+            "Spectral relation: "
+            f"{SPECTRAL_RELATION_FACTORIZATION} (pair risk only)"
+        ),
+        "=" * 100,
+        f"Total parameters: {total:,}",
+        f"Trainable parameters at save time: {trainable:,}",
+        "",
+        "Architecture contract",
+        "-" * 100,
+    ]
+    for key, value in sorted(model.architecture_summary().items()):
+        lines.append(f"{key}: {value}")
+    lines.extend(["", "GeometryBank", "-" * 100])
+    for key, value in sorted(
+        model.geometry_bank.memory_cost_summary().items()
+    ):
+        lines.append(f"{key}: {value}")
+    absolute = os.path.abspath(path)
+    os.makedirs(os.path.dirname(absolute), exist_ok=True)
+    temporary = absolute + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, absolute)
+    return absolute
 
 
-def build_trainer(model: torch.nn.Module, dataset: Any, args: argparse.Namespace, run_dir: str) -> Trainer:
-    assert_strict_energy_contract(args, context="build_trainer(args-before)")
-    assert_model_energy_contract(model)
-    before = namespace_to_dict(args)
-    trainer = Trainer(model, dataset, args)
-    assert_strict_energy_contract(args, context="build_trainer(args-after)")
-    assert_model_energy_contract(model)
-    after = namespace_to_dict(args)
-    diff = compute_config_diff(before, after, {})
-    save_json(os.path.join(run_dir, "config_diff_after_trainer.json"), diff)
-    critical = {"incremental_update_mode", "base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode", "use_spectral_coupled_replay", "use_geometry_gated_adapter"}
-    changed_critical = []
-    for d in diff:
-        name = d["name"]
-        if name not in critical:
-            continue
-        before_v = _canonical_method_value(name, d.get("original"))
-        after_v = _canonical_method_value(name, d.get("resolved"))
-        if before_v != after_v:
-            changed_critical.append(d)
-    if changed_critical:
-        raise RuntimeError(f"Trainer changed method identity after construction: {changed_critical}")
-    if hasattr(trainer, "assert_method_identity"):
-        trainer.assert_method_identity()
-    return trainer
+def write_phase_report(
+    path: str,
+    *,
+    phase: int,
+    metrics: Mapping[str, Any],
+    sampling: Mapping[str, Any],
+    diagnostics: Mapping[str, Any],
+) -> str:
+    lines = [
+        (
+            "Transport-Verified Spectral-Spatial Factor Geometry "
+            f"— Phase {phase}"
+        ),
+        "=" * 112,
+        "",
+        "Method contract",
+        "-" * 112,
+        f"Classification: {CLASSIFICATION_FACTORIZATION}",
+        (
+            "Spectral relation: "
+            f"{SPECTRAL_RELATION_FACTORIZATION} (training pair risk only)"
+        ),
+        "Feature: direct unnormalized z=[z_s;z_p]",
+        "Classifier: parameter-free equal-prior factor energy",
+        "Memory: aggregate class rows only; no old training samples",
+        "",
+        "Cumulative held-out test",
+        "-" * 112,
+        (
+            f"OA={float(metrics['overall_accuracy']):.2f}% | "
+            f"AA={float(metrics['average_accuracy']):.2f}% | "
+            f"MinClass={float(metrics['minimum_per_class_accuracy']):.2f}% | "
+            f"Kappa={float(metrics['kappa']):.4f} | "
+            f"MacroF1={float(metrics['f1_macro']):.2f}%"
+        ),
+        (
+            f"Old={float(metrics['old_accuracy']):.2f}% | "
+            f"New={float(metrics['new_accuracy']):.2f}% | "
+            f"H={float(metrics['harmonic_mean']):.2f}% | "
+            f"Old->New={float(metrics['old_to_new_rate']):.2f}% | "
+            f"New->Old={float(metrics['new_to_old_rate']):.2f}%"
+        ),
+        (
+            f"MeanGap={float(metrics['geometry_margin_mean']):.6f} | "
+            f"Q05Gap={float(metrics['geometry_margin_q05']):.6f} | "
+            f"MinGap={float(metrics['geometry_margin_min']):.6f} | "
+            f"Violation={float(metrics['geometry_error_rate']):.2f}%"
+        ),
+        "",
+        "Sampling diagnostic only",
+        "-" * 112,
+        (
+            f"Accuracy={float(sampling['accuracy']):.2f}% | "
+            f"Q05={float(sampling['q05_gap']):.6f} | "
+            f"Violation={float(sampling['violation_rate']):.2f}% | "
+            f"TrainingUse={sampling['training_use']}"
+        ),
+        "",
+        "GeometryBank",
+        "-" * 112,
+        f"Memory: {json_safe(diagnostics['memory_cost'])}",
+        f"Admission: {json_safe(diagnostics['admission'])}",
+        "",
+        "Class-wise results",
+        "-" * 112,
+        "id  class                              support  accuracy  q05-gap  violation",
+    ]
+    for class_id in metrics["classes"]:
+        geometry = metrics["per_class_geometry"][class_id]
+        lines.append(
+            f"{class_id:2d}  "
+            f"{str(class_id):32s} "
+            f"{int(metrics['support'][class_id]):7d} "
+            f"{float(metrics['per_class_accuracy'][class_id]):8.2f}% "
+            f"{float(geometry['q05_gap']):8.4f} "
+            f"{float(geometry['classification_violation_rate']):8.2f}%"
+        )
+    absolute = os.path.abspath(path)
+    os.makedirs(os.path.dirname(absolute), exist_ok=True)
+    temporary = absolute + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, absolute)
+    return absolute
 
 
-def build_evaluator() -> NECILEvaluator:
-    return NECILEvaluator()
+# =============================================================================
+# Phase evaluation and visualization orchestration
+# =============================================================================
 
 
-# -----------------------------------------------------------------------------
-# Phase metadata and evaluation
-# -----------------------------------------------------------------------------
+def _guarded_artifact(
+    artifacts: Dict[str, Any],
+    name: str,
+    operation: Any,
+) -> None:
+    try:
+        artifacts[name] = operation()
+    except Exception as error:
+        artifacts[name] = {
+            "status": "SKIPPED",
+            "reason": str(error),
+        }
+        print(f"[Artifact skipped: {name}] {error}")
 
 
-def get_phase_info(dataset: Any, phase: int) -> Dict[str, Any]:
-    phase = int(phase)
-    if hasattr(dataset, "get_phase_info"):
-        info = dataset.get_phase_info(phase)
-        if isinstance(info, dict):
-            old_classes = [int(c) for c in info.get("old_classes", [])]
-            new_classes = [int(c) for c in info.get("new_classes", [])]
-            seen_classes = [int(c) for c in info.get("seen_classes", old_classes + new_classes)]
-            if not seen_classes:
-                seen_classes = old_classes + new_classes
-            if len(seen_classes) != len(set(seen_classes)):
-                raise RuntimeError(f"Duplicate class in dataset.get_phase_info({phase}) seen_classes={seen_classes}")
+def evaluate_and_visualize_phase(
+    *,
+    args: argparse.Namespace,
+    run_dir: str,
+    phase: int,
+    model: NECILModel,
+    dataset: IncrementalHSIDatasetManager,
+    history: Mapping[str, Any],
+    evaluator: NECILEvaluator,
+) -> Dict[str, Any]:
+    old_classes = dataset.get_old_classes(phase)
+    new_classes = dataset.get_new_classes(phase)
+    seen_classes = dataset.get_seen_classes(phase)
+    phase_dir = os.path.join(run_dir, f"phase_{phase}")
+    reports_dir = os.path.join(phase_dir, "reports")
+    figures_dir = os.path.join(phase_dir, "figures")
+    arrays_dir = os.path.join(phase_dir, "raw_arrays")
+    os.makedirs(reports_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
+
+    test_loader = dataset.get_cumulative_dataloader(
+        phase,
+        split="test",
+        batch_size=int(args.eval_batch_size),
+        shuffle=False,
+    )
+    all_loader = dataset.get_cumulative_dataloader(
+        phase,
+        split="all",
+        batch_size=int(args.eval_batch_size),
+        shuffle=False,
+    )
+    test_output = evaluate_factor_geometry_loader(
+        model,
+        test_loader,
+        seen_classes=seen_classes,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        device=args.device,
+        energy_margin=float(args.energy_margin),
+        return_arrays=True,
+    )
+    all_output = evaluate_factor_geometry_loader(
+        model,
+        all_loader,
+        seen_classes=seen_classes,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        device=args.device,
+        energy_margin=float(args.energy_margin),
+        return_arrays=False,
+    )
+    metrics = test_output["metrics"]
+    evaluator.update(
+        phase,
+        test_output["y_true"],
+        test_output["y_pred"],
+        seen_classes=seen_classes,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        energy=test_output["energy"],
+        energy_margin=float(args.energy_margin),
+    )
+
+    classification_report = save_classification_report(
+        test_output["y_true"],
+        test_output["y_pred"],
+        target_names=dataset.target_names,
+        save_dir=reports_dir,
+        phase=phase,
+        seen_classes=seen_classes,
+        old_classes=old_classes,
+        new_classes=new_classes,
+        energy=test_output["energy"],
+        energy_margin=float(args.energy_margin),
+    )
+    sampling = geometry_sampling_health(
+        model,
+        seen_classes,
+        samples_per_class=int(
+            args.base_diagnostic_samples_per_class
+        ),
+    )
+    diagnostics = geometry_bank_diagnostics(
+        model,
+        seen_classes,
+    )
+    atomic_json(
+        os.path.join(reports_dir, "training_history.json"),
+        history,
+    )
+    atomic_json(
+        os.path.join(reports_dir, "cumulative_test_metrics.json"),
+        metrics,
+    )
+    atomic_json(
+        os.path.join(reports_dir, "all_seen_labeled_metrics.json"),
+        all_output["metrics"],
+    )
+    atomic_json(
+        os.path.join(reports_dir, "geometry_sampling_health.json"),
+        sampling,
+    )
+    atomic_json(
+        os.path.join(reports_dir, "geometry_bank_diagnostics.json"),
+        diagnostics,
+    )
+    text_report = write_phase_report(
+        os.path.join(reports_dir, f"phase_{phase}_geometry_report.txt"),
+        phase=phase,
+        metrics=metrics,
+        sampling=sampling,
+        diagnostics=diagnostics,
+    )
+
+    artifacts: Dict[str, Any] = {}
+    if bool(args.save_visualizations):
+        _guarded_artifact(
+            artifacts,
+            "training_dynamics",
+            lambda: plot_phase_training_dynamics(
+                history,
+                os.path.join(
+                    figures_dir,
+                    f"phase_{phase}_training_dashboard.png",
+                ),
+                dpi=int(args.visualization_dpi),
+                save_separate=True,
+            ),
+        )
+        _guarded_artifact(
+            artifacts,
+            "classification_diagnostics",
+            lambda: save_classification_diagnostics(
+                confusion_matrix=np.asarray(
+                    metrics["confusion_matrix"],
+                    dtype=np.int64,
+                ),
+                class_ids=seen_classes,
+                target_names=dataset.target_names,
+                save_path=os.path.join(
+                    figures_dir,
+                    f"phase_{phase}_classification_diagnostics.png",
+                ),
+                title=(
+                    f"Phase {phase} Cumulative Test Classification"
+                ),
+                dpi=int(args.visualization_dpi),
+            ),
+        )
+        if bool(args.save_test_maps):
+            _guarded_artifact(
+                artifacts,
+                "test_maps",
+                lambda: predict_phase_grid(
+                    model,
+                    dataset,
+                    phase,
+                    dataset.target_names,
+                    save_dir=figures_dir,
+                    device=str(args.device),
+                    batch_size=int(args.visualization_batch_size),
+                    split="test",
+                    class_cmap=str(args.viz_class_cmap),
+                    background_color=str(args.viz_background_color),
+                    save_numpy=bool(args.save_map_numpy),
+                    save_combined=bool(args.save_combined_maps),
+                    return_outputs=True,
+                    dpi=int(args.visualization_dpi),
+                ),
+            )
+        if bool(args.save_all_labeled_maps):
+            _guarded_artifact(
+                artifacts,
+                "all_seen_labeled_maps",
+                lambda: predict_phase_grid(
+                    model,
+                    dataset,
+                    phase,
+                    dataset.target_names,
+                    save_dir=figures_dir,
+                    device=str(args.device),
+                    batch_size=int(args.visualization_batch_size),
+                    split="all",
+                    class_cmap=str(args.viz_class_cmap),
+                    background_color=str(args.viz_background_color),
+                    save_numpy=bool(args.save_map_numpy),
+                    save_combined=bool(args.save_combined_maps),
+                    return_outputs=True,
+                    dpi=int(args.visualization_dpi),
+                ),
+            )
+
+        def overlap_artifact() -> Dict[str, Any]:
+            review = build_geometry_overlap_review(
+                model=model,
+                class_ids=seen_classes,
+                target_names=dataset.target_names,
+                directional_invasion_matrix=metrics[
+                    "directional_invasion_matrix"
+                ],
+            )
+            review_path = atomic_json(
+                os.path.join(
+                    reports_dir,
+                    "geometry_overlap_review.json",
+                ),
+                review,
+            )
+            figure_path = save_geometry_pair_diagnostics(
+                review=review,
+                class_ids=seen_classes,
+                target_names=dataset.target_names,
+                save_path=os.path.join(
+                    figures_dir,
+                    f"phase_{phase}_geometry_pair_diagnostics.png",
+                ),
+                dpi=int(args.visualization_dpi),
+            )
             return {
-                "phase": int(info.get("phase", phase)),
-                "old_classes": old_classes,
-                "new_classes": new_classes,
-                "seen_classes": seen_classes,
-                "old_class_count": int(info.get("old_class_count", len(old_classes))),
+                "review_path": review_path,
+                "figure_path": figure_path,
+                "high_risk_pair_count": int(
+                    review["high_risk_pair_count"]
+                ),
+                "moderate_risk_pair_count": int(
+                    review["moderate_risk_pair_count"]
+                ),
             }
 
-    phases = phase_to_classes_as_list(dataset)
-    if phase < 0 or phase >= len(phases):
-        raise RuntimeError(f"Invalid phase {phase}; available phases are 0..{len(phases) - 1}.")
-    new_classes = [int(c) for c in phases[phase]]
-    old_classes: List[int] = []
-    for p_idx in range(phase):
-        old_classes.extend(int(c) for c in phases[p_idx])
-    old_classes = list(dict.fromkeys(old_classes))
-    seen_classes = old_classes + new_classes
-    if len(seen_classes) != len(set(seen_classes)):
-        raise RuntimeError(f"Duplicate class in seen_classes at phase {phase}: {seen_classes}")
-    return {"phase": phase, "old_classes": old_classes, "new_classes": new_classes, "seen_classes": seen_classes, "old_class_count": len(old_classes)}
-
-
-def set_model_phase(model: torch.nn.Module, phase_info: Dict[str, Any]) -> None:
-    """Set phase state without enabling any trainable incremental network branch."""
-    phase = int(phase_info["phase"])
-    old_classes = [int(c) for c in phase_info.get("old_classes", [])]
-    seen_classes = [int(c) for c in phase_info.get("seen_classes", [])]
-    if phase == 0:
-        if hasattr(model, "set_base_mode"):
-            try:
-                model.set_base_mode(train_backbone=False, train_projection=False)
-            except TypeError:
-                model.set_base_mode()
-        elif hasattr(model, "set_phase"):
-            model.set_phase(phase)
-        else:
-            model.current_phase = phase
-    else:
-        if not hasattr(model, "set_incremental_mode"):
-            raise RuntimeError("Updated model must expose set_incremental_mode().")
-        model.set_incremental_mode(
-            phase=phase,
-            old_classes=old_classes,
-            old_class_count=len(old_classes),
-            train_classifier_calibration=False,
-            train_geometry_adapter=False,
+        _guarded_artifact(
+            artifacts,
+            "geometry_overlap",
+            overlap_artifact,
         )
-    if hasattr(model, "current_phase"):
-        model.current_phase = phase
-    if hasattr(model, "old_classes"):
-        model.old_classes = list(old_classes)
-    if hasattr(model, "old_class_count"):
-        model.old_class_count = len(old_classes)
-    if hasattr(model, "seen_classes"):
-        model.seen_classes = list(seen_classes)
-    if hasattr(model, "current_num_classes"):
-        model.current_num_classes = len(seen_classes)
-
-def unpack_eval_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-    if isinstance(batch, dict):
-        patches = batch.get("image", batch.get("patch", batch.get("patches", None)))
-        labels = batch.get("label", batch.get("labels", None))
-        spectra = batch.get("spectrum", batch.get("spectra", None))
-        coords = batch.get("coord", batch.get("coords", None))
-        if patches is None or labels is None:
-            raise RuntimeError(f"Unsupported eval batch dict keys: {list(batch.keys())}")
-        return patches, labels, spectra, coords
-    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-        spectra = batch[2] if len(batch) >= 3 else None
-        coords = batch[3] if len(batch) >= 4 else None
-        return batch[0], batch[1], spectra, coords
-    raise RuntimeError(f"Unsupported eval batch type: {type(batch)}")
-
-
-def prepare_eval_spectra(patches: torch.Tensor, spectra: Optional[torch.Tensor], args: argparse.Namespace) -> Tuple[Optional[torch.Tensor], bool, Dict[str, Any]]:
-    if torch.is_tensor(spectra) and spectra.numel() > 0:
-        s = spectra.to(device=patches.device, dtype=patches.dtype)
-        if s.dim() == 4:
-            s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-        elif s.dim() == 3:
-            if s.size(0) == patches.size(0) and s.size(1) > 0 and s.size(2) > 1:
-                s = s[:, :, s.size(-1) // 2]
-            else:
-                s = s.reshape(patches.size(0), -1)
-        elif s.dim() == 1:
-            if s.numel() % max(int(patches.size(0)), 1) != 0:
-                raise RuntimeError("1-D spectra cannot be reshaped to batch.")
-            s = s.reshape(patches.size(0), -1)
-        elif s.dim() != 2:
-            s = s.reshape(patches.size(0), -1)
-        if s.size(0) != patches.size(0):
-            raise RuntimeError("Spectral metadata batch mismatch during evaluation.")
-        physical = bool(args.raw_spectral_summary_is_physical)
-        source = "batch_metadata"
-    else:
-        s = None
-        physical = False
-        source = "none"
-    pca_active = (not bool(args.no_pca)) and int(args.pca_components) > 0
-    if pca_active and s is not None and s.size(1) <= int(args.pca_components):
-        physical = False
-    return s, bool(physical), {"source": source, "physical": bool(physical), "pca_active": bool(pca_active), "spectral_dim": int(s.size(1)) if s is not None else 0}
-
-
-def forward_eval_batch(
-    model: torch.nn.Module,
-    patches: torch.Tensor,
-    spectra: Optional[torch.Tensor],
-    args: argparse.Namespace,
-    seen_classes: List[int],
-    *,
-    old_classes: Optional[List[int]] = None,
-    new_classes: Optional[List[int]] = None,
-) -> Dict[str, Any]:
-    # Raw spectra are bank-construction/replay guidance, not a classifier branch.
-    _, spectral_is_physical, spec_diag = prepare_eval_spectra(patches, spectra, args)
-    out = model(
-        patches,
-        seen_classes=[int(c) for c in seen_classes],
-        old_classes=[int(c) for c in (old_classes or [])],
-        new_classes=[int(c) for c in (new_classes or [])],
-        classifier_mode=normalize_classifier_mode(args.eval_classifier_mode),
-        return_energy=True,
-        return_parts=False,
-        return_diagnostics=False,
-    )
-    if not isinstance(out, dict) or "logits" not in out or "energy" not in out:
-        raise RuntimeError("Evaluation requires model output dict containing both logits and energy.")
-    validate_seen_local_outputs(
-        seen_classes=seen_classes,
-        logits=out["logits"],
-        energy=out["energy"],
-        batch_size=int(patches.size(0)),
-    )
-    out["spectral_diagnostics"] = {
-        **spec_diag,
-        "used_in_classifier": False,
-        "physical_metadata_available": bool(spectral_is_physical),
-    }
-    return out
-
-def logits_to_global_predictions(logits: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-    return predictions_from_seen_local_scores(logits, seen_classes, lower_is_better=False)
-
-@torch.no_grad()
-def get_phase_predictions(
-    model: torch.nn.Module,
-    dataset: Any,
-    phase_info: Dict[str, Any],
-    device: torch.device,
-    args: argparse.Namespace,
-    batch_size: int,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    model.eval()
-    set_model_phase(model, phase_info)
-    phase = int(phase_info["phase"])
-    seen_classes = [int(c) for c in phase_info["seen_classes"]]
-    old_classes = [int(c) for c in phase_info.get("old_classes", [])]
-    new_classes = [int(c) for c in phase_info.get("new_classes", [])]
-    loader = dataset.get_cumulative_dataloader(phase, split="test", batch_size=batch_size, shuffle=False)
-    preds: List[np.ndarray] = []
-    labels_all: List[np.ndarray] = []
-    energies: List[torch.Tensor] = []
-    pred_hist: Dict[int, int] = {}
-    spectral_diag: Optional[Dict[str, Any]] = None
-    for batch in loader:
-        patches, labels, spectra, _ = unpack_eval_batch(batch)
-        patches = patches.to(device, non_blocking=True).float()
-        if torch.is_tensor(spectra):
-            spectra = spectra.to(device, non_blocking=True)
-        labels_t = labels.to(device).long().view(-1) if torch.is_tensor(labels) else torch.as_tensor(labels, device=device).long().view(-1)
-        bad = sorted(set(labels_t.detach().cpu().tolist()) - set(seen_classes))
-        if bad:
-            raise RuntimeError(f"Evaluation labels outside seen classes at phase {phase}: {bad}")
-        out = forward_eval_batch(
-            model,
-            patches,
-            spectra,
-            args,
-            seen_classes,
-            old_classes=old_classes,
-            new_classes=new_classes,
+        _guarded_artifact(
+            artifacts,
+            "spectral_spatial_geometry",
+            lambda: save_spectral_spatial_geometry_diagnostics(
+                model=model,
+                class_ids=seen_classes,
+                target_names=dataset.target_names,
+                save_path=os.path.join(
+                    figures_dir,
+                    f"phase_{phase}_spectral_spatial_geometry.png",
+                ),
+                dpi=int(args.visualization_dpi),
+            ),
         )
-        pred_global = logits_to_global_predictions(out["logits"], seen_classes)
-        energy = out["energy"].detach().float().cpu()
-        for p in pred_global.detach().cpu().tolist():
-            pred_hist[int(p)] = pred_hist.get(int(p), 0) + 1
-        preds.append(pred_global.detach().cpu().numpy())
-        labels_all.append(labels_t.detach().cpu().numpy())
-        energies.append(energy)
-        spectral_diag = out.get("spectral_diagnostics", spectral_diag)
-    if not preds:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), {
-            "prediction_histogram": {},
-            "energy": torch.empty((0, len(seen_classes))),
-        }
-    energy_all = torch.cat(energies, dim=0)
-    return np.concatenate(preds), np.concatenate(labels_all), {
-        "prediction_histogram": pred_hist,
-        "energy": energy_all,
-        "spectral_diagnostics": spectral_diag or {},
-    }
+        if phase > 0:
+            _guarded_artifact(
+                artifacts,
+                "transport_diagnostics",
+                lambda: save_transport_diagnostics(
+                    history=history,
+                    save_path=os.path.join(
+                        figures_dir,
+                        f"phase_{phase}_transport_diagnostics.png",
+                    ),
+                    dpi=int(args.visualization_dpi),
+                ),
+            )
 
-def compute_phase_metrics(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    phase_info: Dict[str, Any],
-    *,
-    energy: Optional[torch.Tensor] = None,
-    energy_margin: float = 0.0,
-) -> Dict[str, Any]:
-    if y_true.size == 0:
-        return {
-            "overall_accuracy": 0.0,
-            "per_class_accuracy": {},
-            "old_accuracy": 0.0,
-            "new_accuracy": 0.0,
-            "harmonic_mean": 0.0,
-            "hm": 0.0,
-        }
-    metrics = calculate_metrics_torch(
-        y_true=y_true,
-        y_pred=y_pred,
-        seen_classes=[int(c) for c in phase_info["seen_classes"]],
-        old_classes=[int(c) for c in phase_info.get("old_classes", [])],
-        new_classes=[int(c) for c in phase_info.get("new_classes", [])],
-        old_class_count=len(phase_info.get("old_classes", [])),
-        energy=energy,
-        energy_margin=float(energy_margin),
-        device="cpu",
+    if bool(args.save_raw_arrays):
+        os.makedirs(arrays_dir, exist_ok=True)
+        np.save(
+            os.path.join(arrays_dir, "true_labels.npy"),
+            test_output["y_true"],
+        )
+        np.save(
+            os.path.join(arrays_dir, "predicted_labels.npy"),
+            test_output["y_pred"],
+        )
+        if test_output["coords"] is not None:
+            np.save(
+                os.path.join(arrays_dir, "coords.npy"),
+                test_output["coords"],
+            )
+        torch.save(
+            test_output["energy"],
+            os.path.join(arrays_dir, "factor_energy.pt"),
+        )
+        torch.save(
+            test_output["quadratic"],
+            os.path.join(arrays_dir, "quadratic_energy.pt"),
+        )
+        torch.save(
+            test_output["volume"],
+            os.path.join(arrays_dir, "volume_energy.pt"),
+        )
+        np.save(
+            os.path.join(arrays_dir, "confusion_matrix.npy"),
+            np.asarray(metrics["confusion_matrix"], dtype=np.int64),
+        )
+
+    atomic_json(
+        os.path.join(reports_dir, "visualization_artifacts.json"),
+        artifacts,
     )
-    metrics["hm"] = float(metrics.get("harmonic_mean", metrics.get("hm", 0.0)))
-    return metrics
-
-def evaluator_update_compat(
-    evaluator: Any,
-    phase: int,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    phase_info: Dict[str, Any],
-    *,
-    energy: Optional[torch.Tensor] = None,
-    energy_margin: float = 0.0,
-) -> None:
-    sig = inspect.signature(evaluator.update)
-    candidates = {
-        "old_class_count": len(phase_info.get("old_classes", [])),
-        "seen_classes": [int(c) for c in phase_info.get("seen_classes", [])],
-        "old_classes": [int(c) for c in phase_info.get("old_classes", [])],
-        "new_classes": [int(c) for c in phase_info.get("new_classes", [])],
-        "energy": energy,
-        "energy_margin": float(energy_margin),
-    }
-    kwargs = {k: v for k, v in candidates.items() if k in sig.parameters}
-    evaluator.update(int(phase), y_true, y_pred, **kwargs)
-
-def save_classification_report_compat(
-    evaluator: Any,
-    phase: int,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    target_names: List[str],
-    phase_dir: str,
-    phase_info: Dict[str, Any],
-    enabled: bool,
-    tr_time: float,
-    te_time: float,
-    *,
-    energy: Optional[torch.Tensor] = None,
-    energy_margin: float = 0.0,
-) -> Optional[Dict[str, Any]]:
-    if not enabled:
-        return None
-    os.makedirs(phase_dir, exist_ok=True)
-    common = {
-        "phase": int(phase),
-        "y_true": y_true,
-        "y_pred": y_pred,
-        "target_names": target_names,
-        "save_dir": phase_dir,
-        "seen_classes": [int(c) for c in phase_info.get("seen_classes", [])],
-        "old_class_count": len(phase_info.get("old_classes", [])),
-        "old_classes": [int(c) for c in phase_info.get("old_classes", [])],
-        "new_classes": [int(c) for c in phase_info.get("new_classes", [])],
-        "energy": energy,
-        "energy_margin": float(energy_margin),
-        "tr_time": tr_time,
-        "te_time": te_time,
-        "dl_time": 0.0,
-    }
-    if hasattr(evaluator, "save_phase_report"):
-        sig = inspect.signature(evaluator.save_phase_report)
-        return evaluator.save_phase_report(**{k: v for k, v in common.items() if k in sig.parameters})
-    return save_classification_report(
-        **common,
-        save_hsi_style=True,
-        save_structured=True,
-    )
-
-# -----------------------------------------------------------------------------
-# Checkpoint, artifacts, phase loop
-# -----------------------------------------------------------------------------
-
-
-def geometry_bank_state(model: torch.nn.Module) -> Any:
-    gb = getattr(model, "geometry_bank", None)
-    if gb is None:
-        return None
-    if hasattr(gb, "state_dict"):
-        try:
-            return gb.state_dict()
-        except Exception:
-            pass
-    if hasattr(model, "export_memory_snapshot"):
-        return model.export_memory_snapshot()
-    if hasattr(gb, "export_state"):
-        return gb.export_state()
-    return None
-
-
-def runtime_contract(args: argparse.Namespace, phase_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    phase = int(phase_info["phase"]) if phase_info else None
-    return {
-        "method": build_method_identity(args),
+    phase_payload = {
         "phase": phase,
-        "feature_space": "single frozen canonical projected-z space",
-        "classifier_mode": args.incremental_classifier_mode if phase and phase > 0 else args.base_classifier_mode,
-        "eval_mode": args.eval_classifier_mode,
-        "trainable_policy": "base_backbone_projection_ce_head" if phase in {None, 0} else "temporary_new_descriptor_tensors_only",
-        "strict_non_exemplar": bool(args.strict_non_exemplar),
-        "raw_exemplars_stored": False,
-        "old_features_stored": False,
-        "raw_old_spectra_stored": False,
-        "aggregate_spectral_geometry_stored": True,
-        "spectral_to_feature_coupling_stored": True,
-        "kd_teacher_used": False,
-        "projection_trainable_during_incremental": False,
-        "classifier_trainable_during_incremental": False,
-        "old_geometry_bank_frozen": True if phase and phase > 0 else None,
-        "replay": "spectral-consistent core plus risk-directed tangent replay",
-        "replay_energy_filter": bool(args.replay_energy_filter),
-        "label_convention": "dataset/global, logits/seen-local, CE/seen-local, predictions/global, explicit old/new lists",
-        "transport_enabled": False,
-        "feature_adapter_enabled": False,
-        "energy_calibrator_enabled": False,
-        "adaptive_boundary_enabled": False,
+        "old_classes": old_classes,
+        "new_classes": new_classes,
+        "seen_classes": seen_classes,
+        "test_metrics": metrics,
+        "all_seen_labeled_metrics": all_output["metrics"],
+        "sampling_health": sampling,
+        "geometry_bank_diagnostics": diagnostics,
+        "classification_report": classification_report,
+        "text_report": text_report,
+        "visualization_artifacts": artifacts,
     }
+    atomic_json(
+        os.path.join(phase_dir, "phase_summary.json"),
+        phase_payload,
+    )
+    print(
+        f"[Phase {phase} Test] "
+        f"OA={metrics['overall_accuracy']:.2f}% | "
+        f"AA={metrics['average_accuracy']:.2f}% | "
+        f"Old={metrics['old_accuracy']:.2f}% | "
+        f"New={metrics['new_accuracy']:.2f}% | "
+        f"H={metrics['harmonic_mean']:.2f}% | "
+        f"Q05={metrics['geometry_margin_q05']:.4f}"
+    )
+    return phase_payload
 
-def checkpoint_payload(
-    model: torch.nn.Module,
+
+# =============================================================================
+# Single and multi-run execution
+# =============================================================================
+
+
+def _execution_phases(
     args: argparse.Namespace,
-    phase_info: Dict[str, Any],
-    history: Any,
-    metrics: Dict[str, Any],
-    diagnostics: Dict[str, Any],
-    method_identity: Dict[str, Any],
+    dataset: IncrementalHSIDatasetManager,
+) -> List[int]:
+    phases = sorted(dataset.phase_to_classes)
+    if bool(args.base_only):
+        return [0]
+    maximum = int(args.maximum_phase)
+    if maximum >= 0:
+        phases = [phase for phase in phases if phase <= maximum]
+    return phases
+
+
+def run_single_experiment(
+    base_args: argparse.Namespace,
+    *,
+    run_index: int,
+    seed: int,
 ) -> Dict[str, Any]:
-    payload = {
-        "phase": int(phase_info["phase"]),
-        "model_state": model.state_dict(),
-        "model_state_dict": model.state_dict(),
-        "geometry_bank_state": geometry_bank_state(model),
-        "memory_snapshot": model.export_memory_snapshot() if hasattr(model, "export_memory_snapshot") else None,
-        "seen_classes": [int(c) for c in phase_info["seen_classes"]],
-        "old_classes": [int(c) for c in phase_info["old_classes"]],
-        "new_classes": [int(c) for c in phase_info["new_classes"]],
-        "class_mappings": {
-            "seen_global_to_local": {str(c): i for i, c in enumerate(phase_info["seen_classes"])},
-            "seen_local_to_global": {str(i): int(c) for i, c in enumerate(phase_info["seen_classes"])},
+    requested = argparse.Namespace(**namespace_to_dict(base_args))
+    requested.seed = int(seed)
+    args = resolve_config(requested)
+    validate_config(args)
+    set_seed(int(args.seed), bool(args.deterministic))
+
+    run_dir = os.path.join(
+        os.path.abspath(str(args.save_dir)),
+        str(args.dataset),
+        (
+            f"base_{int(args.base_classes)}_"
+            f"inc_{int(args.increment)}"
+        ),
+        f"run_{run_index + 1}_seed_{int(args.seed)}",
+    )
+    os.makedirs(run_dir, exist_ok=True)
+    args.save_dir = run_dir
+    atomic_json(
+        os.path.join(run_dir, "requested_configuration.json"),
+        namespace_to_dict(requested),
+    )
+    atomic_json(
+        os.path.join(run_dir, "resolved_configuration.json"),
+        namespace_to_dict(args),
+    )
+
+    print("\n" + "=" * 112)
+    print("TRANSPORT-VERIFIED SPECTRAL-SPATIAL FACTOR GEOMETRY")
+    print("=" * 112)
+    print(
+        f"[Run] dataset={args.dataset} | seed={args.seed} | "
+        f"device={args.device} | base={args.base_classes} | "
+        f"increment={args.increment}"
+    )
+    print(
+        f"[Contract] {CLASSIFICATION_FACTORIZATION}; "
+        f"{SPECTRAL_RELATION_FACTORIZATION} supplies pair risk only"
+    )
+
+    load_start = time.time()
+    data = load_hsi_data(args)
+    loading_time = time.time() - load_start
+    atomic_json(
+        os.path.join(run_dir, "dataset_summary.json"),
+        data["summary"],
+    )
+    atomic_json(
+        os.path.join(run_dir, "incremental_protocol.json"),
+        {
+            "phase_to_classes": data["protocol"]["phase_to_classes"],
+            "class_order_original_ids": data["protocol"][
+                "class_order_original_ids"
+            ],
+            "class_counts": data["protocol"]["class_counts"],
         },
-        "base_geometry_certificate": getattr(model, "base_geometry_certificate", None),
-        "base_handoff": getattr(model, "base_handoff", None),
-        "runtime_contract": runtime_contract(args, phase_info),
-        "method_identity": method_identity,
-        "args_resolved": namespace_to_dict(args),
-        "metrics": metrics,
-        "history": history,
-        "diagnostics": diagnostics,
+    )
+    dataset = build_dataset(args, data)
+    model = build_model(args)
+    if bool(args.save_model_summary):
+        save_model_summary(
+            os.path.join(run_dir, "model_summary_initial.txt"),
+            model,
+        )
+    trainer = Trainer(model, dataset, args)
+    evaluator = NECILEvaluator()
+    histories: Dict[int, Dict[str, Any]] = {}
+    phase_results: Dict[int, Dict[str, Any]] = {}
+
+    resume = str(args.resume_checkpoint).strip()
+    accepted_phase = -1
+    if resume:
+        checkpoint = trainer.load_checkpoint(
+            resume,
+            strict=True,
+            restore_rng=True,
+        )
+        previous_run_dir = os.path.dirname(
+            os.path.dirname(os.path.abspath(resume))
+        )
+        previous_evaluation = os.path.join(
+            previous_run_dir,
+            "evaluation",
+            "necil_evaluation_summary.json",
+        )
+        if os.path.isfile(previous_evaluation):
+            with open(previous_evaluation, "r", encoding="utf-8") as stream:
+                evaluator.restore(json.load(stream))
+            print(
+                "[Resume] restored prior phase evaluation history from "
+                f"{previous_evaluation}"
+            )
+        accepted_phase = int(checkpoint["phase"])
+        history = dict(checkpoint.get("history", {}))
+        histories[accepted_phase] = history
+        for phase in range(accepted_phase + 1):
+            if phase not in dataset.finalized_phases:
+                dataset.finalized_phases.append(phase)
+        dataset.current_phase = accepted_phase
+        print(
+            f"[Resume] accepted phase {accepted_phase} loaded from {resume}"
+        )
+        phase_results[accepted_phase] = evaluate_and_visualize_phase(
+            args=args,
+            run_dir=run_dir,
+            phase=accepted_phase,
+            model=model,
+            dataset=dataset,
+            history=history,
+            evaluator=evaluator,
+        )
+
+    phases = _execution_phases(args, dataset)
+    for phase in phases:
+        if phase <= accepted_phase:
+            continue
+        history = trainer.train_phase(
+            phase=phase,
+            epochs=(
+                int(args.epochs_base)
+                if phase == 0
+                else int(args.epochs_inc)
+            ),
+            batch_size=int(args.batch_size),
+            lr=(
+                float(args.lr)
+                if phase == 0
+                else float(args.lr_inc)
+            ),
+        )
+        histories[phase] = history
+        if phase > 0 and not bool(history.get("committed", False)):
+            print(
+                f"[Phase {phase}] rejected; stopping after accepted phase "
+                f"{phase - 1}"
+            )
+            break
+        phase_results[phase] = evaluate_and_visualize_phase(
+            args=args,
+            run_dir=run_dir,
+            phase=phase,
+            model=model,
+            dataset=dataset,
+            history=history,
+            evaluator=evaluator,
+        )
+        evaluator.save(os.path.join(run_dir, "evaluation"))
+        if bool(args.save_visualizations):
+            plot_necil_phase_summary(
+                evaluator,
+                os.path.join(
+                    run_dir,
+                    "evaluation",
+                    "necil_phase_summary.png",
+                ),
+                dpi=int(args.visualization_dpi),
+            )
+
+    if not phase_results:
+        raise RuntimeError("no accepted phase was evaluated")
+    evaluator_paths = evaluator.save(
+        os.path.join(run_dir, "evaluation")
+    )
+    if bool(args.save_visualizations):
+        phase_summary_figure = plot_necil_phase_summary(
+            evaluator,
+            os.path.join(
+                run_dir,
+                "evaluation",
+                "necil_phase_summary.png",
+            ),
+            dpi=int(args.visualization_dpi),
+        )
+    else:
+        phase_summary_figure = None
+
+    if bool(args.save_model_summary):
+        save_model_summary(
+            os.path.join(run_dir, "model_summary_final.txt"),
+            model,
+        )
+
+    final_phase = max(phase_results)
+    final_metrics = phase_results[final_phase]["test_metrics"]
+    payload = {
+        "stack_build_id": STACK_BUILD_ID,
+        "method": METHOD_NAME,
+        "classification_factorization": CLASSIFICATION_FACTORIZATION,
+        "spectral_relation_factorization": (
+            SPECTRAL_RELATION_FACTORIZATION
+        ),
+        "run_index": int(run_index),
+        "seed": int(args.seed),
+        "run_dir": run_dir,
+        "data_loading_time_sec": float(loading_time),
+        "accepted_phases": sorted(phase_results),
+        "final_phase": int(final_phase),
+        "phase_results": phase_results,
+        "necil_metrics": evaluator.to_dict(),
+        "evaluator_paths": evaluator_paths,
+        "phase_summary_figure": phase_summary_figure,
+        "final_metrics": final_metrics,
     }
-    required = ["phase", "model_state", "geometry_bank_state", "seen_classes", "class_mappings", "runtime_contract", "args_resolved", "metrics"]
-    missing = [k for k in required if k not in payload or payload[k] is None]
-    if missing:
-        raise RuntimeError(f"Checkpoint missing critical fields: {missing}")
+    atomic_json(
+        os.path.join(run_dir, "final_summary.json"),
+        payload,
+    )
+    evaluator.print_summary()
     return payload
 
 
-def save_phase_artifacts(
-    phase_dir: str,
-    model: torch.nn.Module,
-    args: argparse.Namespace,
-    phase_info: Dict[str, Any],
-    history: Any,
-    metrics: Dict[str, Any],
-    diagnostics: Dict[str, Any],
-    method_identity: Dict[str, Any],
-    classification_report: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
-    os.makedirs(phase_dir, exist_ok=True)
-    paths = {
-        "metrics": save_json(os.path.join(phase_dir, "metrics.json"), metrics),
-        "diagnostics": save_json(os.path.join(phase_dir, "diagnostics.json"), diagnostics),
-        "runtime_contract": save_json(os.path.join(phase_dir, "runtime_contract.json"), runtime_contract(args, phase_info)),
-    }
-    if classification_report is not None:
-        paths["classification_report_info"] = save_json(os.path.join(phase_dir, "classification_report_info.json"), classification_report)
-    if int(phase_info["phase"]) == 0:
-        cert = getattr(model, "base_geometry_certificate", None)
-        if cert is not None:
-            paths["geometry_certificate"] = save_json(os.path.join(phase_dir, "geometry_certificate.json"), cert)
-    cm = metrics.get("confusion_matrix", None)
-    if torch.is_tensor(cm):
-        cm = cm.detach().cpu().numpy()
-    if isinstance(cm, np.ndarray):
-        cm_path = os.path.join(phase_dir, "confusion_matrix.npy")
-        np.save(cm_path, cm)
-        paths["confusion_matrix"] = cm_path
-    ckpt = checkpoint_payload(model, args, phase_info, history, metrics, diagnostics, method_identity)
-    ckpt_path = os.path.join(phase_dir, f"phase_{int(phase_info['phase'])}_checkpoint.pt")
-    torch.save(ckpt, ckpt_path)
-    paths["checkpoint"] = ckpt_path
-    return paths
-
-
-def collect_trainer_diagnostics(trainer: Any, phase: int, phase_dir: str) -> Dict[str, Any]:
-    candidates = [
-        f"_last_phase_{int(phase)}_geometry_diagnostics",
-        "_last_incremental_geometry_diagnostics",
-        "_last_phase_geometry_diagnostics",
-        "_last_geometry_diagnostics",
-    ]
-    if int(phase) == 0:
-        candidates.insert(0, "_last_base_geometry_diagnostics")
-    for attr in candidates:
-        diag = getattr(trainer, attr, None)
-        if isinstance(diag, dict) and diag:
-            return _json_safe(diag)
-    json_path = os.path.join(phase_dir, f"phase_{int(phase)}_geometry_diagnostics.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def call_phase_map_compat(model: torch.nn.Module, dataset: Any, phase: int, target_names: List[str], phase_dir: str, args: argparse.Namespace) -> None:
-    if bool(args.skip_phase_maps):
-        return
-    try:
-        sig = inspect.signature(predict_phase_grid)
-        kwargs = {
-            "model": model,
-            "dataset_manager": dataset,
-            "phase": int(phase),
-            "target_names": target_names,
-            "save_dir": os.path.join(phase_dir, "maps"),
-            "device": args.device,
-            "patch_size": args.patch_size,
-            "classifier_mode": args.eval_classifier_mode,
-            "semantic_mode": "identity",
-            "class_cmap": args.viz_class_cmap,
-            "background_color": args.viz_background_color,
-            "save_numpy": args.viz_save_numpy,
-        }
-        predict_phase_grid(**{k: v for k, v in kwargs.items() if k in sig.parameters})
-    except Exception as exc:
-        print(f"[WARN] phase map generation failed: {exc}")
-
-
-def assert_base_handoff_ready(model: torch.nn.Module, trainer: Any) -> None:
-    """Verify phase-0 compact geometry rows without a hard conflict certificate.
-
-    This is intentionally not a semantic handoff gate.  HSI classes can be
-    physically similar, so overlap/risk diagnostics must not stop the run.  The
-    only hard requirements here are: base rows exist, are finite, and can be
-    frozen for future replay/adaptation.
-    """
-    base_ids = [int(c) for c in phase_to_classes_as_list(trainer.dataset)[0]]
-    bank = getattr(model, "geometry_bank", None)
-    if bank is None:
-        raise RuntimeError("Base phase completed without GeometryBank.")
-
-    if hasattr(bank, "phase_geometry_state_report"):
-        report = bank.phase_geometry_state_report(base_ids, freeze=True)
-        if isinstance(report, dict) and not bool(report.get("ok", True)):
-            raise RuntimeError(f"Base GeometryBank rows are not ready: {report}")
-    elif hasattr(bank, "assert_bank_valid"):
-        try:
-            bank.assert_bank_valid(seen_classes=base_ids, strict=True)
-        except TypeError:
-            bank.assert_bank_valid(seen_classes=base_ids)
-        if hasattr(bank, "freeze_classes"):
-            bank.freeze_classes(base_ids)
-        elif hasattr(bank, "freeze_classes_up_to") and base_ids == list(range(max(base_ids) + 1)):
-            bank.freeze_classes_up_to(max(base_ids) + 1)
-    elif hasattr(model, "assert_base_handoff_ready"):
-        # Compatibility only.  Prefer non-strict mode because old implementations
-        # sometimes used band/spectral overlap as a hard failure.
-        try:
-            model.assert_base_handoff_ready(base_ids, freeze=True, strict=False)
-        except TypeError:
-            model.assert_base_handoff_ready()
-    else:
-        raise RuntimeError("No GeometryBank validation API available after base phase.")
-
-
-def assert_incremental_phase_complete(model: torch.nn.Module, phase_info: Dict[str, Any]) -> None:
-    if geometry_bank_state(model) is None:
-        raise RuntimeError("Incremental phase ended without GeometryBank state.")
-    if int(phase_info["phase"]) > 0 and not phase_info.get("old_classes"):
-        raise RuntimeError("Incremental phase missing old classes in phase_info.")
-    gb = getattr(model, "geometry_bank", None)
-    if gb is not None and hasattr(gb, "assert_bank_valid"):
-        try:
-            gb.assert_bank_valid(seen_classes=[int(c) for c in phase_info["seen_classes"]], strict=True)
-        except TypeError:
-            gb.assert_bank_valid(seen_classes=[int(c) for c in phase_info["seen_classes"]])
-
-
-def run_phase(
-    *,
-    trainer: Trainer,
-    model: torch.nn.Module,
-    dataset: Any,
-    evaluator: Any,
-    args: argparse.Namespace,
-    phase_info: Dict[str, Any],
-    target_names: List[str],
-    run_dir: str,
-    method_identity: Dict[str, Any],
+def aggregate_runs(
+    results: Sequence[Mapping[str, Any]],
+    root: str,
 ) -> Dict[str, Any]:
-    phase = int(phase_info["phase"])
-    phase_dir = os.path.join(run_dir, f"phase_{phase}")
-    os.makedirs(phase_dir, exist_ok=True)
-    if hasattr(dataset, "start_phase"):
-        dataset.start_phase(phase)
-    set_model_phase(model, phase_info)
-    print("\n" + "=" * 88)
-    print(f"[Phase {phase}] old={phase_info['old_classes']} | new={phase_info['new_classes']} | seen={phase_info['seen_classes']}")
-    print("=" * 88)
-
-    epochs = int(args.epochs_base if phase == 0 else args.epochs_inc)
-    lr = float(args.lr if phase == 0 else (args.lr_inc if args.lr_inc > 0 else args.lr))
-
-    if phase > 0 and hasattr(trainer, "_assert_incremental_preflight"):
-        trainer._assert_incremental_preflight(
-            phase,
-            old_classes=phase_info["old_classes"],
-            new_classes=phase_info["new_classes"],
-            seen_classes=phase_info["seen_classes"],
-        )
-        print(f"[Incremental Preflight PASS] phase={phase}")
-
-    t0 = time.time()
-    # Always use Trainer.train_phase() so phase-specific trainability, cleaned
-    # argument normalization, old/new class resolution, and incremental preflight
-    # are applied consistently.  Calling train_base_phase()/train_incremental_phase()
-    # directly bypasses that contract.
-    history = trainer.train_phase(phase=phase, epochs=epochs, batch_size=args.batch_size, lr=lr)
-    if phase == 0:
-        assert_base_handoff_ready(model, trainer)
-    else:
-        assert_incremental_phase_complete(model, phase_info)
-    train_time = time.time() - t0
-
-    print(f"[Eval] phase={phase} cumulative seen-class evaluation")
-    e0 = time.time()
-    y_pred, y_true, pred_diag = get_phase_predictions(model, dataset, phase_info, torch.device(args.device), args, batch_size=args.batch_size)
-    eval_time = time.time() - e0
-    energy = pred_diag.get("energy", None)
-
-    metrics = compute_phase_metrics(
-        y_true,
-        y_pred,
-        phase_info,
-        energy=energy,
-        energy_margin=float(args.geometry_energy_margin if phase > 0 else args.base_energy_margin),
-    )
-    metrics["train_time_sec"] = train_time
-    metrics["eval_time_sec"] = eval_time
-    metrics["prediction_histogram"] = pred_diag.get("prediction_histogram", {})
-    evaluator_update_compat(
-        evaluator,
-        phase,
-        y_true,
-        y_pred,
-        phase_info,
-        energy=energy,
-        energy_margin=float(args.geometry_energy_margin if phase > 0 else args.base_energy_margin),
-    )
-    if hasattr(evaluator, "print_summary"):
-        evaluator.print_summary()
-    report = save_classification_report_compat(
-        evaluator=evaluator,
-        phase=phase,
-        y_true=y_true,
-        y_pred=y_pred,
-        target_names=target_names,
-        phase_dir=phase_dir,
-        phase_info=phase_info,
-        enabled=bool(args.save_classification_report),
-        tr_time=train_time,
-        te_time=eval_time,
-        energy=energy,
-        energy_margin=float(args.geometry_energy_margin if phase > 0 else args.base_energy_margin),
-    )
-    diagnostics = collect_trainer_diagnostics(trainer, phase, phase_dir)
-    diagnostics["prediction_histogram"] = pred_diag.get("prediction_histogram", {})
-    diagnostics["evaluation_spectral_metadata"] = pred_diag.get("spectral_diagnostics", {})
-    diagnostics["phase_info"] = phase_info
-    paths = save_phase_artifacts(phase_dir, model, args, phase_info, history, metrics, diagnostics, method_identity, classification_report=report)
-    call_phase_map_compat(model, dataset, phase, target_names, phase_dir, args)
-    return {
-        "phase": phase,
-        "phase_dir": phase_dir,
-        "phase_info": phase_info,
-        "history": history,
-        "metrics": _json_safe(metrics),
-        "diagnostics": diagnostics,
-        "artifact_paths": paths,
-        "classification_report": report,
-        "train_time_sec": train_time,
-        "eval_time_sec": eval_time,
-    }
-
-
-def determine_total_phases(dataset: Any, args: argparse.Namespace) -> int:
-    phases = phase_to_classes_as_list(dataset)
-    dataset_total = int(getattr(dataset, "num_phases", len(phases)))
-    if dataset_total != len(phases):
-        print(f"[WARN] dataset.num_phases={dataset_total} but len(phase_to_classes)={len(phases)}. Using phase_to_classes.")
-        dataset_total = len(phases)
-    if bool(args.base_only):
-        return 1
-    total = dataset_total
-    if int(args.max_phases or 0) > 0:
-        total = min(total, int(args.max_phases))
-    elif int(args.max_train_phase or -1) >= 0:
-        total = min(total, int(args.max_train_phase) + 1)
-    return max(1, total)
-
-
-def save_dataset_protocol_files(run_dir: str, data: Dict[str, Any], dataset: Any) -> Dict[str, str]:
-    phases = phase_to_classes_as_list(dataset)
-    phase_splits = {
-        "num_phases": int(len(phases)),
-        "class_order": _json_safe(getattr(dataset, "class_order", None)),
-        "phase_to_classes": _json_safe(phases),
-    }
-    return {
-        "dataset_summary": save_json(os.path.join(run_dir, "dataset_summary.json"), data["summary"]),
-        "phase_splits": save_json(os.path.join(run_dir, "phase_splits.json"), phase_splits),
-    }
-
-
-def run_single_experiment(base_args: argparse.Namespace, run_idx: int, run_seed: int) -> Dict[str, Any]:
-    raw_args = argparse.Namespace(**namespace_to_dict(base_args))
-    raw_args.seed = int(run_seed)
-    original = namespace_to_dict(raw_args)
-    resolved, diff, method_identity = resolve_experiment_config(raw_args)
-    validate_config(resolved)
-    assert_strict_energy_contract(resolved, context="run_single_experiment(resolved)")
-    set_seed(resolved.seed, deterministic=bool(resolved.deterministic))
-
-    run_tag = "base_only" if bool(resolved.base_only) else "sctgr"
-    run_dir = os.path.join(
-        resolved.save_dir,
-        resolved.dataset,
-        f"patch_{resolved.patch_size}",
-        f"{run_tag}_run_{run_idx + 1}_seed_{resolved.seed}",
-    )
-    os.makedirs(run_dir, exist_ok=True)
-    resolved.run_dir = run_dir
-    resolved.save_dir = run_dir
-
-    save_config_files(run_dir, original, resolved, diff, method_identity)
-    print("\n=== NECIL-HSI RUN ===")
-    print(f"[Build] {STACK_BUILD_ID}")
-    print(f"Run {run_idx + 1}/{base_args.num_runs} | seed={resolved.seed} | device={resolved.device}")
-    print_config_summary(resolved, diff, method_identity)
-
-    data = load_hsi_dataset(resolved)
-    dataset = build_incremental_dataset(resolved, data)
-    target_names = resolve_target_names(dataset, data["target_names"])
-    if hasattr(dataset, "target_names"):
-        dataset.target_names = target_names
-    save_dataset_protocol_files(run_dir, data, dataset)
-
-    device = torch.device(resolved.device)
-    model = build_model(resolved, device)
-    trainer = build_trainer(model, dataset, resolved, run_dir)
-    evaluator = build_evaluator()
-
-    phase_results: Dict[int, Dict[str, Any]] = {}
-    total_phases = determine_total_phases(dataset, resolved)
-    print(f"[Run] phases=0..{total_phases - 1} of dataset phases={getattr(dataset, 'num_phases', total_phases)}")
-    start = time.time()
-    for phase in range(total_phases):
-        phase_info = get_phase_info(dataset, phase)
-        phase_results[phase] = run_phase(
-            trainer=trainer,
-            model=model,
-            dataset=dataset,
-            evaluator=evaluator,
-            args=resolved,
-            phase_info=phase_info,
-            target_names=target_names,
-            run_dir=run_dir,
-            method_identity=method_identity,
+    if not results:
+        raise ValueError("results is empty")
+    rows: List[Dict[str, Any]] = []
+    for result in results:
+        final = result["final_metrics"]
+        standard = result["necil_metrics"]["standard_metrics"]
+        rows.append(
+            {
+                "run_index": int(result["run_index"]),
+                "seed": int(result["seed"]),
+                "final_phase": int(result["final_phase"]),
+                "OA": float(final["overall_accuracy"]),
+                "AA": float(final["average_accuracy"]),
+                "Kappa": float(final["kappa"]),
+                "MacroF1": float(final["f1_macro"]),
+                "Old": float(final["old_accuracy"]),
+                "New": float(final["new_accuracy"]),
+                "H": float(final["harmonic_mean"]),
+                "F_avg": float(standard.get("F_avg", 0.0)),
+                "BWT": float(standard.get("BWT", 0.0)),
+                "OldToNew": float(final["old_to_new_rate"]),
+                "NewToOld": float(final["new_to_old_rate"]),
+                "GeometryViolation": float(
+                    final["geometry_error_rate"]
+                ),
+                "Q05Gap": float(final["geometry_margin_q05"]),
+                "run_dir": str(result["run_dir"]),
+            }
         )
 
-    elapsed = time.time() - start
-    final_phase = max(phase_results)
-    final_metrics = phase_results[final_phase]["metrics"]
-    final_phase_info = get_phase_info(dataset, final_phase)
-    final_results = {
-        "run_idx": run_idx,
-        "seed": int(resolved.seed),
-        "run_dir": run_dir,
-        "elapsed_sec": elapsed,
-        "final_phase": int(final_phase),
-        "final_metrics": final_metrics,
-        "phase_results": _json_safe(phase_results),
-        "method_identity": method_identity,
-        "runtime_contract": runtime_contract(resolved, final_phase_info),
-        "evaluator": evaluator.to_dict() if hasattr(evaluator, "to_dict") else None,
+    numeric_keys = [
+        key
+        for key in rows[0]
+        if key not in {"run_index", "seed", "final_phase", "run_dir"}
+    ]
+    mean_std = {
+        key: (
+            float(
+                np.mean([float(row[key]) for row in rows])
+            ),
+            float(
+                np.std([float(row[key]) for row in rows], ddof=0)
+            ),
+        )
+        for key in numeric_keys
     }
-    save_json(os.path.join(run_dir, "final_results.json"), final_results)
-    torch.save(
-        checkpoint_payload(model, resolved, final_phase_info, None, final_metrics, {}, method_identity),
-        os.path.join(run_dir, "final_model.pt"),
-    )
-    try:
-        history = {}
-        for pr in phase_results.values():
-            h = pr.get("history", {})
-            if isinstance(h, dict):
-                for k, v in h.items():
-                    if isinstance(v, list):
-                        history.setdefault(k, []).extend(v)
-        if history:
-            plot_training_history(history, os.path.join(run_dir, "training_history.png"))
-    except Exception as exc:
-        print(f"[WARN] Could not plot training history: {exc}")
-    write_run_report(os.path.join(run_dir, "SCTGR_HSI_RUN_REPORT.txt"), resolved, final_results)
-    print(f"[Done] run_dir={run_dir} | final_OA={float(final_metrics.get('overall_accuracy', 0.0)):.2f} | final_HM={float(final_metrics.get('hm', 0.0)):.2f}")
-    return final_results
-
-
-def write_run_report(path: str, args: argparse.Namespace, result: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"SCTGR-HSI Run Report - {args.dataset}\n")
-        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("=" * 80 + "\n")
-        f.write(json.dumps(_json_safe(result["method_identity"]), indent=2) + "\n\n")
-        f.write("Phase metrics\n")
-        f.write("-" * 80 + "\n")
-        for p, pr in sorted((result.get("phase_results", {}) or {}).items(), key=lambda kv: int(kv[0])):
-            m = pr.get("metrics", {}) or {}
-            info = pr.get("phase_info", {}) or {}
-            f.write(
-                f"Phase {p}: OA={float(m.get('overall_accuracy', 0.0)):.2f} | "
-                f"Old={float(m.get('old_accuracy', 0.0)):.2f} | New={float(m.get('new_accuracy', 0.0)):.2f} | "
-                f"HM={float(m.get('hm', 0.0)):.2f} | seen={info.get('seen_classes', [])}\n"
-            )
-        f.write("\nFinal metrics\n")
-        f.write(json.dumps(_json_safe(result.get("final_metrics", {})), indent=2) + "\n")
-    print(f"[Report] {path}")
-
-
-def aggregate_runs(results: List[Dict[str, Any]], root_dir: str) -> Dict[str, Any]:
-    os.makedirs(root_dir, exist_ok=True)
-    rows = []
-    for r in results:
-        m = r.get("final_metrics", {}) or {}
-        rows.append({
-            "run_idx": int(r.get("run_idx", 0)),
-            "seed": int(r.get("seed", 0)),
-            "run_dir": r.get("run_dir", ""),
-            "final_phase": int(r.get("final_phase", 0)),
-            "overall_accuracy": float(m.get("overall_accuracy", 0.0)),
-            "old_accuracy": float(m.get("old_accuracy", 0.0)),
-            "new_accuracy": float(m.get("new_accuracy", 0.0)),
-            "hm": float(m.get("hm", 0.0)),
-        })
-
-    def mean_std(key: str) -> Tuple[float, float]:
-        arr = np.asarray([row[key] for row in rows], dtype=np.float64)
-        return (float(arr.mean()), float(arr.std(ddof=0))) if arr.size else (0.0, 0.0)
-
     summary = {
-        "num_runs": len(results),
-        "rows": rows,
-        "overall_accuracy_mean_std": mean_std("overall_accuracy"),
-        "old_accuracy_mean_std": mean_std("old_accuracy"),
-        "new_accuracy_mean_std": mean_std("new_accuracy"),
-        "hm_mean_std": mean_std("hm"),
+        "stack_build_id": STACK_BUILD_ID,
+        "method": METHOD_NAME,
+        "num_runs": len(rows),
+        "runs": rows,
+        "mean_std": mean_std,
     }
-    save_json(os.path.join(root_dir, "runs_summary.json"), summary)
-    csv_path = os.path.join(root_dir, "runs_summary.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = list(rows[0].keys()) if rows else ["run_idx", "seed", "run_dir", "overall_accuracy", "old_accuracy", "new_accuracy", "hm"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    os.makedirs(root, exist_ok=True)
+    atomic_json(
+        os.path.join(root, "multi_run_summary.json"),
+        summary,
+    )
+    csv_path = os.path.join(root, "multi_run_summary.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=list(rows[0]),
+        )
         writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    summary["runs_summary_csv"] = csv_path
+        writer.writerows(rows)
+    summary["csv_path"] = csv_path
     return summary
 
 
-def main(argv: Optional[List[str]] = None) -> None:
-    args = parse_args(argv)
-    preview_args = argparse.Namespace(**namespace_to_dict(args))
-    resolved, _, _ = resolve_experiment_config(preview_args)
-    seeds = parse_seed_list(getattr(resolved, "seed_list", "")) or [int(resolved.seed) + i for i in range(int(resolved.num_runs))]
-    if len(seeds) != int(resolved.num_runs):
-        raise ValueError("seed_list length must match num_runs.")
-
-    results: List[Dict[str, Any]] = []
-    for run_idx, seed in enumerate(seeds):
-        run_args = argparse.Namespace(**namespace_to_dict(args))
-        run_args.seed = int(seed)
-        results.append(run_single_experiment(run_args, run_idx, int(seed)))
-
-    root_dir = os.path.join(resolved.save_dir, resolved.dataset, f"patch_{resolved.patch_size}")
-    summary = aggregate_runs(results, root_dir)
-    print("\n=== MULTI-RUN SUMMARY ===")
-    print(f"runs={summary['num_runs']} | OA={summary['overall_accuracy_mean_std'][0]:.2f}±{summary['overall_accuracy_mean_std'][1]:.2f} | HM={summary['hm_mean_std'][0]:.2f}±{summary['hm_mean_std'][1]:.2f}")
-    print(f"Saved: {os.path.join(root_dir, 'runs_summary.json')}")
-    print(f"Saved: {summary['runs_summary_csv']}")
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parsed = parse_args(argv)
+    preview = resolve_config(parsed)
+    validate_config(preview)
+    seeds = parse_int_list(preview.seed_list, name="seed_list")
+    if seeds is None:
+        seeds = [
+            int(preview.seed) + index
+            for index in range(int(preview.num_runs))
+        ]
+    results = [
+        run_single_experiment(
+            parsed,
+            run_index=index,
+            seed=seed,
+        )
+        for index, seed in enumerate(seeds)
+    ]
+    root = os.path.join(
+        os.path.abspath(str(preview.save_dir)),
+        str(preview.dataset),
+        (
+            f"base_{int(preview.base_classes)}_"
+            f"inc_{int(preview.increment)}"
+        ),
+    )
+    summary = aggregate_runs(results, root)
+    oa_mean, oa_std = summary["mean_std"]["OA"]
+    h_mean, h_std = summary["mean_std"]["H"]
+    forgetting_mean, forgetting_std = summary["mean_std"]["F_avg"]
+    print("\n" + "=" * 112)
+    print("FACTOR-GEOMETRY NECIL MULTI-RUN SUMMARY")
+    print("=" * 112)
+    print(
+        f"runs={summary['num_runs']} | "
+        f"OA={oa_mean:.2f}±{oa_std:.2f} | "
+        f"H={h_mean:.2f}±{h_std:.2f} | "
+        f"F_avg={forgetting_mean:.2f}±{forgetting_std:.2f}"
+    )
+    print(
+        f"[Saved] {os.path.join(root, 'multi_run_summary.json')}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
 
 
 
@@ -2133,29 +2169,56 @@ if __name__ == "__main__":
 # import argparse
 # import copy
 # import csv
-# import inspect
+# import gc
 # import json
+# import math
 # import os
 # import random
 # import sys
 # import time
-# from datetime import datetime
-# from typing import Any, Dict, Iterable, List, Optional, Tuple
+# from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # import numpy as np
 # import torch
+# from torch.utils.data import DataLoader
 
 # sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# from data.hsi_dataloader_pytorch import ImageCubes, LoadHSIData
-# from data.incremental_dataset import IncrementalHSIDataset
+# from data.hsi_dataloader_pytorch import (
+#     ApplyHSIPreprocessor,
+#     BuildPCSIRGInterventionCentersFromCube,
+#     BuildPreprocessFitMask,
+#     ExtractLabeledPixelIndex,
+#     FitHSIPreprocessor,
+#     ImageCubes,
+#     LoadHSIPreprocessor,
+#     LoadRawHSIData,
+#     SaveHSIPreprocessor,
+#     ValidatePCSIRGCenterAlignment,
+# )
+# from data.incremental_dataset import HSIPatchDataset, IncrementalHSIDataset
 # from models.necil_model import NECILModel
 # from trainers.trainer import Trainer
-# from utils.eval import NECILEvaluator, make_json_serializable, save_classification_report
-# from utils.visualize import plot_training_history, predict_phase_grid
+# from utils.visualize import (
+#     build_geometry_overlap_review,
+#     plot_base_training_dynamics,
+#     predict_phase_grid,
+#     save_classification_diagnostics,
+#     save_geometry_pair_diagnostics,
+# )
 
 
-# DATASET_INFO = {
+
+# BuildPCSTGBInterventionCentersFromCube = BuildPCSIRGInterventionCentersFromCube
+# ValidatePCSTGBCenterAlignment = ValidatePCSIRGCenterAlignment
+
+# STACK_BUILD_ID = "PC-STGB-CONDITIONAL-JOINT-NECIL-V5-2026-07-23"
+# METHOD_NAME = "PC-STGB"
+# BANK_SCHEMA_VERSION = 5
+# JOINT_FACTORIZATION = "p(z|c)prod_k p(g_k|z,c)"
+# VISUALIZATION_MODE_ALIAS = "pc_stgb"
+
+# DATASET_INFO: Dict[str, Dict[str, Any]] = {
 #     "IP": {"name": "Indian Pines", "bands": 200, "classes": 16},
 #     "SA": {"name": "Salinas", "bands": 204, "classes": 16},
 #     "PU": {"name": "Pavia University", "bands": 103, "classes": 9},
@@ -2171,1722 +2234,2253 @@ if __name__ == "__main__":
 # }
 
 
-# # -----------------------------------------------------------------------------
-# # Robust utilities
-# # -----------------------------------------------------------------------------
+# # =============================================================================
+# # Generic utilities
+# # =============================================================================
 
 
-# def str2bool(v: Any) -> bool:
-#     if isinstance(v, bool):
-#         return v
-#     if v is None:
+# def str2bool(value: Any) -> bool:
+#     if isinstance(value, bool):
+#         return value
+#     if value is None:
 #         return False
-#     s = str(v).strip().lower()
-#     if s in {"true", "1", "yes", "y", "t", "on"}:
+#     token = str(value).strip().lower()
+#     if token in {"1", "true", "yes", "y", "on", "t"}:
 #         return True
-#     if s in {"false", "0", "no", "n", "f", "off", "none", "null", ""}:
+#     if token in {"0", "false", "no", "n", "off", "none", "null", "", "f"}:
 #         return False
-#     raise argparse.ArgumentTypeError(f"Invalid boolean value: {v!r}")
+#     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
 
 
-# def parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
-#     if seed_list_str is None or str(seed_list_str).strip() == "":
+# def parse_seed_list(raw: Optional[str]) -> Optional[List[int]]:
+#     if raw is None or not str(raw).strip():
 #         return None
-#     return [int(s.strip()) for s in str(seed_list_str).split(",") if s.strip()]
+#     result = [int(token.strip()) for token in str(raw).split(",") if token.strip()]
+#     if len(result) != len(set(result)):
+#         raise ValueError(f"seed_list contains duplicates: {result}")
+#     return result
 
 
-# def _json_safe(obj: Any) -> Any:
-#     try:
-#         return make_json_serializable(obj)
-#     except Exception:
-#         pass
-#     if torch.is_tensor(obj):
-#         x = obj.detach().cpu()
-#         return x.item() if x.numel() == 1 else x.tolist()
-#     if isinstance(obj, np.ndarray):
-#         return obj.tolist()
-#     if isinstance(obj, (np.integer, np.floating)):
-#         return obj.item()
-#     if isinstance(obj, dict):
-#         return {str(k): _json_safe(v) for k, v in obj.items()}
-#     if isinstance(obj, (list, tuple)):
-#         return [_json_safe(v) for v in obj]
-#     if isinstance(obj, (str, int, float, bool)) or obj is None:
-#         return obj
-#     return str(obj)
-
-
-# def save_json(path: str, data: Any) -> str:
-#     os.makedirs(os.path.dirname(path), exist_ok=True)
-#     with open(path, "w", encoding="utf-8") as f:
-#         json.dump(_json_safe(data), f, indent=2, sort_keys=True)
-#     return path
+# def parse_class_order(raw: Optional[str]) -> Optional[List[int]]:
+#     if raw is None or not str(raw).strip():
+#         return None
+#     result = [int(token.strip()) for token in str(raw).split(",") if token.strip()]
+#     if len(result) != len(set(result)):
+#         raise ValueError(f"class_order contains duplicates: {result}")
+#     return result
 
 
 # def namespace_to_dict(args: argparse.Namespace) -> Dict[str, Any]:
 #     return copy.deepcopy(vars(args))
 
 
-# def _set_resolved(args: argparse.Namespace, name: str, value: Any, reasons: Dict[str, str], reason: str) -> None:
-#     old = getattr(args, name, None)
-#     if old != value or not hasattr(args, name):
-#         setattr(args, name, value)
-#         reasons[name] = reason
+# def json_safe(value: Any) -> Any:
+#     if torch.is_tensor(value):
+#         tensor = value.detach().cpu()
+#         return tensor.item() if tensor.numel() == 1 else tensor.tolist()
+#     if isinstance(value, np.ndarray):
+#         return value.tolist()
+#     if isinstance(value, (np.integer, np.floating)):
+#         return value.item()
+#     if isinstance(value, Mapping):
+#         return {str(key): json_safe(item) for key, item in value.items()}
+#     if isinstance(value, (tuple, list)):
+#         return [json_safe(item) for item in value]
+#     if isinstance(value, set):
+#         return [json_safe(item) for item in sorted(value, key=str)]
+#     if isinstance(value, (str, int, float, bool)) or value is None:
+#         return value
+#     return str(value)
 
 
-# def compute_config_diff(
-#     original: Dict[str, Any],
-#     resolved: Dict[str, Any],
-#     reasons: Optional[Dict[str, str]] = None,
-# ) -> List[Dict[str, Any]]:
-#     reasons = reasons or {}
-#     rows: List[Dict[str, Any]] = []
-#     for k in sorted(set(original.keys()) | set(resolved.keys())):
-#         if original.get(k) != resolved.get(k):
-#             rows.append({
-#                 "name": k,
-#                 "original": _json_safe(original.get(k)),
-#                 "resolved": _json_safe(resolved.get(k)),
-#                 "reason": reasons.get(k, "resolved_config"),
-#             })
-#     return rows
+# def save_json(path: str, value: Any) -> str:
+#     absolute = os.path.abspath(path)
+#     os.makedirs(os.path.dirname(absolute), exist_ok=True)
+#     temporary = absolute + ".tmp"
+#     with open(temporary, "w", encoding="utf-8") as stream:
+#         json.dump(json_safe(value), stream, indent=2, sort_keys=True)
+#         stream.flush()
+#         os.fsync(stream.fileno())
+#     os.replace(temporary, absolute)
+#     return absolute
 
 
-# def normalize_classifier_mode(mode: Optional[str]) -> str:
-#     """Normalize every public geometry alias to the strict classifier token.
-
-#     The repaired classifier/model/trainer use ``geometry_only`` as the explicit
-#     method-contract string. ``geometry`` is accepted from older commands, but it
-#     is semantically identical and must be normalized before the trainer identity
-#     check. Otherwise main.py incorrectly reports a method-identity mutation even
-#     though the classifier path did not change.
-#     """
-#     m = str(mode or "geometry_only").lower().strip()
-#     aliases = {
-#         "": "geometry_only",
-#         "none": "geometry_only",
-#         "geo": "geometry_only",
-#         "geometry": "geometry_only",
-#         "geometry_only": "geometry_only",
-#         "geometry-only": "geometry_only",
-#         "feature_geometry": "geometry_only",
-#         "low_rank_geometry": "geometry_only",
-#         "srgp": "geometry_only",
-#         "srgp_geometry": "geometry_only",
-#         "spectral_geometry": "geometry_only",
-#         "spectral_residual_geometry": "geometry_only",
-#         "calibrated": "geometry_only",
-#         "calibrated_geometry": "geometry_only",
-#     }
-#     m = aliases.get(m, m)
-#     if m != "geometry_only":
-#         raise ValueError(f"Unsupported classifier mode {mode!r}. Use geometry_only/geometry.")
-#     return m
+# def set_seed(seed: int, deterministic: bool = False) -> None:
+#     seed = int(seed)
+#     random.seed(seed)
+#     np.random.seed(seed)
+#     torch.manual_seed(seed)
+#     if torch.cuda.is_available():
+#         torch.cuda.manual_seed_all(seed)
+#     if deterministic:
+#         torch.backends.cudnn.benchmark = False
+#         torch.backends.cudnn.deterministic = True
+#         torch.use_deterministic_algorithms(True, warn_only=True)
+#     elif torch.cuda.is_available():
+#         torch.backends.cudnn.benchmark = True
 
 
-# def normalize_incremental_update_mode(mode: Optional[str]) -> str:
-#     """PG-RGA is the main method.
-
-#     Old names are accepted only so old commands do not break. They all resolve to
-#     geometry_gated_adapter because PG-RGA uses the bounded geometry residual
-#     adapter as the only incremental model plasticity.
-#     """
-#     m = str(mode or "geometry_gated_adapter").lower().strip()
-#     aliases = {
-#         "": "geometry_gated_adapter",
-#         "none": "geometry_gated_adapter",
-#         "clean": "geometry_gated_adapter",
-#         "main": "geometry_gated_adapter",
-#         "pg_rga": "geometry_gated_adapter",
-#         "pg-rga": "geometry_gated_adapter",
-#         "pgrga": "geometry_gated_adapter",
-#         "geometry_gated_adapter": "geometry_gated_adapter",
-#         "g2rpa": "geometry_gated_adapter",
-#         "g2-rpa": "geometry_gated_adapter",
-#         "g²rpa": "geometry_gated_adapter",
-#         "gated_adapter": "geometry_gated_adapter",
-#         "geometry_adapter": "geometry_gated_adapter",
-#         "adapter": "geometry_gated_adapter",
-#         # legacy aliases from earlier drafts
-#         "scbgr": "geometry_gated_adapter",
-#         "scb-gr": "geometry_gated_adapter",
-#         "descriptor": "geometry_gated_adapter",
-#         "descriptor_only": "geometry_gated_adapter",
-#         "rsgi": "geometry_gated_adapter",
-#         "geometry_state_admission": "geometry_gated_adapter",
-#         "spectral_risk_boundary": "geometry_gated_adapter",
-#         "boundary_geometry": "geometry_gated_adapter",
-#     }
-#     if m not in aliases:
-#         raise ValueError("Unsupported --incremental_update_mode. Use geometry_gated_adapter / pg_rga.")
-#     return aliases[m]
+# def resolve_device(value: Any) -> str:
+#     token = str(value).strip().lower()
+#     if token == "gpu":
+#         token = "cuda"
+#     try:
+#         requested = torch.device(token)
+#     except (TypeError, RuntimeError, ValueError) as error:
+#         raise RuntimeError(
+#             f"Invalid device {value!r}; use cpu, cuda, or cuda:<index>"
+#         ) from error
+#     if requested.type == "cpu":
+#         return "cpu"
+#     if requested.type != "cuda":
+#         raise RuntimeError(f"Unsupported device type {requested.type!r}")
+#     if not torch.cuda.is_available():
+#         raise RuntimeError(f"device={value!r} requests CUDA, but CUDA is unavailable")
+#     count = int(torch.cuda.device_count())
+#     index = (
+#         int(torch.cuda.current_device())
+#         if requested.index is None
+#         else int(requested.index)
+#     )
+#     if index < 0 or index >= count:
+#         raise RuntimeError(
+#             f"Requested cuda:{index}, but only {count} device(s) are visible"
+#         )
+#     torch.cuda.set_device(index)
+#     return f"cuda:{index}"
 
 
-# # -----------------------------------------------------------------------------
-# # Parser and resolved configuration
-# # -----------------------------------------------------------------------------
+# def to_numpy(value: Any, *, dtype: Optional[np.dtype] = None) -> np.ndarray:
+#     if torch.is_tensor(value):
+#         array = value.detach().cpu().numpy()
+#     else:
+#         array = np.asarray(value)
+#     return np.asarray(array, dtype=dtype) if dtype is not None else np.asarray(array)
+
+
+# def _finite_float(value: Any, name: str) -> float:
+#     result = float(value)
+#     if not math.isfinite(result):
+#         raise ValueError(f"{name} must be finite")
+#     return result
+
+
+# def _class_name(target_names: Optional[Sequence[str]], class_id: int) -> str:
+#     if target_names is not None and 0 <= int(class_id) < len(target_names):
+#         return str(target_names[int(class_id)])
+#     return f"Class-{int(class_id)}"
+
+
+# # =============================================================================
+# # Configuration
+# # =============================================================================
 
 
 # def build_parser() -> argparse.ArgumentParser:
 #     parser = argparse.ArgumentParser(
-#         description="PG-RGA-HSI: low-rank GeometryBank descriptor-based exemplar-free HSI class-incremental classification",
+#         description=(
+#             "Strict non-exemplar HSI class-incremental learning with PC-STGB: "
+#             "low-rank occupancy geometry, occupancy-conditioned spectral tangents, "
+#             "coupled aggregate replay, and digest-protected atomic admission."
+#         ),
 #         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 #     )
 
-#     main = parser.add_argument_group("A. Core experiment")
-#     main.add_argument("--dataset", type=str, default="IP", choices=DATASET_INFO.keys())
-#     main.add_argument("--data_dir", type=str, default="./datasets")
-#     main.add_argument("--save_dir", type=str, default="./results_pg_rga")
-#     main.add_argument("--patch_size", type=int, default=11)
-#     main.add_argument("--train_ratio", type=float, default=0.2)
-#     main.add_argument("--val_ratio", type=float, default=0.1)
-#     main.add_argument("--min_train_per_class", type=int, default=20)
-#     main.add_argument("--no_pca", action="store_true")
-#     main.add_argument("--pca_components", type=int, default=30)
-#     main.add_argument("--reduction_method", type=str, default="PCA")
-#     main.add_argument("--base_classes", type=int, default=None)
-#     main.add_argument("--increment", type=int, default=None)
-#     main.add_argument("--epochs_base", type=int, default=80)
-#     main.add_argument("--epochs_inc", type=int, default=30)
-#     main.add_argument("--batch_size", type=int, default=64)
-#     main.add_argument("--lr", type=float, default=1e-4)
-#     main.add_argument("--lr_inc", type=float, default=1e-4)
-#     main.add_argument("--weight_decay", type=float, default=1e-4)
-#     main.add_argument("--seed", type=int, default=42)
-#     main.add_argument("--num_runs", type=int, default=1)
-#     main.add_argument("--seed_list", type=str, default="")
-#     main.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-#     main.add_argument("--num_workers", type=int, default=0)
-#     main.add_argument("--base_only", type=str2bool, default=False)
-#     main.add_argument("--max_train_phase", type=int, default=-1)
-#     main.add_argument("--max_phases", type=int, default=0)
+#     exp = parser.add_argument_group("A. Experiment and phase protocol")
+#     exp.add_argument("--dataset", type=str, default="IP", choices=sorted(DATASET_INFO))
+#     exp.add_argument("--data_dir", type=str, default="./datasets")
+#     exp.add_argument("--save_dir", type=str, default="./results_pc_stgb_v5")
+#     exp.add_argument("--patch_size", type=int, default=11)
+#     exp.add_argument("--train_ratio", type=float, default=0.20)
+#     exp.add_argument("--val_ratio", type=float, default=0.10)
+#     exp.add_argument("--min_train_per_class", type=int, default=20)
+#     exp.add_argument("--base_classes", type=int, default=6)
+#     exp.add_argument("--increment", type=int, default=3)
+#     exp.add_argument("--shuffle_order", type=str2bool, default=False)
+#     exp.add_argument("--class_order", type=str, default="")
+#     exp.add_argument("--epochs_base", type=int, default=80)
+#     exp.add_argument("--epochs_inc", type=int, default=20)
+#     exp.add_argument("--batch_size", type=int, default=64)
+#     exp.add_argument("--eval_batch_size", type=int, default=128)
+#     exp.add_argument("--lr", type=float, default=1e-4)
+#     exp.add_argument("--lr_inc", type=float, default=0.0)
+#     exp.add_argument("--weight_decay", type=float, default=1e-4)
+#     exp.add_argument("--base_only", type=str2bool, default=False)
+#     exp.add_argument("--disable_incremental_training", type=str2bool, default=False)
+#     exp.add_argument(
+#         "--max_phase",
+#         type=int,
+#         default=-1,
+#         help="-1 runs every protocol phase; otherwise stop after this phase index.",
+#     )
+#     exp.add_argument("--resume_checkpoint", type=str, default="")
+#     exp.add_argument("--seed", type=int, default=42)
+#     exp.add_argument("--num_runs", type=int, default=1)
+#     exp.add_argument("--seed_list", type=str, default="")
+#     exp.add_argument("--device", type=str, default="cuda:0")
+#     exp.add_argument("--num_workers", type=int, default=0)
+#     exp.add_argument("--deterministic", type=str2bool, default=False)
+#     exp.add_argument("--strict_non_exemplar", type=str2bool, default=True)
 
-#     model = parser.add_argument_group("B. Backbone and GeometryBank")
-#     model.add_argument("--d_model", type=int, default=128)
-#     model.add_argument("--d_state", type=int, default=16)
-#     model.add_argument("--d_conv", type=int, default=4)
-#     model.add_argument("--expand", type=int, default=2)
-#     model.add_argument("--num_spectral_layers", type=int, default=3)
-#     model.add_argument("--num_layers", type=int, default=3)
-#     model.add_argument("--dropout", type=float, default=0.1)
-#     model.add_argument("--projection_dropout", type=float, default=0.1)
-#     model.add_argument("--backbone_norm", type=str, default="layer", choices=["layer", "rms"])
-#     model.add_argument("--stem_norm_groups", type=int, default=8)
-#     model.add_argument("--ssm_residual_scale_init", type=float, default=0.7)
-#     model.add_argument("--fusion_residual_scale", type=float, default=0.3)
-#     model.add_argument("--backbone_output_dropout", type=float, default=0.0)
-#     model.add_argument("--subspace_rank", type=int, default=5)
-#     model.add_argument("--geom_var_floor", type=float, default=5e-4)
-#     model.add_argument("--geometry_variance_shrinkage", type=float, default=0.25)
-#     model.add_argument("--geometry_max_variance_ratio", type=float, default=50.0)
-#     model.add_argument("--geometry_min_reliability", type=float, default=0.05)
-#     model.add_argument("--rank_energy_threshold", type=float, default=0.90)
-#     model.add_argument("--rank_eigen_ratio_threshold", type=float, default=1e-2)
-#     model.add_argument("--min_active_rank", type=int, default=1)
-#     model.add_argument("--normalize_geometry_features", type=str2bool, default=True)
-#     model.add_argument("--geometry_feature_scale", type=float, default=0.0)
-#     model.add_argument("--geometry_feature_clamp", type=float, default=0.0)
-#     model.add_argument("--subspace_extract_batch_size", type=int, default=256)
+#     preprocessing = parser.add_argument_group("B. Leakage-safe preprocessing")
+#     preprocessing.add_argument("--no_pca", action="store_true")
+#     preprocessing.add_argument("--reduction_method", type=str, default="PCA")
+#     preprocessing.add_argument("--pca_components", type=int, default=30)
+#     preprocessing.add_argument("--preprocess_response_chunk_size", type=int, default=4096)
 
-#     base = parser.add_argument_group("C. Mandatory base objective")
+#     backbone = parser.add_argument_group("C. Frozen canonical representation")
+#     backbone.add_argument("--d_model", type=int, default=128)
+#     backbone.add_argument("--d_state", type=int, default=16)
+#     backbone.add_argument("--d_conv", type=int, default=4)
+#     backbone.add_argument("--expand", type=int, default=2)
+#     backbone.add_argument("--num_spectral_layers", type=int, default=3)
+#     backbone.add_argument("--num_layers", type=int, default=3)
+#     backbone.add_argument("--dropout", type=float, default=0.10)
+#     backbone.add_argument("--projection_dropout", type=float, default=0.10)
+#     backbone.add_argument("--backbone_norm", type=str, default="layer", choices=["layer", "rms"])
+#     backbone.add_argument("--stem_norm_groups", type=int, default=8)
+#     backbone.add_argument("--ssm_residual_scale_init", type=float, default=0.70)
+#     backbone.add_argument("--fusion_residual_scale", type=float, default=0.30)
+#     backbone.add_argument("--backbone_output_dropout", type=float, default=0.0)
+#     backbone.add_argument("--projection_residual_scale_init", type=float, default=0.10)
+#     backbone.add_argument("--zero_init_projection_output", type=str2bool, default=True)
+#     backbone.add_argument("--normalize_geometry_features", type=str2bool, default=False)
+#     backbone.add_argument("--geometry_feature_scale", type=float, default=1.0)
+#     backbone.add_argument("--geometry_feature_clamp", type=float, default=0.0)
+
+#     occupancy = parser.add_argument_group("D. Occupancy geometry")
+#     occupancy.add_argument("--subspace_rank", type=int, default=5)
+#     occupancy.add_argument("--geom_var_floor", type=float, default=5e-4)
+#     occupancy.add_argument("--geometry_variance_shrinkage", type=float, default=0.25)
+#     occupancy.add_argument("--geometry_max_variance_ratio", type=float, default=50.0)
+#     occupancy.add_argument("--geometry_min_reliability", type=float, default=0.05)
+#     occupancy.add_argument("--reliability_sample_alpha", type=float, default=20.0)
+#     occupancy.add_argument("--rank_energy_threshold", type=float, default=0.90)
+#     occupancy.add_argument("--rank_eigen_ratio_threshold", type=float, default=1e-2)
+#     occupancy.add_argument("--rank_noise_ratio_threshold", type=float, default=1.50)
+#     occupancy.add_argument("--min_active_rank", type=int, default=1)
+#     occupancy.add_argument("--small_class_rank_threshold_1", type=int, default=30)
+#     occupancy.add_argument("--small_class_rank_threshold_2", type=int, default=80)
+#     occupancy.add_argument("--small_class_rank_threshold_3", type=int, default=150)
+#     occupancy.add_argument("--small_class_rank_cap_1", type=int, default=1)
+#     occupancy.add_argument("--small_class_rank_cap_2", type=int, default=3)
+#     occupancy.add_argument("--small_class_rank_cap_3", type=int, default=4)
+#     occupancy.add_argument("--small_class_extra_shrinkage", type=float, default=0.35)
+#     occupancy.add_argument("--bootstrap_resamples", type=int, default=12)
+#     occupancy.add_argument("--bootstrap_min_samples", type=int, default=8)
+#     occupancy.add_argument("--bootstrap_max_samples", type=int, default=512)
+#     occupancy.add_argument("--energy_logdet_weight", type=float, default=1.0)
+#     occupancy.add_argument("--logit_scale", type=float, default=8.0)
+#     occupancy.add_argument("--invalid_class_energy", type=float, default=1e6)
+#     occupancy.add_argument("--geometry_logit_clip", type=float, default=0.0)
+
+#     tangent = parser.add_argument_group("E. Conditional spectral tangent geometry")
+#     tangent.add_argument("--num_spectral_interventions", type=int, default=2)
+#     tangent.add_argument("--spectral_response_rank", type=int, default=2)
+#     tangent.add_argument("--spectral_response_weight", type=float, default=0.20)
+#     tangent.add_argument("--spectral_response_variance_floor", type=float, default=5e-4)
+#     tangent.add_argument("--spectral_response_variance_shrinkage_tau", type=float, default=20.0)
+#     tangent.add_argument("--spectral_response_mean_shrinkage_tau", type=float, default=5.0)
+#     tangent.add_argument("--spectral_response_rank_energy_threshold", type=float, default=0.90)
+#     tangent.add_argument("--spectral_response_rank_eigen_ratio_threshold", type=float, default=1e-2)
+#     tangent.add_argument("--spectral_response_rank_noise_ratio_threshold", type=float, default=1.25)
+#     tangent.add_argument("--response_logdet_weight", type=float, default=1.0)
+#     tangent.add_argument("--spectral_tangent_coupling_ridge", type=float, default=1e-2)
+#     tangent.add_argument("--spectral_tangent_coupling_shrinkage_tau", type=float, default=20.0)
+#     tangent.add_argument("--spectral_tangent_coupling_max_norm", type=float, default=8.0)
+#     tangent.add_argument("--intervention_definition_version", type=int, default=1)
+#     tangent.add_argument("--spectral_gain_step", type=float, default=0.03)
+#     tangent.add_argument("--spectral_tilt_step", type=float, default=0.03)
+#     tangent.add_argument("--base_require_response_views", type=str2bool, default=True)
+
+#     base = parser.add_argument_group("F. Base representation objective")
 #     base.add_argument("--base_ce_weight", type=float, default=1.0)
-#     base.add_argument("--base_srpgr_weight", type=float, default=1.0)
-#     base.add_argument("--base_gics_weight", type=float, default=0.20)
-#     base.add_argument("--base_gics_temperature", type=float, default=0.07)
+#     base.add_argument("--pc_stgb_weight", type=float, default=0.10)
+#     base.add_argument("--pc_margin", type=float, default=0.30)
+#     base.add_argument("--pc_temperature", type=float, default=0.20)
+#     base.add_argument("--boundary_certificate_weight", type=float, default=0.05)
+#     base.add_argument("--boundary_certificate_margin", type=float, default=0.0)
+#     base.add_argument("--boundary_certificate_temperature", type=float, default=0.20)
+#     base.add_argument("--boundary_confidence_multiplier", type=float, default=1.0)
+#     base.add_argument("--tangent_consistency_weight", type=float, default=0.0)
+#     base.add_argument("--tangent_consistency_magnitude_weight", type=float, default=0.5)
+#     base.add_argument("--tangent_consistency_direction_weight", type=float, default=0.5)
+#     base.add_argument("--tangent_consistency_minimum_norm", type=float, default=1e-6)
 #     base.add_argument("--base_class_balance", type=str2bool, default=True)
-#     base.add_argument("--base_gics_key_noise_std", type=float, default=0.0)
-#     base.add_argument("--base_gics_key_scale_jitter", type=float, default=0.0)
-#     base.add_argument("--base_gics_key_band_drop", type=float, default=0.0)
-#     base.add_argument("--base_gics_key_spatial_drop", type=float, default=0.0)
-#     base.add_argument("--pgr_weight", type=float, default=0.10)
-#     base.add_argument("--pgr_compact_weight", type=float, default=0.15)
-#     base.add_argument("--pgr_center_weight", type=float, default=0.25)
-#     base.add_argument("--pgr_subspace_weight", type=float, default=0.15)
-#     base.add_argument("--pgr_band_weight", type=float, default=0.05)
-#     base.add_argument("--pgr_volume_weight", type=float, default=0.05)
-#     base.add_argument("--pgr_center_margin", type=float, default=1.10)
-#     base.add_argument("--pgr_band_overlap_max", type=float, default=0.65)
-#     base.add_argument("--pgr_max_subspace_overlap", type=float, default=0.55)
-#     base.add_argument("--pgr_min_class_variance", type=float, default=0.015)
-#     base.add_argument("--pgr_max_class_variance", type=float, default=0.75)
-#     base.add_argument("--pgr_min_class_samples", type=int, default=3)
-#     base.add_argument("--pgr_subspace_min_samples", type=int, default=6)
-#     base.add_argument("--pgr_subspace_rank", type=int, default=3)
-#     base.add_argument("--base_spectral_shape_weight", type=float, default=0.05)
-#     base.add_argument("--base_max_spectral_shape_similarity", type=float, default=0.75)
-#     base.add_argument("--base_spectral_shape_risk_weight", type=float, default=1.0)
-#     base.add_argument("--base_require_physical_spectral_shape", type=str2bool, default=False)
-#     base.add_argument("--strict_base_component_coverage", type=str2bool, default=True)
+#     base.add_argument("--base_use_geometry_balanced_sampler", type=str2bool, default=True)
+#     base.add_argument("--geometry_batch_classes", type=int, default=0)
+#     base.add_argument("--geometry_samples_per_class", type=int, default=16)
+#     base.add_argument("--base_min_samples_per_class_in_batch", type=int, default=16)
+#     base.add_argument("--label_smoothing", type=float, default=0.0)
+#     base.add_argument("--grad_clip_base", type=float, default=5.0)
+#     base.add_argument("--base_admission_enforce", type=str2bool, default=False)
+#     base.add_argument("--base_admission_min_oof_accuracy", type=float, default=0.0)
+#     base.add_argument("--base_admission_min_class_accuracy", type=float, default=0.0)
+#     base.add_argument("--base_admission_max_classification_violation", type=float, default=1.0)
+#     base.add_argument("--base_admission_max_certificate_violation", type=float, default=1.0)
+#     base.add_argument("--base_admission_max_invasion", type=float, default=1.0)
+#     base.add_argument("--base_admission_require_tangent_help", type=str2bool, default=False)
 
-#     inc = parser.add_argument_group("D. PG-RGA incremental objective")
-#     inc.add_argument("--incremental_update_mode", type=str, default="geometry_gated_adapter")
-#     inc.add_argument("--gfa_weight", type=float, default=1.0)
-#     inc.add_argument("--gfa_samples_per_class", type=int, default=48)
-#     inc.add_argument("--gfa_parallel_scale", type=float, default=1.0)
-#     inc.add_argument("--gfa_residual_scale", type=float, default=0.25)
-#     inc.add_argument("--joint_old_new_ce_weight", type=float, default=1.0)
-#     inc.add_argument("--geometry_energy_margin_weight", type=float, default=0.30)
-#     inc.add_argument("--geometry_energy_margin", type=float, default=0.30)
-#     inc.add_argument("--old_new_invasion_weight", type=float, default=0.50)
-#     inc.add_argument("--old_new_geometry_margin", type=float, default=0.35)
-#     inc.add_argument("--refine_new_descriptors", type=str2bool, default=True)
-#     inc.add_argument("--descriptor_refine_steps", type=int, default=20)
-#     inc.add_argument("--descriptor_refine_steps_per_epoch", type=int, default=None)
-#     inc.add_argument("--descriptor_refine_lr", type=float, default=1e-3)
-#     inc.add_argument("--descriptor_trust_weight", type=float, default=0.8)
-#     inc.add_argument("--descriptor_refine_max_mean_shift", type=float, default=0.30)
-#     inc.add_argument("--descriptor_refine_max_logvar_shift", type=float, default=0.50)
-#     inc.add_argument("--adapter_bottleneck", type=int, default=32)
-#     inc.add_argument("--adapter_max_scale", type=float, default=0.35)
-#     inc.add_argument("--adapter_dropout", type=float, default=0.0)
-#     inc.add_argument("--adapter_gate_bias_init", type=float, default=-3.0)
-#     inc.add_argument("--adapter_lr", type=float, default=5e-4)
-#     inc.add_argument("--adapter_weight_decay", type=float, default=0.0)
-#     inc.add_argument("--g2rpa_adapter_weight", type=float, default=1.0)
-#     inc.add_argument("--adapter_old_delta_weight", type=float, default=1.0)
-#     inc.add_argument("--adapter_old_gate_weight", type=float, default=0.75)
-#     inc.add_argument("--adapter_old_energy_weight", type=float, default=0.25)
-#     inc.add_argument("--adapter_old_margin_weight", type=float, default=0.25)
-#     inc.add_argument("--adapter_delta_weight", type=float, default=0.10)
-#     inc.add_argument("--adapter_new_gate_weight", type=float, default=0.05)
-#     inc.add_argument("--adapter_new_gate_target", type=float, default=0.25)
-#     inc.add_argument("--adapter_new_gate_max_target", type=float, default=0.75)
+#     inc = parser.add_argument_group("G. Incremental conditional admission")
+#     inc.add_argument("--descriptor_lr", type=float, default=1e-3)
+#     inc.add_argument("--incremental_steps_per_epoch", type=int, default=10)
+#     inc.add_argument("--incremental_crossfit_folds", type=int, default=3)
+#     inc.add_argument("--incremental_old_replay_samples_per_class", type=int, default=32)
+#     inc.add_argument("--incremental_replay_reliability_gated", type=str2bool, default=True)
+#     inc.add_argument("--incremental_margin", type=float, default=0.30)
+#     inc.add_argument("--incremental_temperature", type=float, default=0.20)
+#     inc.add_argument("--incremental_new_weight", type=float, default=1.0)
+#     inc.add_argument("--incremental_old_replay_weight", type=float, default=1.0)
+#     inc.add_argument("--incremental_crossfit_weight", type=float, default=1.0)
+#     inc.add_argument("--incremental_certificate_weight", type=float, default=0.10)
+#     inc.add_argument("--incremental_certificate_margin", type=float, default=0.0)
+#     inc.add_argument("--incremental_certificate_temperature", type=float, default=0.20)
+#     inc.add_argument("--incremental_certificate_kappa", type=float, default=1.0)
+#     inc.add_argument("--incremental_invasion_weight", type=float, default=1.0)
+#     inc.add_argument("--incremental_invasion_margin", type=float, default=0.30)
+#     inc.add_argument("--incremental_invasion_temperature", type=float, default=0.20)
+#     inc.add_argument("--incremental_trust_weight", type=float, default=0.05)
+#     inc.add_argument("--incremental_max_mean_shift", type=float, default=0.25)
+#     inc.add_argument("--incremental_max_log_eigval_shift", type=float, default=0.35)
+#     inc.add_argument("--incremental_max_log_residual_shift", type=float, default=0.35)
+#     inc.add_argument("--incremental_max_response_mean_shift", type=float, default=0.25)
+#     inc.add_argument("--incremental_max_response_log_eigval_shift", type=float, default=0.35)
+#     inc.add_argument("--incremental_max_response_log_residual_shift", type=float, default=0.35)
+#     inc.add_argument("--incremental_grad_clip", type=float, default=5.0)
+#     inc.add_argument("--incremental_admission_enforce", type=str2bool, default=False)
+#     inc.add_argument("--incremental_min_crossfit_accuracy", type=float, default=0.0)
+#     inc.add_argument("--incremental_min_crossfit_min_class_accuracy", type=float, default=0.0)
+#     inc.add_argument("--incremental_max_crossfit_classification_violation", type=float, default=1.0)
+#     inc.add_argument("--incremental_max_crossfit_certificate_violation", type=float, default=1.0)
+#     inc.add_argument("--incremental_min_old_new_harmonic_mean", type=float, default=0.0)
+#     inc.add_argument("--incremental_max_old_to_new_invasion", type=float, default=1.0)
+#     inc.add_argument("--incremental_max_new_to_old_invasion", type=float, default=1.0)
 
-#     clf = parser.add_argument_group("E. Geometry classifier/evaluation")
-#     clf.add_argument("--classifier_mode", type=str, default="geometry")
-#     clf.add_argument("--base_classifier_mode", type=str, default=None)
-#     clf.add_argument("--incremental_classifier_mode", type=str, default=None)
-#     clf.add_argument("--eval_classifier_mode", type=str, default="geometry")
-#     clf.add_argument("--logit_scale", type=float, default=8.0)
-#     clf.add_argument("--loss_scale", type=float, default=None)
-#     clf.add_argument("--residual_variance_scale", type=float, default=0.75)
-#     clf.add_argument("--energy_normalize_by_dim", type=str2bool, default=True)
-#     clf.add_argument("--use_logdet_energy", type=str2bool, default=True)
-#     clf.add_argument("--logdet_energy_weight", type=float, default=0.05)
-#     clf.add_argument("--use_reliability_penalty", type=str2bool, default=True)
-#     clf.add_argument("--reliability_energy_weight", type=float, default=0.03)
-#     clf.add_argument("--geometry_logit_clip", type=float, default=0.0)
-#     clf.add_argument("--best_state_metric", type=str, default="hm")
-#     clf.add_argument("--label_smoothing", type=float, default=0.0)
-#     clf.add_argument("--ce_logit_clip", type=float, default=50.0)
-#     clf.add_argument("--grad_clip_base", type=float, default=1.0)
-#     clf.add_argument("--grad_clip_inc", type=float, default=0.5)
-
-#     spec = parser.add_argument_group("F. HSI spectral metadata")
-#     spec.add_argument("--spectral_summary_mode", type=str, default="center", choices=["center", "mean"])
-#     spec.add_argument("--spectral_summary_is_physical", type=str2bool, default=False)
-#     spec.add_argument("--raw_spectral_summary_is_physical", type=str2bool, default=True)
-#     spec.add_argument("--external_spectra_are_physical", type=str2bool, default=True)
-#     spec.add_argument("--allow_nonphysical_spectral_summary", type=str2bool, default=False)
-#     spec.add_argument("--spectral_require_physical_summary", type=str2bool, default=True)
-#     spec.add_argument("--use_spectral_geometry", type=str2bool, default=True)
-#     spec.add_argument("--spectral_energy_weight", type=float, default=0.0)
-#     spec.add_argument("--spectral_derivative_weight", type=float, default=0.50)
-#     spec.add_argument("--spectral_second_derivative_weight", type=float, default=0.25)
-#     spec.add_argument("--band_energy_weight", type=float, default=0.0)
-
-#     safety = parser.add_argument_group("G. Safety, diagnostics, visualization")
-#     safety.add_argument("--strict_non_exemplar", type=str2bool, default=True)
-#     safety.add_argument("--strict_feature_contract", type=str2bool, default=True)
-#     safety.add_argument("--strict_updated_stack", type=str2bool, default=True)
-#     safety.add_argument("--freeze_projection_during_incremental", type=str2bool, default=True)
-#     safety.add_argument("--allow_incremental_projection_training", type=str2bool, default=False)
-#     safety.add_argument("--freeze_classifier_during_incremental", type=str2bool, default=True)
-#     safety.add_argument("--save_geometry_diagnostics", type=str2bool, default=True)
-#     safety.add_argument("--save_classification_report", type=str2bool, default=True)
-#     safety.add_argument("--save_final_classification_report", type=str2bool, default=True)
-#     safety.add_argument("--skip_phase_maps", type=str2bool, default=False)
-#     safety.add_argument("--viz_class_cmap", type=str, default="nipy_spectral")
-#     safety.add_argument("--viz_background_color", type=str, default="#20252B")
-#     safety.add_argument("--viz_save_numpy", type=str2bool, default=True)
-#     safety.add_argument("--deterministic", type=str2bool, default=False)
-#     safety.add_argument("--debug_verbose", type=str2bool, default=False)
-#     safety.add_argument("--refresh_before_validation", type=str2bool, default=True)
-#     safety.add_argument("--validation_refresh_every", type=int, default=1)
-#     safety.add_argument("--base_geometry_refresh_every", type=int, default=1)
-#     safety.add_argument("--print_base_geometry_diagnostics", type=str2bool, default=True)
-#     safety.add_argument("--geometry_diag_anchors_per_class", type=int, default=64)
-#     safety.add_argument("--geometry_diag_topk_pairs", type=int, default=20)
-#     safety.add_argument("--geometry_diag_topk_bands", type=int, default=5)
-#     safety.add_argument("--base_cert_min_geom_acc", type=float, default=95.0)
-#     safety.add_argument("--base_cert_min_reliability", type=float, default=0.15)
-#     safety.add_argument("--base_cert_min_mean_reliability", type=float, default=0.35)
-#     safety.add_argument("--base_cert_max_subspace_overlap", type=float, default=0.55)
-#     safety.add_argument("--base_cert_subspace_warn_overlap", type=float, default=0.72)
-#     safety.add_argument("--base_cert_max_geometry_conflict", type=float, default=1.35)
-#     safety.add_argument("--base_cert_max_geometry_conflict_soft", type=float, default=1.40)
-#     safety.add_argument("--base_cert_max_guided_geometry_conflict", type=float, default=0.18)
-#     safety.add_argument("--base_cert_max_band_similarity", type=float, default=0.90)
-#     safety.add_argument("--base_cert_max_spectral_shape_similarity", type=float, default=0.85)
-
-#     legacy = parser.add_argument_group("H. Legacy flags accepted but disabled")
-#     legacy.add_argument("--use_geometry_transport", type=str2bool, default=False)
-#     legacy.add_argument("--use_sglat_transport", type=str2bool, default=False)
-#     legacy.add_argument("--transport_mode", type=str, default="new_row_only")
-#     legacy.add_argument("--allow_old_model_transport", type=str2bool, default=False)
-#     legacy.add_argument("--allow_transport_without_adapter", type=str2bool, default=False)
-#     legacy.add_argument("--use_energy_calibrator", type=str2bool, default=False)
-#     legacy.add_argument("--energy_calibrator_type", type=str, default="none")
-#     legacy.add_argument("--energy_calibration_weight", type=float, default=0.0)
-#     legacy.add_argument("--use_adaptive_boundary", type=str2bool, default=False)
-#     legacy.add_argument("--use_incremental_adapter", type=str2bool, default=False)
-#     legacy.add_argument("--disable_incremental_adapter", type=str2bool, default=True)
-#     legacy.add_argument("--use_geometry_calibrator", type=str2bool, default=False)
-#     legacy.add_argument("--use_bicyc_geometry_cycle", type=str2bool, default=False)
-#     legacy.add_argument("--bss_weight", type=float, default=0.0)
-#     legacy.add_argument("--sym_bss_weight", type=float, default=0.0)
-#     legacy.add_argument("--gdr_weight", type=float, default=0.0)
-#     legacy.add_argument("--anchor_consistency_weight", type=float, default=0.0)
-#     legacy.add_argument("--use_mssl_loss", type=str2bool, default=False)
-#     legacy.add_argument("--unsafe_ablation_use_mssl_loss", type=str2bool, default=False)
-#     legacy.add_argument("--mssl_weight", type=float, default=0.0)
-#     legacy.add_argument("--mssl_inc_weight", type=float, default=0.0)
-#     legacy.add_argument("--bank_refresh_every", type=int, default=0)
-#     legacy.add_argument("--early_stop_patience", type=int, default=0)
-#     legacy.add_argument("--base_early_stop_patience", type=int, default=0)
-#     legacy.add_argument("--incremental_early_stop_patience", type=int, default=0)
-#     legacy.add_argument("--eval_semantic_mode", type=str, default="identity")
-#     legacy.add_argument("--use_pretrain_incremental_baseline", type=str2bool, default=False)
-#     legacy.add_argument("--allow_unknown_legacy_args", type=str2bool, default=False)
+#     runtime = parser.add_argument_group("H. Runtime identity and diagnostics")
+#     runtime.add_argument("--classifier_mode", type=str, default="pc_stgb")
+#     runtime.add_argument("--base_classifier_mode", type=str, default="base_ce")
+#     runtime.add_argument("--eval_classifier_mode", type=str, default="pc_stgb")
+#     runtime.add_argument("--incremental_update_mode", type=str, default="pc_stgb_row_replay")
+#     runtime.add_argument("--base_diagnostic_replay_samples_per_class", type=int, default=32)
+#     runtime.add_argument("--checkpoint_requires_dataset_state", type=str2bool, default=True)
+#     runtime.add_argument("--save_raw_arrays", type=str2bool, default=False)
+#     runtime.add_argument("--save_model_summary", type=str2bool, default=True)
+#     runtime.add_argument("--save_visualizations", type=str2bool, default=True)
+#     runtime.add_argument("--skip_phase_maps", type=str2bool, default=False)
+#     runtime.add_argument("--save_qualitative_all_labeled_map", type=str2bool, default=True)
+#     runtime.add_argument(
+#         "--qualitative_map_reload_from_source",
+#         type=str2bool,
+#         default=True,
+#         help=(
+#             "Reload the raw scene after each committed phase only for no-gradient "
+#             "qualitative map generation. Reloaded samples are never exposed to the "
+#             "trainer and are destroyed immediately after rendering."
+#         ),
+#     )
+#     runtime.add_argument("--visualization_dpi", type=int, default=300)
+#     runtime.add_argument("--visualization_batch_size", type=int, default=128)
+#     runtime.add_argument("--viz_class_cmap", type=str, default="nipy_spectral")
+#     runtime.add_argument("--viz_background_color", type=str, default="#20252B")
+#     runtime.add_argument("--debug_verbose", type=str2bool, default=False)
 
 #     return parser
 
 
-# def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-#     parser = build_parser()
-#     args, unknown = parser.parse_known_args(argv)
-#     args._unknown_args = unknown
-#     return args
+# def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+#     return build_parser().parse_args(argv)
 
 
-# def resolve_experiment_config(args: argparse.Namespace) -> Tuple[argparse.Namespace, List[Dict[str, Any]], Dict[str, Any]]:
-#     original = namespace_to_dict(args)
-#     resolved = argparse.Namespace(**copy.deepcopy(original))
-#     reasons: Dict[str, str] = {}
+# def resolve_config(args: argparse.Namespace) -> argparse.Namespace:
+#     resolved = argparse.Namespace(**namespace_to_dict(args))
+#     resolved.device = resolve_device(resolved.device)
+#     resolved.base_only = bool(resolved.base_only or resolved.disable_incremental_training)
+#     resolved.disable_incremental_training = bool(resolved.base_only)
+#     if resolved.base_only:
+#         resolved.epochs_inc = 0
 
-#     mode = normalize_incremental_update_mode(getattr(resolved, "incremental_update_mode", "geometry_gated_adapter"))
-#     _set_resolved(resolved, "incremental_update_mode", mode, reasons, "pg_rga_method_identity")
-#     _set_resolved(resolved, "use_geometry_gated_adapter", True, reasons, "pg_rga_adapter_required")
+#     # Model/classifier compatibility fields. They describe the same deployed
+#     # conditional joint score; no fallback classifier or calibration is enabled.
+#     resolved.loss_scale = float(resolved.logit_scale)
+#     resolved.energy_normalize_by_dim = True
+#     resolved.normalize_energy_by_dim = True
+#     resolved.use_logdet_energy = True
+#     resolved.logdet_energy_weight = float(resolved.energy_logdet_weight)
+#     resolved.ce_logit_clip = 0.0
+#     resolved.base_checkpoint_requires_dataset_state = bool(
+#         resolved.checkpoint_requires_dataset_state
+#     )
 
-#     base_mode = normalize_classifier_mode(getattr(resolved, "base_classifier_mode", None) or "geometry")
-#     inc_mode = normalize_classifier_mode(getattr(resolved, "incremental_classifier_mode", None) or "geometry")
-#     eval_mode = normalize_classifier_mode(getattr(resolved, "eval_classifier_mode", "geometry"))
-#     for key, value in {
-#         "classifier_mode": eval_mode,
-#         "base_classifier_mode": base_mode,
-#         "incremental_classifier_mode": inc_mode,
-#         "eval_classifier_mode": eval_mode,
-#     }.items():
-#         _set_resolved(resolved, key, value, reasons, "seen_local_geometry_classifier")
+#     # Temporary aliases consumed by older reporting hooks. The revised base
+#     # trainer prefers the PC-STGB names above.
+#     resolved.sgc_weight = float(resolved.pc_stgb_weight)
+#     resolved.sgc_margin = float(resolved.pc_margin)
+#     resolved.sgc_temperature = float(resolved.pc_temperature)
+#     resolved.sgc_boundary_weight = float(resolved.boundary_certificate_weight)
+#     resolved.sgc_boundary_margin = float(resolved.boundary_certificate_margin)
 
-#     forced_true = {
-#         "strict_non_exemplar": True,
-#         "strict_feature_contract": True,
-#         "strict_updated_stack": True,
-#         "freeze_projection_during_incremental": True,
-#         "freeze_classifier_during_incremental": True,
-#         "disable_incremental_adapter": True,
-#         "base_class_balance": True,
-#         "strict_base_component_coverage": True,
-#         "use_spectral_geometry": True,
-#     }
-#     for k, v in forced_true.items():
-#         _set_resolved(resolved, k, v, reasons, "pg_rga_contract")
-
-#     forced_false = {
-#         "allow_incremental_projection_training": False,
-#         "use_geometry_transport": False,
-#         "use_sglat_transport": False,
-#         "allow_old_model_transport": False,
-#         "allow_transport_without_adapter": False,
-#         "use_energy_calibrator": False,
-#         "use_adaptive_boundary": False,
-#         "use_incremental_adapter": False,
-#         "use_geometry_calibrator": False,
-#         "use_bicyc_geometry_cycle": False,
-#         "use_mssl_loss": False,
-#         "use_pretrain_incremental_baseline": False,
-#         "geometry_normalize_logits": False,
-#         "allow_nonphysical_spectral_summary": False,
-#     }
-#     for k, v in forced_false.items():
-#         _set_resolved(resolved, k, v, reasons, "legacy_or_ablation_disabled")
-
-#     forced_zero = [
-#         "energy_calibration_weight",
-#         "bss_weight",
-#         "sym_bss_weight",
-#         "gdr_weight",
-#         "anchor_consistency_weight",
-#         "mssl_weight",
-#         "mssl_inc_weight",
-#         "bank_refresh_every",
-#         "early_stop_patience",
-#         "base_early_stop_patience",
-#         "incremental_early_stop_patience",
-#         "spectral_energy_weight",
-#         "band_energy_weight",
-#     ]
-#     for k in forced_zero:
-#         _set_resolved(resolved, k, 0.0 if "weight" in k or "energy" in k else 0, reasons, "not_used_in_pg_rga_main_path")
-
-#     # Required non-zero base components.
-#     required_positive = {
-#         "base_ce_weight": 1.0,
-#         "base_srpgr_weight": 1.0,
-#         "base_gics_weight": 0.20,
-#         "pgr_weight": 0.10,
-#         "pgr_compact_weight": 0.15,
-#         "pgr_center_weight": 0.25,
-#         "pgr_subspace_weight": 0.15,
-#         "pgr_band_weight": 0.05,
-#         "pgr_volume_weight": 0.05,
-#         "pgr_max_subspace_overlap": 0.55,
-#         "pgr_min_class_variance": 0.015,
-#     }
-#     for k, fallback in required_positive.items():
-#         if float(getattr(resolved, k, fallback)) <= 0.0:
-#             _set_resolved(resolved, k, fallback, reasons, "mandatory_base_component")
-
-#     pca_active = (not bool(getattr(resolved, "no_pca", False))) and int(getattr(resolved, "pca_components", 0) or 0) > 0
-#     if pca_active:
-#         _set_resolved(resolved, "spectral_summary_is_physical", False, reasons, "pca_components_are_not_physical_wavelengths")
-#     if getattr(resolved, "descriptor_refine_steps_per_epoch", None) is None:
-#         _set_resolved(
-#             resolved,
-#             "descriptor_refine_steps_per_epoch",
-#             int(getattr(resolved, "descriptor_refine_steps", 20)),
-#             reasons,
-#             "default_filled",
-#         )
-#     if getattr(resolved, "loss_scale", None) is None:
-#         _set_resolved(resolved, "loss_scale", float(getattr(resolved, "logit_scale", 8.0)), reasons, "classifier_scale_alias")
-
-#     if bool(getattr(resolved, "base_only", False)):
-#         _set_resolved(resolved, "epochs_inc", 0, reasons, "base_only")
-#         _set_resolved(resolved, "lr_inc", 0.0, reasons, "base_only")
-#         _set_resolved(resolved, "best_state_metric", "geometry_score", reasons, "base_only")
-
-#     method_identity = build_method_identity(resolved)
-#     diff = compute_config_diff(original, namespace_to_dict(resolved), reasons)
-#     return resolved, diff, method_identity
-
-
-# def build_method_identity(args: argparse.Namespace) -> Dict[str, Any]:
-#     return {
-#         "method_name": "Low-Rank Geometry Replay and Residual Geometry Adaptation for HSI NECIL",
-#         "short_name": "LRGRR-HSI",
-#         "main_path": True,
-#         "incremental_update_mode": "geometry_gated_adapter",
-#         "base": {
-#             "temporary_ce_head": True,
-#             "mandatory_balanced_ce": True,
-#             "mandatory_gics": True,
-#             "mandatory_pgr": ["compact", "center", "subspace", "band", "volume"],
-#             "physical_spectral_shape_only_when_raw_spectra_exist": True,
-#             "geometry_bank_space": "canonical_projected_z",
-#             "base_handoff_certificate": True,
-#         },
-#         "incremental": {
-#             "frozen_backbone": True,
-#             "frozen_projection": True,
-#             "frozen_old_geometry_bank_rows": True,
-#             "new_class_geometry_insertion": True,
-#             "synthetic_old_geometry_replay": True,
-#             "geometry_plastic_adapter": True,
-#             "seen_local_geometry_classifier": True,
-#             "joint_old_new_ce": True,
-#             "old_new_energy_margin": True,
-#             "descriptor_refinement_new_rows_only": bool(getattr(args, "refine_new_descriptors", True)),
-#         },
-#         "forbidden": {
-#             "raw_exemplars": False,
-#             "stored_old_features": False,
-#             "kd_teacher": False,
-#             "centroid_classifier": False,
-#             "old_row_transport": False,
-#             "score_calibrator": False,
-#             "adaptive_boundary": False,
-#             "bicyc_cycle": False,
-#             "projection_plasticity": False,
-#         },
-#         "label_convention": {
-#             "dataset_labels": "global_class_ids",
-#             "geometry_bank_rows": "global_class_ids",
-#             "classifier_logits": "seen_local_column_order",
-#             "ce_targets": "seen_local_labels",
-#             "evaluation_predictions": "mapped_to_global_class_ids",
-#         },
-#     }
-
-
-# def validate_config(args: argparse.Namespace, *, num_classes: Optional[int] = None) -> None:
-#     unknown_args = list(getattr(args, "_unknown_args", []) or [])
-#     if unknown_args and not bool(getattr(args, "allow_unknown_legacy_args", False)):
-#         raise ValueError(
-#             "Unknown CLI arguments are not allowed in the PG-RGA main path because they can silently disable a required component: "
-#             + str(unknown_args)
-#             + ". Add the flag to main.py if it is part of the architecture, or remove it from the command."
-#         )
-#     if args.dataset not in DATASET_INFO:
-#         raise ValueError(f"Unknown dataset {args.dataset!r}.")
-#     if not bool(args.strict_non_exemplar):
-#         raise ValueError("PG-RGA requires --strict_non_exemplar true.")
-#     if int(args.patch_size) <= 0 or int(args.patch_size) % 2 == 0:
-#         raise ValueError("--patch_size must be a positive odd integer.")
-#     if float(args.train_ratio) <= 0 or float(args.val_ratio) < 0 or float(args.train_ratio) + float(args.val_ratio) >= 1.0:
-#         raise ValueError("Require 0 < train_ratio, 0 <= val_ratio, and train_ratio + val_ratio < 1.")
-#     if int(args.epochs_base) <= 0:
-#         raise ValueError("--epochs_base must be positive.")
-#     if int(args.epochs_inc) < 0:
-#         raise ValueError("--epochs_inc must be >= 0.")
-#     if int(args.batch_size) <= 0:
-#         raise ValueError("--batch_size must be positive.")
-#     if int(args.d_model) <= 0:
-#         raise ValueError("--d_model must be positive.")
-#     if int(args.subspace_rank) <= 0 or int(args.subspace_rank) >= int(args.d_model):
-#         raise ValueError("Require 0 < subspace_rank < d_model.")
-#     if not bool(args.no_pca) and int(args.pca_components) <= 0:
-#         raise ValueError("--pca_components must be positive unless --no_pca is used.")
-#     if float(args.geom_var_floor) <= 0:
-#         raise ValueError("--geom_var_floor must be > 0.")
-#     if normalize_incremental_update_mode(args.incremental_update_mode) != "geometry_gated_adapter":
-#         raise ValueError("PG-RGA requires incremental_update_mode=geometry_gated_adapter.")
-#     if bool(args.allow_incremental_projection_training) or not bool(args.freeze_projection_during_incremental):
-#         raise ValueError("Incremental projection training invalidates frozen GeometryBank coordinates.")
-#     forbidden_bool = [
+#     # Contradictory branches are fixed off so saved configuration files state
+#     # the actual architecture unambiguously.
+#     for name in (
+#         "use_incremental_adapter",
+#         "use_geometry_gated_adapter",
 #         "use_geometry_transport",
 #         "use_sglat_transport",
 #         "allow_old_model_transport",
 #         "use_energy_calibrator",
-#         "use_adaptive_boundary",
-#         "use_incremental_adapter",
 #         "use_geometry_calibrator",
-#         "use_bicyc_geometry_cycle",
-#         "use_mssl_loss",
-#     ]
-#     bad = [k for k in forbidden_bool if bool(getattr(args, k, False))]
-#     if bad:
-#         raise ValueError(f"These flags are not part of PG-RGA main path and must be false: {bad}")
-#     if bool(args.spectral_summary_is_physical) and (not bool(args.no_pca)) and int(args.pca_components) > 0:
-#         raise ValueError("PCA summaries cannot be marked physical.")
-#     for key in (
-#         "base_ce_weight", "base_srpgr_weight", "base_gics_weight",
-#         "pgr_weight", "pgr_compact_weight", "pgr_center_weight",
-#         "pgr_subspace_weight", "pgr_band_weight", "pgr_volume_weight",
-#         "pgr_max_subspace_overlap", "pgr_min_class_variance",
+#         "use_adaptive_boundary",
+#         "allow_incremental_projection_training",
+#         "use_raw_spectral_gaussian",
+#         "use_spectral_feature_coupling",
+#         "use_independent_geometry_replay",
+#         "use_independent_response_replay",
 #     ):
-#         if float(getattr(args, key)) <= 0.0:
-#             raise ValueError(f"{key} must be > 0 in mandatory base phase.")
-#     if not (0.0 < float(args.pgr_max_subspace_overlap) <= 1.0):
-#         raise ValueError("--pgr_max_subspace_overlap must be in (0, 1].")
-#     if not (0.0 < float(args.pgr_band_overlap_max) <= 1.0):
-#         raise ValueError("--pgr_band_overlap_max must be in (0, 1].")
-#     if float(args.pgr_min_class_variance) >= float(args.pgr_max_class_variance):
-#         raise ValueError("--pgr_min_class_variance must be smaller than --pgr_max_class_variance.")
-#     if float(args.base_cert_max_geometry_conflict) <= 0.0:
-#         raise ValueError("--base_cert_max_geometry_conflict must be > 0.")
-#     if float(args.base_cert_max_geometry_conflict_soft) < float(args.base_cert_max_geometry_conflict):
-#         raise ValueError("--base_cert_max_geometry_conflict_soft must be >= --base_cert_max_geometry_conflict.")
-#     if float(args.base_cert_max_guided_geometry_conflict) <= 0.0:
-#         raise ValueError("--base_cert_max_guided_geometry_conflict must be > 0.")
-#     if float(args.base_cert_subspace_warn_overlap) < float(args.base_cert_max_subspace_overlap):
-#         raise ValueError("--base_cert_subspace_warn_overlap must be >= --base_cert_max_subspace_overlap.")
-#     if float(args.adapter_max_scale) <= 0.0:
-#         raise ValueError("PG-RGA requires --adapter_max_scale > 0.")
-#     if num_classes is not None:
-#         if int(num_classes) != int(DATASET_INFO[args.dataset]["classes"]):
-#             raise ValueError(f"Loaded class count {num_classes} does not match DATASET_INFO[{args.dataset}]={DATASET_INFO[args.dataset]['classes']}.")
-#         if args.base_classes is not None and (int(args.base_classes) <= 0 or int(args.base_classes) >= int(num_classes)):
-#             raise ValueError(f"base_classes={args.base_classes} must be in [1,{num_classes - 1}].")
-#         if args.increment is not None and int(args.increment) <= 0:
-#             raise ValueError("--increment must be positive.")
-#     seeds = parse_seed_list(getattr(args, "seed_list", ""))
-#     if seeds is not None and len(seeds) != int(args.num_runs):
-#         raise ValueError(f"--seed_list has {len(seeds)} seeds but --num_runs={args.num_runs}.")
+#         setattr(resolved, name, False)
+#     return resolved
+
+
+# def validate_config(args: argparse.Namespace, num_classes: Optional[int] = None) -> None:
+#     if not bool(args.strict_non_exemplar):
+#         raise ValueError("strict_non_exemplar must be true")
+#     if str(args.incremental_update_mode).strip().lower().replace("-", "_") != "pc_stgb_row_replay":
+#         raise ValueError("incremental_update_mode must be pc_stgb_row_replay")
+#     if str(args.classifier_mode).strip().lower().replace("-", "_") != "pc_stgb":
+#         raise ValueError("classifier_mode must be pc_stgb")
+#     if str(args.eval_classifier_mode).strip().lower().replace("-", "_") != "pc_stgb":
+#         raise ValueError("eval_classifier_mode must be pc_stgb")
+#     if str(args.base_classifier_mode).strip().lower().replace("-", "_") != "base_ce":
+#         raise ValueError("base_classifier_mode must be base_ce")
+
+#     if int(args.patch_size) <= 0 or int(args.patch_size) % 2 == 0:
+#         raise ValueError("patch_size must be a positive odd integer")
+#     if not 0.0 < float(args.train_ratio) < 1.0:
+#         raise ValueError("train_ratio must be in (0,1)")
+#     if not 0.0 <= float(args.val_ratio) < 1.0:
+#         raise ValueError("val_ratio must be in [0,1)")
+#     if float(args.train_ratio) + float(args.val_ratio) >= 1.0:
+#         raise ValueError("train_ratio + val_ratio must be < 1")
+#     if int(args.epochs_base) <= 0 or int(args.batch_size) <= 0:
+#         raise ValueError("epochs_base and batch_size must be positive")
+#     if int(args.eval_batch_size) <= 0:
+#         raise ValueError("eval_batch_size must be positive")
+#     if int(args.epochs_inc) < 0:
+#         raise ValueError("epochs_inc must be non-negative")
+#     if float(args.lr) <= 0.0 or float(args.weight_decay) < 0.0:
+#         raise ValueError("lr must be positive and weight_decay non-negative")
+#     if not math.isfinite(float(args.lr_inc)):
+#         raise ValueError("lr_inc must be finite")
 #     if int(args.num_runs) <= 0:
-#         raise ValueError("--num_runs must be >= 1.")
+#         raise ValueError("num_runs must be positive")
+#     if int(args.max_phase) < -1:
+#         raise ValueError("max_phase must be -1 or a non-negative phase index")
 
+#     if int(args.d_model) <= 0 or not 0 < int(args.subspace_rank) < int(args.d_model):
+#         raise ValueError("Require d_model > 0 and 0 < subspace_rank < d_model")
+#     if bool(args.normalize_geometry_features):
+#         raise ValueError("normalize_geometry_features must be false")
+#     if abs(float(args.geometry_feature_scale) - 1.0) > 1e-12:
+#         raise ValueError("geometry_feature_scale must equal 1.0")
+#     if abs(float(args.geometry_feature_clamp)) > 1e-12:
+#         raise ValueError("geometry_feature_clamp must equal 0.0")
+#     if float(args.geom_var_floor) <= 0.0 or float(args.energy_logdet_weight) <= 0.0:
+#         raise ValueError("Geometry variance floor and log-volume weight must be positive")
+#     if abs(float(args.geometry_logit_clip)) > 1e-12:
+#         raise ValueError("geometry_logit_clip must equal zero")
 
-# def save_config_files(
-#     save_root: str,
-#     original: Dict[str, Any],
-#     resolved: argparse.Namespace,
-#     diff: List[Dict[str, Any]],
-#     method_identity: Dict[str, Any],
-# ) -> Dict[str, str]:
-#     os.makedirs(save_root, exist_ok=True)
-#     paths = {
-#         "config_original": save_json(os.path.join(save_root, "config_original.json"), original),
-#         "config_resolved": save_json(os.path.join(save_root, "config_resolved.json"), namespace_to_dict(resolved)),
-#         "config_diff": save_json(os.path.join(save_root, "config_diff.json"), diff),
-#         "method_identity": save_json(os.path.join(save_root, "method_identity.json"), method_identity),
-#     }
-#     if getattr(resolved, "_unknown_args", None):
-#         paths["unknown_args"] = save_json(os.path.join(save_root, "unknown_args.json"), {"unknown_args": list(resolved._unknown_args)})
-#     return paths
-
-
-# def print_config_summary(args: argparse.Namespace, diff: List[Dict[str, Any]], method_identity: Dict[str, Any]) -> None:
-#     print("[Method]", method_identity["method_name"])
-#     print(f"[Method] short_name={method_identity['short_name']} | incremental_update_mode={args.incremental_update_mode}")
-#     print(f"[Classifier] base={args.base_classifier_mode} | incremental={args.incremental_classifier_mode} | eval={args.eval_classifier_mode}")
-#     print(f"[Base] CE={args.base_ce_weight} | GICS={args.base_gics_weight} | PGR={args.pgr_weight} | class_balance={args.base_class_balance}")
-#     print(
-#         f"[Base Certificate] guided_conflict<={args.base_cert_max_guided_geometry_conflict} | "
-#         f"subspace_warn<={args.base_cert_subspace_warn_overlap} | "
-#         f"energy_conflict<={args.base_cert_max_geometry_conflict} "
-#         f"(soft<={args.base_cert_max_geometry_conflict_soft})"
+#     if int(args.num_spectral_interventions) != 2:
+#         raise ValueError(
+#             "intervention definition v1 contains exactly two physical directions: "
+#             "multiplicative gain and smooth wavelength tilt"
+#         )
+#     if int(args.intervention_definition_version) != 1:
+#         raise ValueError("intervention_definition_version must equal 1")
+#     if not 0 < int(args.spectral_response_rank) <= int(args.d_model):
+#         raise ValueError("spectral_response_rank must lie in [1,d_model]")
+#     positive_tangent = (
+#         "spectral_response_weight",
+#         "spectral_response_variance_floor",
+#         "response_logdet_weight",
+#         "spectral_tangent_coupling_ridge",
+#         "spectral_tangent_coupling_shrinkage_tau",
+#         "spectral_tangent_coupling_max_norm",
+#         "spectral_gain_step",
+#         "spectral_tilt_step",
 #     )
-#     print(f"[Incremental] replay/class={args.gfa_samples_per_class} | adapter_max_scale={args.adapter_max_scale} | old_new_margin={args.old_new_geometry_margin}")
-#     # print("[Forbidden OFF] transport=False | calibrator=False | adaptive_boundary=False | KD=False | raw_exemplars=False")
-#     if getattr(args, "_unknown_args", None):
-#         mode = "IGNORED BY USER OVERRIDE" if bool(getattr(args, "allow_unknown_legacy_args", False)) else "ERROR"
-#         print(f"[UNKNOWN ARGS {mode}] {args._unknown_args}")
-#     if diff:
-#         print("[Config Diff] resolved changes:")
-#         for row in diff[:40]:
-#             print(f"  - {row['name']}: {row['original']} -> {row['resolved']} ({row['reason']})")
-#         if len(diff) > 40:
-#             print(f"  ... {len(diff) - 40} more changes saved in config_diff.json")
+#     for name in positive_tangent:
+#         if _finite_float(getattr(args, name), name) <= 0.0:
+#             raise ValueError(f"{name} must be positive")
+#     if max(float(args.spectral_gain_step), float(args.spectral_tilt_step)) >= 0.25:
+#         raise ValueError("spectral intervention steps are too large for a local tangent")
+#     if not bool(args.base_require_response_views):
+#         raise ValueError("base_require_response_views must be true")
 
-
-# # -----------------------------------------------------------------------------
-# # Reproducibility and data loading
-# # -----------------------------------------------------------------------------
-
-
-# def set_seed(seed: int, deterministic: bool = False) -> None:
-#     random.seed(int(seed))
-#     np.random.seed(int(seed))
-#     torch.manual_seed(int(seed))
-#     if torch.cuda.is_available():
-#         torch.cuda.manual_seed_all(int(seed))
-#     if deterministic:
-#         torch.backends.cudnn.deterministic = True
-#         torch.backends.cudnn.benchmark = False
-#         try:
-#             torch.use_deterministic_algorithms(True, warn_only=True)
-#         except Exception:
-#             pass
-#     else:
-#         torch.backends.cudnn.benchmark = True
-
-
-# def load_hsi_dataset(args: argparse.Namespace) -> Dict[str, Any]:
-#     apply_reduction = (not bool(args.no_pca)) and str(args.reduction_method).lower() != "none"
-#     raw_hsi_physical = None
-#     label_policy = None
-#     try:
-#         load_out = LoadHSIData(
-#             method=args.dataset,
-#             base_dir=args.data_dir,
-#             apply_reduction=apply_reduction,
-#             n_components=args.pca_components,
-#             reduction_method=args.reduction_method,
-#             return_label_policy=True,
-#             return_raw_hsi=True,
+#     if float(args.base_ce_weight) <= 0.0:
+#         raise ValueError("base_ce_weight must be positive")
+#     if float(args.pc_stgb_weight) <= 0.0 or float(args.pc_temperature) <= 0.0:
+#         raise ValueError("pc_stgb_weight and pc_temperature must be positive")
+#     if float(args.pc_margin) < 0.0:
+#         raise ValueError("pc_margin must be non-negative")
+#     if float(args.boundary_certificate_weight) < 0.0:
+#         raise ValueError("boundary_certificate_weight must be non-negative")
+#     if float(args.boundary_certificate_margin) < 0.0:
+#         raise ValueError("boundary_certificate_margin must be non-negative")
+#     if float(args.boundary_certificate_temperature) <= 0.0:
+#         raise ValueError("boundary_certificate_temperature must be positive")
+#     if float(args.boundary_confidence_multiplier) < 0.0:
+#         raise ValueError("boundary_confidence_multiplier must be non-negative")
+#     if float(args.tangent_consistency_weight) != 0.0:
+#         raise ValueError(
+#             "The current IncrementalHSIDataset does not provide true h/2 intervention "
+#             "views. Keep tangent_consistency_weight=0 until those views are added; "
+#             "do not fabricate them by interpolation."
 #         )
-#         if len(load_out) == 7:
-#             hsi, gt, num_classes, target_names, has_bg, label_policy, raw_hsi_physical = load_out
-#         else:
-#             hsi, gt, num_classes, target_names, has_bg, label_policy = load_out
-#     except TypeError:
-#         hsi, gt, num_classes, target_names, has_bg = LoadHSIData(
-#             method=args.dataset,
-#             base_dir=args.data_dir,
-#             apply_reduction=apply_reduction,
-#             n_components=args.pca_components,
-#             reduction_method=args.reduction_method,
-#         )
+#     if int(args.geometry_samples_per_class) < 6 or int(args.geometry_samples_per_class) % 2:
+#         raise ValueError("geometry_samples_per_class must be even and at least 6")
+#     if int(args.base_min_samples_per_class_in_batch) < 6:
+#         raise ValueError("base_min_samples_per_class_in_batch must be at least 6")
+#     if int(args.geometry_batch_classes) == 1 or int(args.geometry_batch_classes) < 0:
+#         raise ValueError("geometry_batch_classes must be 0 or at least 2")
 
+#     if not bool(args.base_only):
+#         if float(args.descriptor_lr) <= 0.0:
+#             raise ValueError("descriptor_lr must be positive")
+#         if int(args.incremental_steps_per_epoch) <= 0 and int(args.epochs_inc) > 0:
+#             raise ValueError("incremental_steps_per_epoch must be positive")
+#         if int(args.incremental_crossfit_folds) < 2:
+#             raise ValueError("incremental_crossfit_folds must be at least 2")
+#         if int(args.incremental_old_replay_samples_per_class) <= 0:
+#             raise ValueError("incremental_old_replay_samples_per_class must be positive")
+#         for name in (
+#             "incremental_temperature",
+#             "incremental_certificate_temperature",
+#             "incremental_invasion_temperature",
+#             "incremental_grad_clip",
+#             "incremental_max_mean_shift",
+#             "incremental_max_log_eigval_shift",
+#             "incremental_max_log_residual_shift",
+#             "incremental_max_response_mean_shift",
+#             "incremental_max_response_log_eigval_shift",
+#             "incremental_max_response_log_residual_shift",
+#         ):
+#             if _finite_float(getattr(args, name), name) <= 0.0:
+#                 raise ValueError(f"{name} must be positive")
+#         for name in (
+#             "incremental_margin",
+#             "incremental_new_weight",
+#             "incremental_old_replay_weight",
+#             "incremental_crossfit_weight",
+#             "incremental_certificate_weight",
+#             "incremental_certificate_margin",
+#             "incremental_certificate_kappa",
+#             "incremental_invasion_weight",
+#             "incremental_invasion_margin",
+#             "incremental_trust_weight",
+#         ):
+#             if _finite_float(getattr(args, name), name) < 0.0:
+#                 raise ValueError(f"{name} must be non-negative")
+
+#     if int(args.preprocess_response_chunk_size) <= 0:
+#         raise ValueError("preprocess_response_chunk_size must be positive")
+#     if int(args.visualization_batch_size) <= 0:
+#         raise ValueError("visualization_batch_size must be positive")
+
+#     seeds = parse_seed_list(args.seed_list)
+#     if seeds is not None and len(seeds) != int(args.num_runs):
+#         raise ValueError("seed_list length must equal num_runs")
+#     if str(args.resume_checkpoint).strip() and int(args.num_runs) != 1:
+#         raise ValueError("resume_checkpoint is supported only when num_runs=1")
+
+#     if num_classes is not None:
+#         class_count = int(num_classes)
+#         if not 2 <= int(args.base_classes) <= class_count:
+#             raise ValueError(f"base_classes must lie in [2,{class_count}]")
+#         if int(args.increment) <= 0:
+#             raise ValueError("increment must be positive")
+#         if int(args.geometry_batch_classes) > int(args.base_classes):
+#             raise ValueError("geometry_batch_classes cannot exceed base_classes")
+#         order = parse_class_order(args.class_order)
+#         if order is not None and set(order) != set(range(class_count)):
+#             raise ValueError("class_order must be a complete sequential-class permutation")
+
+
+# # =============================================================================
+# # Data and strict non-exemplar ownership
+# # =============================================================================
+
+
+# def load_hsi_data(args: argparse.Namespace) -> Dict[str, Any]:
+#     raw_hsi, gt, num_classes, raw_target_names, has_background, label_policy = LoadRawHSIData(
+#         method=args.dataset,
+#         base_dir=args.data_dir,
+#     )
 #     validate_config(args, num_classes=int(num_classes))
+#     raw_hsi = np.asarray(raw_hsi, dtype=np.float32)
+#     raw_band_count = int(raw_hsi.shape[-1])
+#     gt = np.asarray(gt)
+#     index_labels, index_coords = ExtractLabeledPixelIndex(gt, label_policy=label_policy)
+#     protocol = IncrementalHSIDataset.build_protocol_plan(
+#         index_labels,
+#         base_classes=int(args.base_classes),
+#         increment=int(args.increment),
+#         train_ratio=float(args.train_ratio),
+#         val_ratio=float(args.val_ratio),
+#         min_train_per_class=int(args.min_train_per_class),
+#         seed=int(args.seed),
+#         shuffle_order=bool(args.shuffle_order),
+#         class_order=parse_class_order(args.class_order),
+#     )
 
-#     try:
-#         cube_out = ImageCubes(
-#             HSI=hsi,
-#             GT=gt,
-#             WS=args.patch_size,
-#             removeZeroLabels=True,
-#             has_background=has_bg,
-#             num_classes=num_classes,
-#             pytorch_format=True,
-#             label_policy=label_policy,
-#             return_center_spectra=True,
-#             raw_hsi_for_spectra=raw_hsi_physical,
-#         )
-#         if len(cube_out) == 4:
-#             patches, labels, coords, raw_center_spectra = cube_out
-#         else:
-#             patches, labels, coords = cube_out
-#             raw_center_spectra = None
-#     except TypeError:
-#         patches, labels, coords = ImageCubes(
-#             HSI=hsi,
-#             GT=gt,
-#             WS=args.patch_size,
-#             removeZeroLabels=True,
-#             has_background=has_bg,
-#             num_classes=num_classes,
-#             pytorch_format=True,
-#         )
-#         raw_center_spectra = None
+#     fit_mask = BuildPreprocessFitMask(
+#         gt.shape,
+#         index_coords,
+#         protocol["base_train_indices"],
+#         labels=protocol["remapped_labels"],
+#         allowed_classes=protocol["phase_to_classes"][0],
+#     )
+#     apply_reduction = (
+#         not bool(args.no_pca)
+#         and str(args.reduction_method).strip().lower() not in {"", "none", "identity"}
+#     )
+#     model_hsi, _, preprocessing_state = FitHSIPreprocessor(
+#         raw_hsi,
+#         fit_mask=fit_mask,
+#         apply_reduction=apply_reduction,
+#         reduction_method=str(args.reduction_method),
+#         n_components=int(args.pca_components),
+#         fit_scope="phase0_train_only",
+#     )
+#     preprocessing_path = SaveHSIPreprocessor(
+#         os.path.join(os.path.abspath(str(args.save_dir)), "preprocessing_state.npz"),
+#         preprocessing_state,
+#     )
 
-#     labels_np = labels.detach().cpu().numpy() if torch.is_tensor(labels) else np.asarray(labels)
-#     if np.any(labels_np < 0):
-#         raise RuntimeError("Dataset labels must be non-negative global class IDs after background removal.")
+#     patches, labels_from_cubes, coords = ImageCubes(
+#         model_hsi,
+#         gt,
+#         WS=int(args.patch_size),
+#         removeZeroLabels=True,
+#         has_background=bool(has_background),
+#         num_classes=int(num_classes),
+#         pytorch_format=True,
+#         label_policy=label_policy,
+#         return_center_spectra=False,
+#     )
+#     patches = np.ascontiguousarray(to_numpy(patches), dtype=np.float32)
+#     labels_from_cubes = np.ascontiguousarray(
+#         to_numpy(labels_from_cubes, dtype=np.int64).reshape(-1)
+#     )
+#     coords = np.ascontiguousarray(to_numpy(coords, dtype=np.int64))
+#     if not np.array_equal(labels_from_cubes, np.asarray(index_labels, dtype=np.int64)):
+#         raise RuntimeError("ImageCubes changed the labeled-pixel order")
+#     if not np.array_equal(coords, np.asarray(index_coords, dtype=np.int64)):
+#         raise RuntimeError("ImageCubes changed the coordinate order")
+
+#     positive_centers, negative_centers, step_sizes, intervention_metadata = (
+#         BuildPCSTGBInterventionCentersFromCube(
+#             raw_hsi,
+#             coords,
+#             preprocessing_state,
+#             gain_step=float(args.spectral_gain_step),
+#             tilt_step=float(args.spectral_tilt_step),
+#             chunk_size=int(args.preprocess_response_chunk_size),
+#             definition_version=int(args.intervention_definition_version),
+#         )
+#     )
+#     intervention_metadata = dict(intervention_metadata)
+#     intervention_metadata.update(
+#         {
+#             "method": METHOD_NAME,
+#             "spectral_object": "central_finite_difference_canonical_feature_tangent",
+#             "joint_factorization": JOINT_FACTORIZATION,
+#             "persistent_raw_spectra": False,
+#         }
+#     )
+
+#     raw_centers = np.ascontiguousarray(
+#         raw_hsi[coords[:, 0], coords[:, 1], :], dtype=np.float32
+#     )
+#     maximum_center_error = ValidatePCSTGBCenterAlignment(
+#         patches,
+#         raw_centers,
+#         preprocessing_state,
+#         tolerance=5e-4,
+#         chunk_size=int(args.preprocess_response_chunk_size),
+#     )
+#     del raw_centers, model_hsi, raw_hsi
+#     gc.collect()
 
 #     args.num_bands = int(patches.shape[1])
 #     args.max_classes = int(num_classes)
-#     args.raw_spectral_summary_is_physical = bool(raw_center_spectra is not None)
-
-#     dataset_summary = {
-#         "dataset": args.dataset,
-#         "name": DATASET_INFO[args.dataset]["name"],
-#         "expected_raw_bands": DATASET_INFO[args.dataset]["bands"],
-#         "used_channels": int(patches.shape[1]),
+#     args.raw_num_bands = int(raw_band_count)
+#     target_names = [
+#         str(raw_target_names[int(protocol["inv_label_map"][class_id])])
+#         for class_id in range(int(num_classes))
+#     ]
+#     summary = {
+#         "stack_build_id": STACK_BUILD_ID,
+#         "method": METHOD_NAME,
+#         "schema_version": BANK_SCHEMA_VERSION,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "dataset": str(args.dataset),
+#         "dataset_name": DATASET_INFO[str(args.dataset)]["name"],
+#         "num_classes": int(num_classes),
+#         "num_phases": int(protocol["num_phases"]),
+#         "phase_to_classes": protocol["phase_to_classes"],
+#         "class_order_input_ids": list(protocol["class_order"]),
+#         "labeled_samples": int(protocol["remapped_labels"].size),
+#         "base_train_samples": int(protocol["base_train_indices"].size),
+#         "raw_sensor_bands": int(raw_band_count),
+#         "model_input_channels": int(patches.shape[1]),
+#         "patch_size": int(args.patch_size),
 #         "pca_active": bool(apply_reduction),
-#         "pca_components": int(args.pca_components) if apply_reduction else 0,
-#         "num_classes": int(num_classes),
-#         "has_background": bool(has_bg),
-#         "labeled_samples": int(labels_np.size),
-#         "train_ratio": float(args.train_ratio),
-#         "val_ratio": float(args.val_ratio),
-#         "raw_physical_center_spectra_available": bool(raw_center_spectra is not None),
-#         "raw_center_spectra_shape": list(raw_center_spectra.shape) if raw_center_spectra is not None and hasattr(raw_center_spectra, "shape") else None,
-#         "label_policy": label_policy,
+#         "preprocessing_fit_scope": "phase0_train_only",
+#         "preprocessing_fit_pixel_count": int(np.asarray(fit_mask).sum()),
+#         "preprocessing_state_path": preprocessing_path,
+#         "intervention_metadata": intervention_metadata,
+#         "maximum_center_preprocessing_error": maximum_center_error,
+#         "persistent_memory": (
+#             "aggregate occupancy rows, occupancy-tangent coupling, conditional "
+#             "tangent residual rows, frozen global tangent prior, and row statistics"
+#         ),
+#         "strict_non_exemplar": True,
 #     }
-#     print("[Dataset]")
-#     print(f"  name={dataset_summary['name']} | classes={num_classes} | used_channels={patches.shape[1]} | PCA={apply_reduction}")
-#     print(f"  samples={dataset_summary['labeled_samples']} | raw_spectra={dataset_summary['raw_physical_center_spectra_available']}")
 #     return {
-#         "hsi": hsi,
 #         "gt": gt,
-#         "num_classes": int(num_classes),
-#         "target_names": list(target_names),
-#         "has_background": bool(has_bg),
-#         "label_policy": label_policy,
 #         "patches": patches,
-#         "labels": labels,
+#         "input_labels": labels_from_cubes,
 #         "coords": coords,
-#         "raw_center_spectra": raw_center_spectra,
-#         "summary": dataset_summary,
+#         "positive_centers": positive_centers,
+#         "negative_centers": negative_centers,
+#         "step_sizes": step_sizes,
+#         "protocol": protocol,
+#         "target_names": target_names,
+#         "raw_target_names": [str(value) for value in raw_target_names],
+#         "label_policy": dict(label_policy),
+#         "num_classes": int(num_classes),
+#         "summary": summary,
 #     }
 
 
-# def build_incremental_dataset(args: argparse.Namespace, data: Dict[str, Any]) -> IncrementalHSIDataset:
-#     if args.base_classes is None:
-#         args.base_classes = 6 if args.dataset in {"IP", "SA", "HC"} else max(2, data["num_classes"] // 2)
-#     if args.increment is None:
-#         remaining = max(1, data["num_classes"] - int(args.base_classes))
-#         args.increment = 3 if remaining >= 3 else 1
-#     validate_config(args, num_classes=data["num_classes"])
-
-#     kwargs = dict(
+# def build_dataset(
+#     args: argparse.Namespace, data: Mapping[str, Any]
+# ) -> IncrementalHSIDataset:
+#     dataset = IncrementalHSIDataset(
 #         patches=data["patches"],
-#         labels=data["labels"],
+#         labels=np.asarray(data["input_labels"], dtype=np.int64),
 #         coords=data["coords"],
-#         gt_shape=data["gt"].shape,
-#         GT=data["gt"].copy().astype(np.int64),
+#         gt_shape=tuple(np.asarray(data["gt"]).shape[:2]),
+#         GT=data["gt"],
 #         base_classes=int(args.base_classes),
 #         increment=int(args.increment),
 #         train_ratio=float(args.train_ratio),
 #         val_ratio=float(args.val_ratio),
 #         seed=int(args.seed),
-#         device=str(args.device),
+#         shuffle_order=bool(args.shuffle_order),
 #         min_train_per_class=int(args.min_train_per_class),
+#         num_workers=int(args.num_workers),
+#         device=str(args.device),
 #         strict_non_exemplar=bool(args.strict_non_exemplar),
+#         target_names=list(data["raw_target_names"]),
+#         label_policy=dict(data["label_policy"]),
+#         class_balanced_train_batches=bool(args.base_class_balance),
+#         strict_unique_balanced_batches=True,
+#         geometry_batch_classes=int(args.geometry_batch_classes),
+#         geometry_samples_per_class=int(args.geometry_samples_per_class),
+#         spectral_positive_centers=data["positive_centers"],
+#         spectral_negative_centers=data["negative_centers"],
+#         spectral_step_sizes=data["step_sizes"],
+#         intervention_metadata=data["summary"]["intervention_metadata"],
+#         require_response_views=True,
+#         purge_finalized_train_payload=True,
+#         protocol_plan=data["protocol"],
 #     )
-#     optional = {
-#         "num_workers": int(args.num_workers),
-#         "target_names": data["target_names"],
-#         "label_policy": data.get("label_policy"),
-#         "return_metadata": True,
-#         "include_metadata": True,
-#         "raw_spectra": data.get("raw_center_spectra"),
-#         "center_spectra": data.get("raw_center_spectra"),
-#         "spectra_are_physical": bool(data.get("raw_center_spectra") is not None and args.raw_spectral_summary_is_physical),
-#     }
-#     sig = inspect.signature(IncrementalHSIDataset.__init__)
-#     for k, v in optional.items():
-#         if k in sig.parameters:
-#             kwargs[k] = v
-#     dataset = IncrementalHSIDataset(**kwargs)
-#     validate_incremental_dataset(dataset, args, data["num_classes"])
-#     print_incremental_protocol(dataset)
+#     response_contract = dataset.get_response_contract()
+#     if not bool(response_contract.get("available", False)):
+#         raise RuntimeError("Dataset did not install paired PC-STGB intervention views")
+#     if int(response_contract.get("definition_version", -1)) != int(
+#         args.intervention_definition_version
+#     ):
+#         raise RuntimeError("Dataset/model intervention-definition version mismatch")
+#     if int(response_contract.get("num_interventions", -1)) != int(
+#         args.num_spectral_interventions
+#     ):
+#         raise RuntimeError("Dataset/model intervention-count mismatch")
 #     return dataset
 
 
-# def phase_to_classes_as_list(dataset: Any) -> List[List[int]]:
-#     if not hasattr(dataset, "phase_to_classes"):
-#         raise RuntimeError("Incremental dataset must expose phase_to_classes.")
-#     ptc = getattr(dataset, "phase_to_classes")
-#     if isinstance(ptc, dict):
-#         phases = sorted(int(k) for k in ptc.keys())
-#         expected = list(range(len(phases)))
-#         if phases != expected:
-#             raise RuntimeError(f"phase_to_classes keys must be contiguous 0..P-1, got {phases}")
-#         return [[int(c) for c in list(ptc[p])] for p in phases]
-#     if isinstance(ptc, (list, tuple)):
-#         return [[int(c) for c in list(v)] for v in ptc]
-#     raise RuntimeError(f"Unsupported phase_to_classes type: {type(ptc)}")
+# def release_external_sample_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+#     """Drop duplicate sample arrays after IncrementalHSIDataset takes ownership.
+
+#     IncrementalHSIDataset copies all arrays. Retaining the original arrays in
+#     ``main.py`` would leave a second, unpurged copy of old training patches and
+#     intervention centers after phase finalization, violating the strict physical
+#     non-exemplar contract even though dataset access control is correct.
+#     """
+#     retained = {
+#         "protocol": data.get("protocol"),
+#         "summary": data.get("summary"),
+#         "target_names": data.get("target_names"),
+#         "raw_target_names": data.get("raw_target_names"),
+#         "label_policy": data.get("label_policy"),
+#         "num_classes": data.get("num_classes"),
+#     }
+#     data.clear()
+#     gc.collect()
+#     return retained
 
 
-# def validate_incremental_dataset(dataset: Any, args: argparse.Namespace, num_classes: int) -> None:
-#     phases = phase_to_classes_as_list(dataset)
-#     if not phases:
-#         raise RuntimeError("phase_to_classes is empty.")
-#     all_classes: List[int] = []
-#     for p_idx, cls_list in enumerate(phases):
-#         if not cls_list:
-#             raise RuntimeError(f"Phase {p_idx} has no classes.")
-#         all_classes.extend(cls_list)
-#     if len(all_classes) != len(set(all_classes)):
-#         dup = sorted(c for c in set(all_classes) if all_classes.count(c) > 1)
-#         raise RuntimeError(f"A class appears in more than one phase: {dup}")
-#     expected = set(range(int(num_classes)))
-#     actual = set(all_classes)
-#     if actual != expected:
-#         raise RuntimeError(f"Phase classes must cover exactly 0..{num_classes - 1}; missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
-#     if hasattr(dataset, "assert_non_exemplar"):
-#         dataset.assert_non_exemplar()
-#     if not bool(args.strict_non_exemplar):
-#         raise RuntimeError("strict_non_exemplar must be true.")
-#     for a, b in [("train_indices", "val_indices"), ("train_indices", "test_indices"), ("val_indices", "test_indices")]:
-#         if hasattr(dataset, a) and hasattr(dataset, b):
-#             overlap = sorted(set(map(int, getattr(dataset, a))) & set(map(int, getattr(dataset, b))))
-#             if overlap:
-#                 raise RuntimeError(f"Dataset split leakage: {a} and {b} overlap. First overlaps={overlap[:20]}")
+# # =============================================================================
+# # Model construction and evaluation
+# # =============================================================================
 
 
-# def print_incremental_protocol(dataset: Any) -> None:
-#     print("[Incremental Protocol]")
-#     for p_idx, cls_list in enumerate(phase_to_classes_as_list(dataset)):
-#         print(f"  phase_{p_idx}_classes={list(map(int, cls_list))}")
-
-
-# def resolve_target_names(dataset: Any, raw_target_names: List[str]) -> List[str]:
-#     if hasattr(dataset, "inv_label_map"):
-#         names = []
-#         for sid in range(int(getattr(dataset, "num_classes", len(raw_target_names)))):
-#             input_label = int(dataset.inv_label_map[sid])
-#             names.append(raw_target_names[input_label] if input_label < len(raw_target_names) else f"Class {sid}")
-#         return names
-#     return list(raw_target_names)
-
-
-# # -----------------------------------------------------------------------------
-# # Model / trainer / evaluator
-# # -----------------------------------------------------------------------------
-
-
-# def build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-#     model = NECILModel(args).to(device)
-#     if int(getattr(model, "d_model", args.d_model)) != int(args.d_model):
-#         raise RuntimeError(f"model.d_model={getattr(model, 'd_model', None)} != args.d_model={args.d_model}")
-#     gb = getattr(model, "geometry_bank", None)
-#     if gb is None:
-#         raise RuntimeError("Model must expose geometry_bank.")
-#     bank_rank = getattr(gb, "rank", getattr(gb, "subspace_rank", None))
-#     if bank_rank is not None and int(bank_rank) != int(args.subspace_rank):
-#         raise RuntimeError(f"GeometryBank rank {bank_rank} != subspace_rank {args.subspace_rank}")
-#     if getattr(model, "classifier", None) is None:
-#         raise RuntimeError("Model must expose classifier.")
-#     for required in ("extract_projected_features", "get_subspace_bank"):
-#         if not hasattr(model, required):
-#             raise RuntimeError(f"Model missing required API: {required}")
-#     if hasattr(model, "incremental_update_mode"):
-#         model.incremental_update_mode = "geometry_gated_adapter"
-#     if hasattr(model, "use_geometry_gated_adapter"):
-#         model.use_geometry_gated_adapter = True
-#     if hasattr(model, "use_geometry_calibrator"):
-#         model.use_geometry_calibrator = False
-#     if hasattr(model, "use_incremental_adapter"):
-#         model.use_incremental_adapter = False
-#     print("[Model]")
-#     print(f"  feature_dim={args.d_model} | subspace_rank={args.subspace_rank} | classifier={type(model.classifier).__name__}")
-#     print("  incremental_plasticity=geometry_plastic_adapter | transport=False | calibrator=False")
+# def build_model(args: argparse.Namespace) -> NECILModel:
+#     model = NECILModel(args).to(torch.device(args.device))
+#     model.assert_architecture_contract()
+#     contract = model.feature_contract()
+#     expected = {
+#         "method": METHOD_NAME,
+#         "geometry_bank_schema_version": BANK_SCHEMA_VERSION,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "classifier_contract": "dimension_normalized_conditional_joint_energy",
+#         "inference_geometry": "occupancy_conditioned_spectral_tangent_geometry",
+#         "occupancy_tangent_coupling": True,
+#         "independent_response_factorization": False,
+#         "raw_spectral_gaussian": False,
+#     }
+#     bad = {
+#         key: (contract.get(key), value)
+#         for key, value in expected.items()
+#         if contract.get(key) != value
+#     }
+#     if bad:
+#         raise RuntimeError(f"Model architecture contract mismatch: {bad}")
+#     classifier_contract = model.classifier.classifier_contract()
+#     if not bool(classifier_contract.get("uses_coupling_inference_score", False)):
+#         raise RuntimeError("Classifier does not use occupancy-tangent coupling")
 #     return model
 
 
-# def _canonical_method_value(name: str, value: Any) -> Any:
-#     """Canonicalize semantically equivalent method values for identity checks."""
-#     if name in {"base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode", "classifier_mode"}:
-#         return normalize_classifier_mode(value)
-#     if name == "incremental_update_mode":
-#         return normalize_incremental_update_mode(value)
-#     if name == "use_geometry_gated_adapter":
-#         return bool(value)
-#     return value
+# def _batch_tensor(batch: Mapping[str, Any], names: Sequence[str], name: str) -> torch.Tensor:
+#     for key in names:
+#         value = batch.get(key)
+#         if torch.is_tensor(value):
+#             return value
+#     raise RuntimeError(f"Evaluation batch is missing {name}")
 
 
-# def build_trainer(model: torch.nn.Module, dataset: Any, args: argparse.Namespace, run_dir: str) -> Trainer:
-#     before = namespace_to_dict(args)
-#     trainer = Trainer(model, dataset, args)
-#     after = namespace_to_dict(args)
-#     diff = compute_config_diff(before, after, {})
-#     save_json(os.path.join(run_dir, "config_diff_after_trainer.json"), diff)
-#     critical = {"incremental_update_mode", "base_classifier_mode", "incremental_classifier_mode", "eval_classifier_mode", "use_geometry_gated_adapter"}
-#     changed_critical = []
-#     for d in diff:
-#         name = d["name"]
-#         if name not in critical:
-#             continue
-#         before_v = _canonical_method_value(name, d.get("original"))
-#         after_v = _canonical_method_value(name, d.get("resolved"))
-#         if before_v != after_v:
-#             changed_critical.append(d)
-#     if changed_critical:
-#         raise RuntimeError(f"Trainer changed method identity after construction: {changed_critical}")
-#     if hasattr(trainer, "assert_method_identity"):
-#         trainer.assert_method_identity()
-#     return trainer
-
-
-# def build_evaluator() -> NECILEvaluator:
-#     return NECILEvaluator()
-
-
-# # -----------------------------------------------------------------------------
-# # Phase metadata and evaluation
-# # -----------------------------------------------------------------------------
-
-
-# def get_phase_info(dataset: Any, phase: int) -> Dict[str, Any]:
-#     phase = int(phase)
-#     if hasattr(dataset, "get_phase_info"):
-#         info = dataset.get_phase_info(phase)
-#         if isinstance(info, dict):
-#             old_classes = [int(c) for c in info.get("old_classes", [])]
-#             new_classes = [int(c) for c in info.get("new_classes", [])]
-#             seen_classes = [int(c) for c in info.get("seen_classes", old_classes + new_classes)]
-#             if not seen_classes:
-#                 seen_classes = old_classes + new_classes
-#             if len(seen_classes) != len(set(seen_classes)):
-#                 raise RuntimeError(f"Duplicate class in dataset.get_phase_info({phase}) seen_classes={seen_classes}")
-#             return {
-#                 "phase": int(info.get("phase", phase)),
-#                 "old_classes": old_classes,
-#                 "new_classes": new_classes,
-#                 "seen_classes": seen_classes,
-#                 "old_class_count": int(info.get("old_class_count", len(old_classes))),
-#             }
-
-#     phases = phase_to_classes_as_list(dataset)
-#     if phase < 0 or phase >= len(phases):
-#         raise RuntimeError(f"Invalid phase {phase}; available phases are 0..{len(phases) - 1}.")
-#     new_classes = [int(c) for c in phases[phase]]
-#     old_classes: List[int] = []
-#     for p_idx in range(phase):
-#         old_classes.extend(int(c) for c in phases[p_idx])
-#     old_classes = sorted(set(old_classes))
-#     seen_classes = old_classes + new_classes
-#     if len(seen_classes) != len(set(seen_classes)):
-#         raise RuntimeError(f"Duplicate class in seen_classes at phase {phase}: {seen_classes}")
-#     return {"phase": phase, "old_classes": old_classes, "new_classes": new_classes, "seen_classes": seen_classes, "old_class_count": len(old_classes)}
-
-
-# def set_model_phase(model: torch.nn.Module, phase_info: Dict[str, Any]) -> None:
-#     phase = int(phase_info["phase"])
-#     old_count = int(len(phase_info.get("old_classes", [])))
-#     if hasattr(model, "set_phase"):
-#         model.set_phase(phase)
-#     else:
-#         model.current_phase = phase
-#     if hasattr(model, "set_old_class_count"):
-#         model.set_old_class_count(old_count)
-#     else:
-#         model.old_class_count = old_count
-
-
-# def unpack_eval_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Any]:
-#     if isinstance(batch, dict):
-#         patches = batch.get("image", batch.get("patch", batch.get("patches", None)))
-#         labels = batch.get("label", batch.get("labels", None))
-#         spectra = batch.get("spectrum", batch.get("spectra", None))
-#         coords = batch.get("coord", batch.get("coords", None))
-#         if patches is None or labels is None:
-#             raise RuntimeError(f"Unsupported eval batch dict keys: {list(batch.keys())}")
-#         return patches, labels, spectra, coords
-#     if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-#         spectra = batch[2] if len(batch) >= 3 else None
-#         coords = batch[3] if len(batch) >= 4 else None
-#         return batch[0], batch[1], spectra, coords
-#     raise RuntimeError(f"Unsupported eval batch type: {type(batch)}")
-
-
-# def prepare_eval_spectra(patches: torch.Tensor, spectra: Optional[torch.Tensor], args: argparse.Namespace) -> Tuple[Optional[torch.Tensor], bool, Dict[str, Any]]:
-#     if torch.is_tensor(spectra) and spectra.numel() > 0:
-#         s = spectra.to(device=patches.device, dtype=patches.dtype)
-#         if s.dim() == 4:
-#             s = s[:, :, s.size(-2) // 2, s.size(-1) // 2]
-#         elif s.dim() == 3:
-#             if s.size(0) == patches.size(0) and s.size(1) > 0 and s.size(2) > 1:
-#                 s = s[:, :, s.size(-1) // 2]
-#             else:
-#                 s = s.reshape(patches.size(0), -1)
-#         elif s.dim() == 1:
-#             if s.numel() % max(int(patches.size(0)), 1) != 0:
-#                 raise RuntimeError("1-D spectra cannot be reshaped to batch.")
-#             s = s.reshape(patches.size(0), -1)
-#         elif s.dim() != 2:
-#             s = s.reshape(patches.size(0), -1)
-#         if s.size(0) != patches.size(0):
-#             raise RuntimeError("Spectral metadata batch mismatch during evaluation.")
-#         physical = bool(args.raw_spectral_summary_is_physical)
-#         source = "batch_metadata"
-#     else:
-#         s = None
-#         physical = False
-#         source = "none"
-#     pca_active = (not bool(args.no_pca)) and int(args.pca_components) > 0
-#     if pca_active and s is not None and s.size(1) <= int(args.pca_components):
-#         physical = False
-#     return s, bool(physical), {"source": source, "physical": bool(physical), "pca_active": bool(pca_active), "spectral_dim": int(s.size(1)) if s is not None else 0}
-
-
-# def forward_eval_batch(model: torch.nn.Module, patches: torch.Tensor, spectra: Optional[torch.Tensor], args: argparse.Namespace, seen_classes: List[int]) -> Dict[str, Any]:
-#     spectral_summary, spectral_is_physical, spec_diag = prepare_eval_spectra(patches, spectra, args)
-#     kwargs = dict(
-#         seen_classes=[int(c) for c in seen_classes],
-#         classifier_mode=normalize_classifier_mode(args.eval_classifier_mode),
-#         return_energy=True,
-#         spectral_summary=spectral_summary,
-#         spectral_summary_is_physical=bool(spectral_is_physical),
+# def _joint_batch(
+#     batch: Any, device: torch.device
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#     if not isinstance(batch, Mapping):
+#         raise RuntimeError("PC-STGB evaluation requires mapping batches")
+#     x = _batch_tensor(batch, ("image", "patch", "patches"), "image")
+#     labels = _batch_tensor(batch, ("label", "labels", "target"), "label")
+#     positive = _batch_tensor(
+#         batch,
+#         ("spectral_positive_patches", "positive_intervention_patches"),
+#         "positive intervention views",
 #     )
-#     try:
-#         out = model(patches, **kwargs)
-#     except TypeError:
-#         kwargs.pop("spectral_summary", None)
-#         kwargs.pop("spectral_summary_is_physical", None)
-#         out = model(patches, **kwargs)
-#     if not isinstance(out, dict):
-#         out = {"logits": out}
-#     out["spectral_diagnostics"] = spec_diag
-#     return out
+#     negative = _batch_tensor(
+#         batch,
+#         ("spectral_negative_patches", "negative_intervention_patches"),
+#         "negative intervention views",
+#     )
+#     steps = _batch_tensor(
+#         batch,
+#         ("spectral_step_sizes", "intervention_step_sizes"),
+#         "intervention step sizes",
+#     )
+#     return (
+#         x.to(device=device, dtype=torch.float32, non_blocking=True),
+#         labels.to(device=device, dtype=torch.long, non_blocking=True).flatten(),
+#         positive.to(device=device, dtype=torch.float32, non_blocking=True),
+#         negative.to(device=device, dtype=torch.float32, non_blocking=True),
+#         steps.to(device=device, dtype=torch.float32, non_blocking=True),
+#     )
 
 
-# def logits_to_global_predictions(logits: torch.Tensor, seen_classes: Iterable[int]) -> torch.Tensor:
-#     seen = torch.as_tensor([int(c) for c in seen_classes], device=logits.device, dtype=torch.long)
-#     if logits.dim() != 2:
-#         raise RuntimeError(f"logits must be [B,C], got {tuple(logits.shape)}")
-#     if logits.size(1) == seen.numel():
-#         pred_local = logits.argmax(dim=1)
-#         return seen[pred_local]
-#     if seen.numel() > 0 and int(seen.max().item()) < logits.size(1):
-#         logits_seen = logits.index_select(1, seen)
-#         pred_local = logits_seen.argmax(dim=1)
-#         return seen[pred_local]
-#     raise RuntimeError(f"Cannot map logits width={logits.size(1)} to seen_classes={seen.detach().cpu().tolist()}")
+# def _seen_classes(dataset: IncrementalHSIDataset, phase: int) -> List[int]:
+#     if hasattr(dataset, "get_seen_classes"):
+#         return [int(value) for value in dataset.get_seen_classes(int(phase))]
+#     values: List[int] = []
+#     for index in range(int(phase) + 1):
+#         values.extend(int(value) for value in dataset.phase_to_classes[index])
+#     return values
+
+
+# def _phase_classes(dataset: IncrementalHSIDataset, phase: int) -> List[int]:
+#     return [int(value) for value in dataset.phase_to_classes[int(phase)]]
 
 
 # @torch.no_grad()
-# def get_phase_predictions(
-#     model: torch.nn.Module,
-#     dataset: Any,
-#     phase_info: Dict[str, Any],
-#     device: torch.device,
-#     args: argparse.Namespace,
+# def evaluate_phase_geometry(
+#     model: NECILModel,
+#     dataset: IncrementalHSIDataset,
+#     phase: int,
+#     *,
 #     batch_size: int,
-# ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+#     device: torch.device,
+#     split: str = "test",
+# ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, torch.Tensor]:
+#     phase = int(phase)
+#     seen_classes = _seen_classes(dataset, phase)
+#     new_classes = _phase_classes(dataset, phase)
+#     old_classes = seen_classes[: len(seen_classes) - len(new_classes)]
+#     loader = dataset.get_cumulative_dataloader(
+#         phase,
+#         split=str(split),
+#         batch_size=int(batch_size),
+#         shuffle=False,
+#     )
+
+#     joint_parts: List[torch.Tensor] = []
+#     occupancy_parts: List[torch.Tensor] = []
+#     tangent_parts: List[torch.Tensor] = []
+#     labels_parts: List[torch.Tensor] = []
 #     model.eval()
-#     set_model_phase(model, phase_info)
-#     phase = int(phase_info["phase"])
-#     seen_classes = [int(c) for c in phase_info["seen_classes"]]
-#     loader = dataset.get_cumulative_dataloader(phase, split="test", batch_size=batch_size, shuffle=False)
-#     preds: List[np.ndarray] = []
-#     labels_all: List[np.ndarray] = []
-#     pred_hist: Dict[int, int] = {}
 #     for batch in loader:
-#         patches, labels, spectra, _ = unpack_eval_batch(batch)
-#         patches = patches.to(device, non_blocking=True).float()
-#         if torch.is_tensor(spectra):
-#             spectra = spectra.to(device, non_blocking=True)
-#         labels_t = labels.to(device).long().view(-1) if torch.is_tensor(labels) else torch.as_tensor(labels, device=device).long().view(-1)
-#         if not set(labels_t.detach().cpu().tolist()).issubset(set(seen_classes)):
-#             bad = sorted(set(labels_t.detach().cpu().tolist()) - set(seen_classes))
-#             raise RuntimeError(f"Evaluation labels outside seen classes at phase {phase}: {bad}")
-#         out = forward_eval_batch(model, patches, spectra, args, seen_classes)
-#         pred_global = logits_to_global_predictions(out["logits"], seen_classes)
-#         if not set(pred_global.detach().cpu().tolist()).issubset(set(seen_classes)):
-#             raise RuntimeError("Evaluation produced unseen predictions after seen-class mapping.")
-#         for p in pred_global.detach().cpu().tolist():
-#             pred_hist[int(p)] = pred_hist.get(int(p), 0) + 1
-#         preds.append(pred_global.detach().cpu().numpy())
-#         labels_all.append(labels_t.detach().cpu().numpy())
-#     if not preds:
-#         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), {"prediction_histogram": {}}
-#     return np.concatenate(preds), np.concatenate(labels_all), {"prediction_histogram": pred_hist}
+#         x, labels, positive, negative, steps = _joint_batch(batch, device)
+#         joint_tuple = model.extract_joint_geometry_tuple(
+#             x,
+#             positive,
+#             negative,
+#             step_sizes=steps,
+#             deterministic=True,
+#             return_view_features=False,
+#         )
+#         if joint_tuple.get("joint_factorization") != JOINT_FACTORIZATION:
+#             raise RuntimeError("Model returned the wrong joint tuple factorization")
+#         scored = model.compute_logits_from_features(
+#             joint_tuple["features"],
+#             spectral_responses=joint_tuple["spectral_responses"],
+#             seen_classes=seen_classes,
+#             mode="pc_stgb",
+#             return_energy=True,
+#             return_parts=True,
+#         )
+#         if scored.get("joint_factorization") != JOINT_FACTORIZATION:
+#             raise RuntimeError("Classifier returned the wrong joint factorization")
+#         if not bool(scored.get("uses_coupling_inference_score", False)):
+#             raise RuntimeError("Evaluation score does not use occupancy-tangent coupling")
+#         joint_parts.append(scored["joint_energy"].detach().cpu())
+#         occupancy_parts.append(scored["occupancy_energy"].detach().cpu())
+#         tangent_parts.append(scored["conditional_tangent_energy"].detach().cpu())
+#         labels_parts.append(labels.detach().cpu())
+
+#     if not joint_parts:
+#         raise RuntimeError(f"Phase {phase} {split} loader is empty")
+#     joint = torch.cat(joint_parts, dim=0)
+#     occupancy = torch.cat(occupancy_parts, dim=0)
+#     tangent = torch.cat(tangent_parts, dim=0)
+#     labels = torch.cat(labels_parts, dim=0)
+
+#     class_ids = list(seen_classes)
+#     local_map = {class_id: column for column, class_id in enumerate(class_ids)}
+#     try:
+#         local = torch.tensor(
+#             [local_map[int(value)] for value in labels.tolist()], dtype=torch.long
+#         )
+#     except KeyError as error:
+#         raise RuntimeError(f"Evaluation labels contain an unseen class: {error}") from error
+
+#     joint_pred_local = joint.argmin(dim=1)
+#     occupancy_pred_local = occupancy.argmin(dim=1)
+#     tangent_pred_local = tangent.argmin(dim=1)
+#     class_tensor = torch.tensor(class_ids, dtype=torch.long)
+#     joint_pred = class_tensor.index_select(0, joint_pred_local)
+
+#     true_energy = joint.gather(1, local[:, None]).squeeze(1)
+#     rivals = joint.clone()
+#     rivals.scatter_(1, local[:, None], float("inf"))
+#     gaps = rivals.min(dim=1).values - true_energy
+#     correct = joint_pred.eq(labels)
+#     occupancy_correct = occupancy_pred_local.eq(local)
+#     tangent_correct = tangent_pred_local.eq(local)
+
+#     class_count = len(class_ids)
+#     confusion = torch.zeros((class_count, class_count), dtype=torch.long)
+#     for true_id, pred_id in zip(local.tolist(), joint_pred_local.tolist()):
+#         confusion[true_id, pred_id] += 1
+#     support = confusion.sum(1).double()
+#     predicted = confusion.sum(0).double()
+#     true_positive = confusion.diag().double()
+#     precision = torch.where(
+#         predicted > 0, true_positive / predicted, torch.zeros_like(true_positive)
+#     )
+#     recall = torch.where(
+#         support > 0, true_positive / support, torch.zeros_like(true_positive)
+#     )
+#     f1 = torch.where(
+#         precision + recall > 0,
+#         2 * precision * recall / (precision + recall),
+#         torch.zeros_like(precision),
+#     )
+
+#     invasion = torch.zeros((class_count, class_count), dtype=torch.float32)
+#     per_class: Dict[int, Dict[str, Any]] = {}
+#     for local_id, class_id in enumerate(class_ids):
+#         mask = local.eq(local_id)
+#         class_gaps = gaps[mask]
+#         for rival_id in range(class_count):
+#             if rival_id != local_id:
+#                 invasion[local_id, rival_id] = (
+#                     joint[mask, rival_id] <= joint[mask, local_id]
+#                 ).float().mean()
+#         per_class[class_id] = {
+#             "class_id": int(class_id),
+#             "class_name": _class_name(dataset.target_names, class_id),
+#             "phase_created": int(dataset.class_to_phase[class_id]),
+#             "support": int(mask.sum().item()),
+#             "correct": int(correct[mask].sum().item()),
+#             "accuracy": 100.0 * float(correct[mask].float().mean().item()),
+#             "precision": float(precision[local_id].item()),
+#             "recall": float(recall[local_id].item()),
+#             "f1": float(f1[local_id].item()),
+#             "mean_gap": float(class_gaps.mean().item()),
+#             "q05_gap": float(torch.quantile(class_gaps, 0.05).item()),
+#             "minimum_gap": float(class_gaps.min().item()),
+#             "classification_violation_rate": float(
+#                 class_gaps.le(0.0).float().mean().item()
+#             ),
+#         }
+
+#     old_set = set(old_classes)
+#     new_set = set(new_classes)
+#     old_mask = torch.tensor([int(value) in old_set for value in labels.tolist()])
+#     new_mask = torch.tensor([int(value) in new_set for value in labels.tolist()])
+#     old_accuracy = (
+#         100.0 * float(correct[old_mask].float().mean().item())
+#         if bool(old_mask.any())
+#         else 0.0
+#     )
+#     new_accuracy = (
+#         100.0 * float(correct[new_mask].float().mean().item())
+#         if bool(new_mask.any())
+#         else 100.0 * float(correct.float().mean().item())
+#     )
+#     harmonic = (
+#         0.0
+#         if phase > 0 and old_accuracy + new_accuracy <= 0.0
+#         else (
+#             new_accuracy
+#             if phase == 0
+#             else 2.0 * old_accuracy * new_accuracy / (old_accuracy + new_accuracy)
+#         )
+#     )
+#     old_to_new = (
+#         float(
+#             torch.tensor(
+#                 [int(value) in new_set for value in joint_pred[old_mask].tolist()],
+#                 dtype=torch.float32,
+#             ).mean().item()
+#         )
+#         if bool(old_mask.any())
+#         else 0.0
+#     )
+#     new_to_old = (
+#         float(
+#             torch.tensor(
+#                 [int(value) in old_set for value in joint_pred[new_mask].tolist()],
+#                 dtype=torch.float32,
+#             ).mean().item()
+#         )
+#         if bool(new_mask.any()) and old_set
+#         else 0.0
+#     )
+
+#     per_class_accuracies = [float(row["accuracy"]) for row in per_class.values()]
+#     metrics: Dict[str, Any] = {
+#         "phase": phase,
+#         "method": METHOD_NAME,
+#         "schema_version": BANK_SCHEMA_VERSION,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "split": str(split),
+#         "seen_classes": class_ids,
+#         "old_classes": old_classes,
+#         "new_classes": new_classes,
+#         "overall_accuracy": 100.0 * float(correct.float().mean().item()),
+#         "average_accuracy": float(np.mean(per_class_accuracies)),
+#         "minimum_per_class_accuracy": float(min(per_class_accuracies)),
+#         "old_accuracy": old_accuracy,
+#         "new_accuracy": new_accuracy,
+#         "old_new_harmonic_mean": harmonic,
+#         "old_to_new_invasion_rate": old_to_new,
+#         "new_to_old_invasion_rate": new_to_old,
+#         "joint_accuracy": 100.0 * float(correct.float().mean().item()),
+#         "occupancy_only_accuracy": 100.0 * float(
+#             occupancy_correct.float().mean().item()
+#         ),
+#         "conditional_tangent_accuracy": 100.0 * float(
+#             tangent_correct.float().mean().item()
+#         ),
+#         "conditional_tangent_help_rate": float(
+#             ((~occupancy_correct) & correct).float().mean().item()
+#         ),
+#         "conditional_tangent_harm_rate": float(
+#             (occupancy_correct & (~correct)).float().mean().item()
+#         ),
+#         "mean_energy_gap": float(gaps.mean().item()),
+#         "q05_energy_gap": float(torch.quantile(gaps, 0.05).item()),
+#         "minimum_energy_gap": float(gaps.min().item()),
+#         "classification_violation_rate": float(gaps.le(0.0).float().mean().item()),
+#         "maximum_directional_invasion": float(invasion.max().item()),
+#         "mean_directional_invasion": float(
+#             invasion[~torch.eye(class_count, dtype=torch.bool)].mean().item()
+#             if class_count > 1
+#             else 0.0
+#         ),
+#         "directional_invasion_matrix": invasion,
+#         "confusion_matrix": confusion,
+#         "macro_precision": float(precision.mean().item()),
+#         "macro_recall": float(recall.mean().item()),
+#         "macro_f1": float(f1.mean().item()),
+#         "per_class_metrics": per_class,
+#         "sample_count": int(labels.numel()),
+#         "geometry_bank_contract_digest": model.geometry_bank.contract_digest(),
+#         "classifier_bound_contract_digest": model.classifier.bound_contract_digest,
+#         "model_contract_digest": model.model_contract_digest(),
+#     }
+#     # Compatibility names for old analysis scripts. The term is conditional.
+#     metrics["response_only_accuracy"] = metrics["conditional_tangent_accuracy"]
+#     metrics["response_help_rate"] = metrics["conditional_tangent_help_rate"]
+#     metrics["response_harm_rate"] = metrics["conditional_tangent_harm_rate"]
+#     return metrics, labels.numpy(), joint_pred.numpy(), joint
 
 
-# def compute_phase_metrics(y_true: np.ndarray, y_pred: np.ndarray, phase_info: Dict[str, Any]) -> Dict[str, Any]:
-#     if y_true.size == 0:
-#         return {"overall_accuracy": 0.0, "per_class_accuracy": {}, "old_accuracy": 0.0, "new_accuracy": 0.0, "hm": 0.0}
-#     seen = [int(c) for c in phase_info["seen_classes"]]
-#     old = [int(c) for c in phase_info["old_classes"]]
-#     new = [int(c) for c in phase_info["new_classes"]]
-#     if not set(y_true.tolist()).issubset(set(seen)) or not set(y_pred.tolist()).issubset(set(seen)):
-#         raise RuntimeError("Metric labels/predictions outside seen classes.")
-#     overall = 100.0 * float((y_true == y_pred).mean())
-#     per_class: Dict[int, float] = {}
-#     for c in seen:
-#         mask = y_true == int(c)
-#         per_class[int(c)] = 100.0 * float((y_pred[mask] == c).mean()) if mask.any() else 0.0
-#     if old and new:
-#         old_mask = np.isin(y_true, np.asarray(old))
-#         new_mask = np.isin(y_true, np.asarray(new))
-#         old_acc = 100.0 * float((y_pred[old_mask] == y_true[old_mask]).mean()) if old_mask.any() else 0.0
-#         new_acc = 100.0 * float((y_pred[new_mask] == y_true[new_mask]).mean()) if new_mask.any() else 0.0
-#         hm = 2.0 * old_acc * new_acc / max(old_acc + new_acc, 1e-8)
-#     else:
-#         old_acc = 0.0
-#         new_acc = overall
-#         hm = overall
-#     cm = np.zeros((len(seen), len(seen)), dtype=np.int64)
-#     pos = {c: i for i, c in enumerate(seen)}
-#     for yt, yp in zip(y_true.tolist(), y_pred.tolist()):
-#         cm[pos[int(yt)], pos[int(yp)]] += 1
+# @torch.no_grad()
+# def replay_health(
+#     model: NECILModel,
+#     class_ids: Sequence[int],
+#     *,
+#     samples_per_class: int,
+# ) -> Dict[str, Any]:
+#     ids = [int(value) for value in class_ids]
+#     replay = model.sample_geometry_replay(
+#         ids,
+#         samples_per_class=int(samples_per_class),
+#         seen_classes=ids,
+#         reliability_gated=True,
+#     )
+#     features = replay.get("features")
+#     responses = replay.get("spectral_responses", replay.get("responses"))
+#     labels = replay.get("global_labels")
+#     if not torch.is_tensor(features) or features.numel() == 0:
+#         raise RuntimeError("Geometry replay produced no samples")
+#     if not torch.is_tensor(responses) or responses.size(0) != features.size(0):
+#         raise RuntimeError("Geometry replay did not return aligned conditional tangents")
+#     if not torch.is_tensor(labels) or labels.numel() != features.size(0):
+#         raise RuntimeError("Geometry replay labels are missing or misaligned")
+#     scored = model.compute_logits_from_features(
+#         features,
+#         spectral_responses=responses,
+#         seen_classes=ids,
+#         mode="pc_stgb",
+#         return_energy=True,
+#         return_parts=True,
+#     )
+#     if scored.get("joint_factorization") != JOINT_FACTORIZATION:
+#         raise RuntimeError("Replay scoring used the wrong joint factorization")
+#     energy = scored["joint_energy"]
+#     local_map = {class_id: index for index, class_id in enumerate(ids)}
+#     local = torch.tensor(
+#         [local_map[int(value)] for value in labels.detach().cpu().tolist()],
+#         device=energy.device,
+#         dtype=torch.long,
+#     )
+#     true = energy.gather(1, local[:, None]).squeeze(1)
+#     rival = energy.clone()
+#     rival.scatter_(1, local[:, None], float("inf"))
+#     gap = rival.min(dim=1).values - true
+#     prediction = energy.argmin(dim=1)
 #     return {
-#         "overall_accuracy": overall,
-#         "old_accuracy": old_acc,
-#         "new_accuracy": new_acc,
-#         "hm": hm,
-#         "per_class_accuracy": per_class,
-#         "seen_classes": seen,
-#         "old_classes": old,
-#         "new_classes": new,
-#         "confusion_matrix": cm,
+#         "replay_factorization": "z_then_g_given_z_c",
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "samples": int(local.numel()),
+#         "accuracy": 100.0 * float(prediction.eq(local).float().mean().item()),
+#         "mean_gap": float(gap.mean().item()),
+#         "q05_gap": float(torch.quantile(gap, 0.05).item()),
+#         "minimum_gap": float(gap.min().item()),
+#         "violation_rate": float(gap.le(0.0).float().mean().item()),
 #     }
 
 
-# def evaluator_update_compat(evaluator: Any, phase: int, y_true: np.ndarray, y_pred: np.ndarray, old_class_count: int, seen_classes: List[int]) -> None:
-#     sig = inspect.signature(evaluator.update)
-#     kwargs = {}
-#     if "old_class_count" in sig.parameters:
-#         kwargs["old_class_count"] = int(old_class_count)
-#     if "seen_classes" in sig.parameters:
-#         kwargs["seen_classes"] = seen_classes
-#     evaluator.update(int(phase), y_true, y_pred, **kwargs)
+# def save_model_summary(path: str, model: torch.nn.Module) -> str:
+#     total = sum(int(parameter.numel()) for parameter in model.parameters())
+#     trainable = sum(
+#         int(parameter.numel())
+#         for parameter in model.parameters()
+#         if parameter.requires_grad
+#     )
+#     lines = [
+#         f"Model: {model.__class__.__name__}",
+#         f"Stack: {STACK_BUILD_ID}",
+#         f"Method: {METHOD_NAME}",
+#         f"Joint factorization: {JOINT_FACTORIZATION}",
+#         "=" * 104,
+#         f"Total parameters: {total:,}",
+#         f"Trainable parameters at save time: {trainable:,}",
+#         "",
+#         "Feature contract",
+#         "-" * 104,
+#     ]
+#     for key, value in sorted(model.feature_contract().items()):
+#         lines.append(f"{key}: {value}")
+#     absolute = os.path.abspath(path)
+#     os.makedirs(os.path.dirname(absolute), exist_ok=True)
+#     temporary = absolute + ".tmp"
+#     with open(temporary, "w", encoding="utf-8") as stream:
+#         stream.write("\n".join(lines) + "\n")
+#         stream.flush()
+#         os.fsync(stream.fileno())
+#     os.replace(temporary, absolute)
+#     return absolute
 
 
-# def save_classification_report_compat(
-#     evaluator: Any,
+# # =============================================================================
+# # Phase reports and continual metrics
+# # =============================================================================
+
+
+# def _phase_report_text(
 #     phase: int,
-#     y_true: np.ndarray,
-#     y_pred: np.ndarray,
-#     target_names: List[str],
-#     phase_dir: str,
-#     seen_classes: List[int],
-#     old_class_count: int,
-#     enabled: bool,
-#     tr_time: float,
-#     te_time: float,
-# ) -> Optional[Dict[str, Any]]:
-#     if not enabled:
-#         return None
-#     os.makedirs(phase_dir, exist_ok=True)
-#     if hasattr(evaluator, "save_phase_report"):
-#         return evaluator.save_phase_report(
-#             phase=int(phase),
-#             y_true=y_true,
-#             y_pred=y_pred,
-#             target_names=target_names,
-#             save_dir=phase_dir,
-#             seen_classes=seen_classes,
-#             old_class_count=int(old_class_count),
-#             tr_time=tr_time,
-#             te_time=te_time,
-#             dl_time=0.0,
+#     metrics: Mapping[str, Any],
+#     diagnostics: Mapping[str, Any],
+#     replay: Mapping[str, Any],
+#     training: Mapping[str, Any],
+# ) -> str:
+#     lines = [
+#         f"PC-STGB Phase {int(phase)} Geometry Report",
+#         "=" * 112,
+#         "",
+#         "Method contract",
+#         "-" * 112,
+#         f"Factorization: {JOINT_FACTORIZATION}",
+#         "Inference: dimension-normalized occupancy + occupancy-conditioned tangent energy",
+#         "Replay: sample z first, then sample g conditioned on z and class",
+#         "Memory: aggregate rows only; old rows and global prior are immutable",
+#         "",
+#         "Official cumulative test geometry",
+#         "-" * 112,
+#         (
+#             f"OA={float(metrics['overall_accuracy']):.2f}% | "
+#             f"AA={float(metrics['average_accuracy']):.2f}% | "
+#             f"MinClass={float(metrics['minimum_per_class_accuracy']):.2f}% | "
+#             f"Old={float(metrics['old_accuracy']):.2f}% | "
+#             f"New={float(metrics['new_accuracy']):.2f}% | "
+#             f"H={float(metrics['old_new_harmonic_mean']):.2f}%"
+#         ),
+#         (
+#             f"Occupancy={float(metrics['occupancy_only_accuracy']):.2f}% | "
+#             f"ConditionalTangent={float(metrics['conditional_tangent_accuracy']):.2f}% | "
+#             f"TangentHelp={float(metrics['conditional_tangent_help_rate']):.4f} | "
+#             f"TangentHarm={float(metrics['conditional_tangent_harm_rate']):.4f}"
+#         ),
+#         (
+#             f"MeanGap={float(metrics['mean_energy_gap']):.6f} | "
+#             f"Q05Gap={float(metrics['q05_energy_gap']):.6f} | "
+#             f"MinGap={float(metrics['minimum_energy_gap']):.6f} | "
+#             f"Violation={100.0 * float(metrics['classification_violation_rate']):.2f}%"
+#         ),
+#         (
+#             f"Old->New={100.0 * float(metrics['old_to_new_invasion_rate']):.2f}% | "
+#             f"New->Old={100.0 * float(metrics['new_to_old_invasion_rate']):.2f}% | "
+#             f"MaxDirectionalInvasion={float(metrics['maximum_directional_invasion']):.4f}"
+#         ),
+#         "",
+#         "Replay fidelity",
+#         "-" * 112,
+#         (
+#             f"Accuracy={float(replay['accuracy']):.2f}% | "
+#             f"MeanGap={float(replay['mean_gap']):.6f} | "
+#             f"Q05Gap={float(replay['q05_gap']):.6f} | "
+#             f"Violation={100.0 * float(replay['violation_rate']):.2f}%"
+#         ),
+#         "",
+#         "Geometry readiness",
+#         "-" * 112,
+#         (
+#             f"response_ready_rate={float(diagnostics.get('response_ready_rate', 0.0)):.4f} | "
+#             f"coupling_ready_rate={float(diagnostics.get('coupling_ready_rate', 0.0)):.4f} | "
+#             f"coupling_reliability_mean={float(diagnostics.get('coupling_reliability_mean', 0.0)):.4f} | "
+#             f"coupling_explained_variance_mean={float(diagnostics.get('coupling_explained_variance_mean', 0.0)):.4f}"
+#         ),
+#         "",
+#         "Training/admission state",
+#         "-" * 112,
+#         f"status={training.get('status', training.get('state', 'COMPLETE'))}",
+#         f"committed={training.get('committed', phase == 0)}",
+#         f"protocol_stop={training.get('protocol_stop', False)}",
+#         "",
+#         "Class-wise cumulative test results",
+#         "-" * 112,
+#         "id  introduced  class                              support  accuracy    q05-gap     violation",
+#     ]
+#     per_class = metrics["per_class_metrics"]
+#     for class_id in metrics["seen_classes"]:
+#         row = per_class[class_id]
+#         lines.append(
+#             f"{int(class_id):2d}  {int(row['phase_created']):10d}  "
+#             f"{str(row['class_name'])[:32]:32s} {int(row['support']):7d}  "
+#             f"{float(row['accuracy']):8.2f}%  {float(row['q05_gap']):10.5f}  "
+#             f"{100.0 * float(row['classification_violation_rate']):8.2f}%"
 #         )
-#     return save_classification_report(
-#         y_true=y_true,
-#         y_pred=y_pred,
-#         target_names=target_names,
-#         save_dir=phase_dir,
-#         phase=int(phase),
-#         seen_classes=seen_classes,
-#         old_class_count=int(old_class_count),
-#         tr_time=tr_time,
-#         te_time=te_time,
-#         dl_time=0.0,
-#         save_hsi_style=True,
-#         save_structured=True,
+#     return "\n".join(lines) + "\n"
+
+
+# def write_phase_report(
+#     path: str,
+#     *,
+#     phase: int,
+#     metrics: Mapping[str, Any],
+#     diagnostics: Mapping[str, Any],
+#     replay: Mapping[str, Any],
+#     training: Mapping[str, Any],
+# ) -> str:
+#     absolute = os.path.abspath(path)
+#     os.makedirs(os.path.dirname(absolute), exist_ok=True)
+#     temporary = absolute + ".tmp"
+#     with open(temporary, "w", encoding="utf-8") as stream:
+#         stream.write(
+#             _phase_report_text(
+#                 phase,
+#                 metrics,
+#                 diagnostics,
+#                 replay,
+#                 training,
+#             )
+#         )
+#         stream.flush()
+#         os.fsync(stream.fileno())
+#     os.replace(temporary, absolute)
+#     return absolute
+
+
+# def build_continual_summary(
+#     phase_results: Sequence[Mapping[str, Any]],
+# ) -> Dict[str, Any]:
+#     if not phase_results:
+#         raise ValueError("phase_results is empty")
+#     evaluated = [item for item in phase_results if isinstance(item.get("test_metrics"), Mapping)]
+#     if not evaluated:
+#         raise ValueError("phase_results contains no evaluated committed phase")
+#     per_class_history: Dict[int, List[Tuple[int, float]]] = {}
+#     introduction_accuracy: Dict[int, float] = {}
+#     phase_rows: List[Dict[str, Any]] = []
+#     for item in evaluated:
+#         phase = int(item["phase"])
+#         metrics = item["test_metrics"]
+#         for class_id, row in metrics["per_class_metrics"].items():
+#             class_id = int(class_id)
+#             accuracy = float(row["accuracy"])
+#             per_class_history.setdefault(class_id, []).append((phase, accuracy))
+#             if int(row["phase_created"]) == phase:
+#                 introduction_accuracy[class_id] = accuracy
+#         phase_rows.append(
+#             {
+#                 "phase": phase,
+#                 "seen_classes": list(metrics["seen_classes"]),
+#                 "overall_accuracy": float(metrics["overall_accuracy"]),
+#                 "average_accuracy": float(metrics["average_accuracy"]),
+#                 "minimum_per_class_accuracy": float(
+#                     metrics["minimum_per_class_accuracy"]
+#                 ),
+#                 "old_accuracy": float(metrics["old_accuracy"]),
+#                 "new_accuracy": float(metrics["new_accuracy"]),
+#                 "old_new_harmonic_mean": float(metrics["old_new_harmonic_mean"]),
+#                 "old_to_new_invasion_rate": float(
+#                     metrics["old_to_new_invasion_rate"]
+#                 ),
+#                 "new_to_old_invasion_rate": float(
+#                     metrics["new_to_old_invasion_rate"]
+#                 ),
+#                 "q05_energy_gap": float(metrics["q05_energy_gap"]),
+#                 "checkpoint": item.get("checkpoint"),
+#                 "status": item.get("status", "COMPLETE"),
+#             }
+#         )
+
+#     final_phase = int(phase_rows[-1]["phase"])
+#     final_metrics = evaluated[-1]["test_metrics"]
+#     forgetting: Dict[int, float] = {}
+#     backward_transfer: Dict[int, float] = {}
+#     for class_id, trajectory in per_class_history.items():
+#         final_accuracy = trajectory[-1][1]
+#         previous = [accuracy for phase, accuracy in trajectory if phase < final_phase]
+#         forgetting[class_id] = (
+#             max(previous) - final_accuracy if previous else 0.0
+#         )
+#         if class_id in introduction_accuracy:
+#             backward_transfer[class_id] = (
+#                 final_accuracy - introduction_accuracy[class_id]
+#             )
+
+#     old_class_ids = [
+#         int(class_id)
+#         for class_id in final_metrics["seen_classes"]
+#         if int(final_metrics["per_class_metrics"][class_id]["phase_created"]) < final_phase
+#     ]
+#     average_forgetting = (
+#         float(np.mean([forgetting[class_id] for class_id in old_class_ids]))
+#         if old_class_ids
+#         else 0.0
+#     )
+#     average_bwt = (
+#         float(np.mean([backward_transfer[class_id] for class_id in old_class_ids]))
+#         if old_class_ids
+#         else 0.0
+#     )
+#     return {
+#         "method": METHOD_NAME,
+#         "stack_build_id": STACK_BUILD_ID,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "completed_phases": [row["phase"] for row in phase_rows],
+#         "phase_results": phase_rows,
+#         "final_phase": final_phase,
+#         "final_overall_accuracy": float(final_metrics["overall_accuracy"]),
+#         "final_average_accuracy": float(final_metrics["average_accuracy"]),
+#         "final_minimum_per_class_accuracy": float(
+#             final_metrics["minimum_per_class_accuracy"]
+#         ),
+#         "average_forgetting": average_forgetting,
+#         "average_backward_transfer": average_bwt,
+#         "per_class_forgetting": forgetting,
+#         "per_class_backward_transfer": backward_transfer,
+#         "per_class_accuracy_history": per_class_history,
+#         "protocol_stopped": bool(
+#             any(
+#                 item.get("status") == "REJECTED"
+#                 or item.get("protocol_stop", False)
+#                 for item in phase_results
+#             )
+#         ),
+#         "summary_scope": (
+#             f"phases_{phase_rows[0]['phase']}_through_{phase_rows[-1]['phase']}"
+#         ),
+#     }
+
+
+# # =============================================================================
+# # Evaluation-only qualitative scene reconstruction
+# # =============================================================================
+
+
+# class _TransientQualitativePhaseManager:
+#     """A short-lived, evaluation-only loader for dense labeled-pixel maps.
+
+#     The training dataset physically purges finalized training pixels.  A dense
+#     qualitative map for a later phase therefore cannot be produced from the
+#     training dataset without violating its access controls.  This manager is
+#     reconstructed from the immutable source scene *after* a phase has committed,
+#     is never attached to Trainer, runs only under ``torch.no_grad()``, and is
+#     explicitly destroyed after rendering.
+#     """
+
+#     def __init__(
+#         self,
+#         *,
+#         patch_dataset: HSIPatchDataset,
+#         phase_to_classes: Mapping[int, Sequence[int]],
+#         phase: int,
+#         gt_shape: Sequence[int],
+#         num_workers: int,
+#         pin_memory: bool,
+#     ) -> None:
+#         self._patch_dataset = patch_dataset
+#         self.phase_to_classes = {
+#             int(key): [int(value) for value in values]
+#             for key, values in phase_to_classes.items()
+#         }
+#         self.phase = int(phase)
+#         self.gt_shape = tuple(int(value) for value in gt_shape)
+#         self.num_workers = int(num_workers)
+#         self.pin_memory = bool(pin_memory)
+#         self.released = False
+
+#     def get_classes_up_to_phase(self, phase: int) -> List[int]:
+#         phase = int(phase)
+#         result: List[int] = []
+#         for index in range(phase + 1):
+#             result.extend(self.phase_to_classes[index])
+#         return result
+
+#     def get_cumulative_dataloader(
+#         self,
+#         phase: Optional[int] = None,
+#         *,
+#         up_to_phase: Optional[int] = None,
+#         split: str = "all",
+#         batch_size: int = 128,
+#         shuffle: bool = False,
+#     ) -> DataLoader:
+#         resolved = self.phase if phase is None else int(phase)
+#         if up_to_phase is not None:
+#             resolved = int(up_to_phase)
+#         if resolved != self.phase:
+#             raise RuntimeError(
+#                 f"Transient map manager was built for phase {self.phase}, got {resolved}."
+#             )
+#         if str(split).strip().lower() not in {
+#             "all", "all_labeled", "full", "labeled"
+#         }:
+#             raise RuntimeError(
+#                 "Transient qualitative manager supports only split='all'."
+#             )
+#         if bool(shuffle):
+#             raise RuntimeError("Qualitative visualization must not shuffle coordinates.")
+#         if self.released or self._patch_dataset is None:
+#             raise RuntimeError("Transient qualitative manager has been released.")
+#         return DataLoader(
+#             self._patch_dataset,
+#             batch_size=int(batch_size),
+#             shuffle=False,
+#             drop_last=False,
+#             pin_memory=self.pin_memory,
+#             num_workers=self.num_workers,
+#         )
+
+#     def release(self) -> None:
+#         if self.released:
+#             return
+#         dataset = self._patch_dataset
+#         if dataset is not None:
+#             for name in (
+#                 "patches",
+#                 "spectral_positive_centers",
+#                 "spectral_negative_centers",
+#                 "spectral_step_sizes",
+#             ):
+#                 value = getattr(dataset, name, None)
+#                 if torch.is_tensor(value):
+#                     value.zero_()
+#         self._patch_dataset = None
+#         self.released = True
+#         gc.collect()
+#         if torch.cuda.is_available():
+#             torch.cuda.empty_cache()
+
+
+# def _build_transient_qualitative_phase_manager(
+#     *,
+#     args: argparse.Namespace,
+#     retained_data: Mapping[str, Any],
+#     phase: int,
+# ) -> _TransientQualitativePhaseManager:
+#     """Reconstruct all labeled pixels from source for one committed phase map.
+
+#     This routine is deliberately outside ``IncrementalHSIDataset`` and Trainer.
+#     It does not restore train access, does not alter the model, and does not
+#     contribute any metric used for checkpoint selection or phase admission.
+#     """
+#     phase = int(phase)
+#     protocol = retained_data.get("protocol")
+#     summary = retained_data.get("summary")
+#     if not isinstance(protocol, Mapping) or not isinstance(summary, Mapping):
+#         raise RuntimeError("Qualitative reconstruction metadata are incomplete.")
+#     phase_to_classes = {
+#         int(key): [int(value) for value in values]
+#         for key, values in dict(protocol["phase_to_classes"]).items()
+#     }
+#     seen_classes: List[int] = []
+#     for phase_index in range(phase + 1):
+#         seen_classes.extend(phase_to_classes[phase_index])
+#     seen_classes = list(dict.fromkeys(seen_classes))
+
+#     preprocessing_path = str(summary.get("preprocessing_state_path", ""))
+#     if not preprocessing_path or not os.path.isfile(preprocessing_path):
+#         raise RuntimeError(
+#             f"Saved preprocessing state is unavailable: {preprocessing_path!r}"
+#         )
+
+#     raw_hsi, gt, num_classes, _, has_background, label_policy = LoadRawHSIData(
+#         method=args.dataset,
+#         base_dir=args.data_dir,
+#     )
+#     if int(num_classes) != int(retained_data["num_classes"]):
+#         raise RuntimeError("Reloaded qualitative scene has a different class count.")
+#     raw_hsi = np.asarray(raw_hsi, dtype=np.float32)
+#     gt = np.asarray(gt)
+#     preprocessing_state = LoadHSIPreprocessor(preprocessing_path)
+#     model_hsi, _ = ApplyHSIPreprocessor(raw_hsi, preprocessing_state)
+
+#     patches, input_labels, coords = ImageCubes(
+#         model_hsi,
+#         gt,
+#         WS=int(args.patch_size),
+#         removeZeroLabels=True,
+#         has_background=bool(has_background),
+#         num_classes=int(num_classes),
+#         pytorch_format=True,
+#         label_policy=label_policy,
+#         return_center_spectra=False,
+#     )
+#     patches = np.ascontiguousarray(to_numpy(patches), dtype=np.float32)
+#     input_labels = np.ascontiguousarray(
+#         to_numpy(input_labels, dtype=np.int64).reshape(-1)
+#     )
+#     coords = np.ascontiguousarray(to_numpy(coords, dtype=np.int64))
+
+#     index_labels, index_coords = ExtractLabeledPixelIndex(
+#         gt, label_policy=label_policy
+#     )
+#     if not np.array_equal(input_labels, np.asarray(index_labels, dtype=np.int64)):
+#         raise RuntimeError("Reloaded qualitative labels changed sample order.")
+#     if not np.array_equal(coords, np.asarray(index_coords, dtype=np.int64)):
+#         raise RuntimeError("Reloaded qualitative coordinates changed sample order.")
+
+#     remapped_labels = np.asarray(protocol["remapped_labels"], dtype=np.int64)
+#     if remapped_labels.shape != input_labels.shape:
+#         raise RuntimeError("Reloaded qualitative sample count differs from protocol.")
+#     seen_mask = np.isin(remapped_labels, np.asarray(seen_classes, dtype=np.int64))
+#     sample_indices = np.flatnonzero(seen_mask).astype(np.int64)
+#     if sample_indices.size == 0:
+#         raise RuntimeError(f"Phase {phase} qualitative scene contains no seen pixels.")
+
+#     selected_coords = coords[sample_indices]
+#     positive, negative, steps, intervention_metadata = (
+#         BuildPCSTGBInterventionCentersFromCube(
+#             raw_hsi,
+#             selected_coords,
+#             preprocessing_state,
+#             gain_step=float(args.spectral_gain_step),
+#             tilt_step=float(args.spectral_tilt_step),
+#             chunk_size=int(args.preprocess_response_chunk_size),
+#             definition_version=int(args.intervention_definition_version),
+#         )
+#     )
+#     if int(intervention_metadata.get("num_interventions", -1)) != int(
+#         args.num_spectral_interventions
+#     ):
+#         raise RuntimeError("Qualitative intervention-count mismatch.")
+
+#     patch_dataset = HSIPatchDataset(
+#         patches[sample_indices],
+#         remapped_labels[sample_indices],
+#         coords=selected_coords,
+#         sample_indices=sample_indices,
+#         spectral_positive_centers=positive,
+#         spectral_negative_centers=negative,
+#         spectral_step_sizes=steps,
+#         intervention_definition_version=int(args.intervention_definition_version),
+#     )
+
+#     # The patch dataset owns copied torch tensors.  Remove every reconstruction
+#     # array before returning so only the short-lived evaluation dataset survives.
+#     del (
+#         patches,
+#         input_labels,
+#         coords,
+#         index_labels,
+#         index_coords,
+#         remapped_labels,
+#         selected_coords,
+#         positive,
+#         negative,
+#         steps,
+#         model_hsi,
+#         raw_hsi,
+#         gt,
+#     )
+#     gc.collect()
+
+#     return _TransientQualitativePhaseManager(
+#         patch_dataset=patch_dataset,
+#         phase_to_classes=phase_to_classes,
+#         phase=phase,
+#         gt_shape=preprocessing_state["spatial_shape"],
+#         num_workers=int(args.num_workers),
+#         pin_memory=str(args.device).startswith("cuda"),
 #     )
 
 
-# # -----------------------------------------------------------------------------
-# # Checkpoint, artifacts, phase loop
-# # -----------------------------------------------------------------------------
-
-
-# def geometry_bank_state(model: torch.nn.Module) -> Any:
-#     gb = getattr(model, "geometry_bank", None)
-#     if gb is None:
-#         return None
-#     if hasattr(gb, "state_dict"):
-#         try:
-#             return gb.state_dict()
-#         except Exception:
-#             pass
-#     if hasattr(model, "export_memory_snapshot"):
-#         return model.export_memory_snapshot()
-#     if hasattr(gb, "export_state"):
-#         return gb.export_state()
-#     return None
-
-
-# def runtime_contract(args: argparse.Namespace, phase_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-#     phase = int(phase_info["phase"]) if phase_info else None
-#     return {
-#         "method": build_method_identity(args),
-#         "phase": phase,
-#         "feature_space": "canonical_projected_z in base; adapted_z only through geometry_plastic_adapter in incremental",
-#         "classifier_mode": args.incremental_classifier_mode if phase and phase > 0 else args.base_classifier_mode,
-#         "eval_mode": args.eval_classifier_mode,
-#         "trainable_policy": "base_backbone_projection_ce_head" if phase in {None, 0} else "geometry_plastic_adapter_only",
-#         "strict_non_exemplar": bool(args.strict_non_exemplar),
-#         "raw_exemplars_stored": False,
-#         "old_features_stored": False,
-#         "kd_teacher_used": False,
-#         "projection_trainable_during_incremental": False,
-#         "old_geometry_bank_frozen": True if phase and phase > 0 else None,
-#         "label_convention": "dataset/global, logits/seen-local, CE/seen-local, predictions/global",
-#         "transport_enabled": False,
-#         "old_row_transport_enabled": False,
-#         "adapter_enabled": True,
-#         "energy_calibrator_enabled": False,
-#         "adaptive_boundary_enabled": False,
-#     }
-
-
-# def checkpoint_payload(
-#     model: torch.nn.Module,
+# def _save_transient_qualitative_phase_map(
+#     *,
 #     args: argparse.Namespace,
-#     phase_info: Dict[str, Any],
-#     history: Any,
-#     metrics: Dict[str, Any],
-#     diagnostics: Dict[str, Any],
-#     method_identity: Dict[str, Any],
+#     model: NECILModel,
+#     dataset: IncrementalHSIDataset,
+#     retained_data: Mapping[str, Any],
+#     phase: int,
+#     figures_dir: str,
 # ) -> Dict[str, Any]:
-#     payload = {
-#         "phase": int(phase_info["phase"]),
-#         "model_state": model.state_dict(),
-#         "model_state_dict": model.state_dict(),
-#         "geometry_bank_state": geometry_bank_state(model),
-#         "memory_snapshot": model.export_memory_snapshot() if hasattr(model, "export_memory_snapshot") else None,
-#         "seen_classes": [int(c) for c in phase_info["seen_classes"]],
-#         "old_classes": [int(c) for c in phase_info["old_classes"]],
-#         "new_classes": [int(c) for c in phase_info["new_classes"]],
-#         "class_mappings": {
-#             "seen_global_to_local": {str(c): i for i, c in enumerate(phase_info["seen_classes"])},
-#             "seen_local_to_global": {str(i): int(c) for i, c in enumerate(phase_info["seen_classes"])},
+#     if not bool(args.qualitative_map_reload_from_source):
+#         raise RuntimeError(
+#             "All-phase dense maps require qualitative_map_reload_from_source=true."
+#         )
+#     manager = _build_transient_qualitative_phase_manager(
+#         args=args,
+#         retained_data=retained_data,
+#         phase=int(phase),
+#     )
+#     try:
+#         outputs = predict_phase_grid(
+#             model=model,
+#             dataset_manager=manager,
+#             phase=int(phase),
+#             target_names=dataset.target_names,
+#             save_dir=figures_dir,
+#             device=str(args.device),
+#             patch_size=int(args.patch_size),
+#             chunk_size=int(args.visualization_batch_size),
+#             split="all",
+#             classifier_mode=VISUALIZATION_MODE_ALIAS,
+#             semantic_mode="identity",
+#             save_numpy=bool(args.save_raw_arrays),
+#             return_outputs=True,
+#             class_cmap=str(args.viz_class_cmap),
+#             background_color=str(args.viz_background_color),
+#             save_combined_figure=False,
+#             save_qualitative_all_labeled=False,
+#             dpi=int(args.visualization_dpi),
+#         )
+#         outputs["source_reloaded_after_commit"] = True
+#         outputs["used_for_training_or_admission"] = False
+#         outputs["official_test_evidence"] = False
+#         return outputs
+#     finally:
+#         manager.release()
+
+
+# # =============================================================================
+# # Visualization helpers
+# # =============================================================================
+
+
+# def _safe_visualization(
+#     artifacts: Dict[str, Any],
+#     name: str,
+#     function: Any,
+#     *args: Any,
+#     **kwargs: Any,
+# ) -> None:
+#     try:
+#         artifacts[name] = function(*args, **kwargs)
+#     except Exception as error:
+#         artifacts[name] = {"status": "SKIPPED", "reason": str(error)}
+#         print(f"[Visualization skipped: {name}] {error}")
+
+
+# def save_phase_visualizations(
+#     *,
+#     args: argparse.Namespace,
+#     model: NECILModel,
+#     dataset: IncrementalHSIDataset,
+#     retained_data: Mapping[str, Any],
+#     phase: int,
+#     history: Mapping[str, Any],
+#     metrics: Mapping[str, Any],
+#     run_dir: str,
+# ) -> Dict[str, Any]:
+#     artifacts: Dict[str, Any] = {}
+#     if not bool(args.save_visualizations):
+#         return artifacts
+#     figures_dir = os.path.join(run_dir, f"phase_{phase}", "figures")
+#     os.makedirs(figures_dir, exist_ok=True)
+
+#     if phase == 0:
+#         _safe_visualization(
+#             artifacts,
+#             "training",
+#             plot_base_training_dynamics,
+#             history,
+#             os.path.join(figures_dir, "base_training_dashboard.png"),
+#             dpi=int(args.visualization_dpi),
+#             save_separate=True,
+#         )
+
+#     _safe_visualization(
+#         artifacts,
+#         "classification",
+#         save_classification_diagnostics,
+#         confusion_matrix=to_numpy(metrics["confusion_matrix"], dtype=np.int64),
+#         class_ids=metrics["seen_classes"],
+#         target_names=dataset.target_names,
+#         save_path=os.path.join(figures_dir, "classification_diagnostics.png"),
+#         title=f"Phase {phase} PC-STGB cumulative test classification",
+#         dpi=int(args.visualization_dpi),
+#     )
+
+#     if not bool(args.skip_phase_maps):
+#         _safe_visualization(
+#             artifacts,
+#             "maps",
+#             predict_phase_grid,
+#             model=model,
+#             dataset_manager=dataset,
+#             phase=int(phase),
+#             target_names=dataset.target_names,
+#             save_dir=figures_dir,
+#             device=str(args.device),
+#             patch_size=int(args.patch_size),
+#             chunk_size=int(args.visualization_batch_size),
+#             split="test",
+#             classifier_mode=VISUALIZATION_MODE_ALIAS,
+#             semantic_mode="identity",
+#             save_numpy=bool(args.save_raw_arrays),
+#             return_outputs=True,
+#             class_cmap=str(args.viz_class_cmap),
+#             background_color=str(args.viz_background_color),
+#             save_combined_figure=False,
+#             save_qualitative_all_labeled=False,
+#             dpi=int(args.visualization_dpi),
+#         )
+
+#         if bool(args.save_qualitative_all_labeled_map):
+#             _safe_visualization(
+#                 artifacts,
+#                 "qualitative_all_labeled",
+#                 _save_transient_qualitative_phase_map,
+#                 args=args,
+#                 model=model,
+#                 dataset=dataset,
+#                 retained_data=retained_data,
+#                 phase=int(phase),
+#                 figures_dir=figures_dir,
+#             )
+#     return artifacts
+
+
+# # =============================================================================
+# # Run orchestration
+# # =============================================================================
+
+
+# def _phase_limit(args: argparse.Namespace, dataset: IncrementalHSIDataset) -> int:
+#     final = int(dataset.num_phases) - 1
+#     if bool(args.base_only):
+#         return 0
+#     if int(args.max_phase) >= 0:
+#         final = min(final, int(args.max_phase))
+#     return final
+
+
+# def _restore_checkpoint_dataset_purge(
+#     trainer: Trainer,
+#     dataset: IncrementalHSIDataset,
+#     checkpoint_path: str,
+# ) -> int:
+#     checkpoint = trainer.load_checkpoint(
+#         checkpoint_path,
+#         strict=True,
+#         verify_checksum=True,
+#         restore_rng=True,
+#     )
+#     state = checkpoint.get("dataset_runtime_state")
+#     if not isinstance(state, Mapping):
+#         raise RuntimeError(
+#             "Resume requires dataset_runtime_state so finalized old training payloads "
+#             "can be physically purged in the reconstructed process."
+#         )
+#     # Trainer restoration intentionally avoids a second purge during internal
+#     # loading. Main is the data owner, so it immediately reapplies the state with
+#     # physical purge enabled before any next-phase loader is created.
+#     dataset.restore_runtime_state(state, purge_finalized_train_payload=True)
+#     dataset.assert_non_exemplar()
+#     return int(checkpoint["phase"])
+
+
+# def _save_overlap_review(
+#     *,
+#     model: NECILModel,
+#     dataset: IncrementalHSIDataset,
+#     metrics: Mapping[str, Any],
+#     reports_dir: str,
+# ) -> Dict[str, Any]:
+#     try:
+#         review = build_geometry_overlap_review(
+#             model=model,
+#             class_ids=metrics["seen_classes"],
+#             target_names=dataset.target_names,
+#             directional_invasion_matrix=metrics["directional_invasion_matrix"],
+#         )
+#     except Exception as error:
+#         review = {
+#             "status": "UNAVAILABLE",
+#             "reason": str(error),
+#             "definition": (
+#                 "Operational overlap should be interpreted from the deployed "
+#                 "conditional joint-energy invasion matrix."
+#             ),
+#         }
+#     save_json(os.path.join(reports_dir, "geometry_overlap_review.json"), review)
+#     rows = list(review.get("pair_geometry", []))
+#     if rows:
+#         csv_path = os.path.join(reports_dir, "geometry_overlap_pairs.csv")
+#         with open(csv_path, "w", newline="", encoding="utf-8") as stream:
+#             writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+#             writer.writeheader()
+#             writer.writerows(rows)
+#     return review
+
+
+# def run_single_experiment(
+#     base_args: argparse.Namespace,
+#     *,
+#     run_index: int,
+#     seed: int,
+# ) -> Dict[str, Any]:
+#     requested = argparse.Namespace(**namespace_to_dict(base_args))
+#     requested.seed = int(seed)
+#     args = resolve_config(requested)
+#     validate_config(args)
+#     set_seed(int(args.seed), bool(args.deterministic))
+
+#     run_dir = os.path.join(
+#         os.path.abspath(str(args.save_dir)),
+#         str(args.dataset),
+#         f"base_{int(args.base_classes)}_inc_{int(args.increment)}",
+#         f"run_{run_index + 1}_seed_{int(args.seed)}",
+#     )
+#     os.makedirs(run_dir, exist_ok=True)
+#     args.save_dir = run_dir
+#     save_json(
+#         os.path.join(run_dir, "requested_configuration.json"),
+#         namespace_to_dict(requested),
+#     )
+#     save_json(
+#         os.path.join(run_dir, "resolved_configuration.json"),
+#         namespace_to_dict(args),
+#     )
+
+#     print("\n" + "=" * 112)
+#     print("PC-STGB STRICT NON-EXEMPLAR HSI CLASS-INCREMENTAL EXPERIMENT")
+#     print("=" * 112)
+#     print(
+#         f"[Run] dataset={args.dataset} | seed={args.seed} | device={args.device} | "
+#         f"base={args.base_classes} | increment={args.increment}"
+#     )
+#     print(
+#         f"[Geometry] occupancy_rank={args.subspace_rank} | tangent_rank={args.spectral_response_rank} | "
+#         f"K={args.num_spectral_interventions} | beta_T={args.spectral_response_weight:.3f}"
+#     )
+#     print(f"[Factorization] {JOINT_FACTORIZATION}")
+
+#     load_start = time.time()
+#     data = load_hsi_data(args)
+#     load_time = time.time() - load_start
+#     save_json(os.path.join(run_dir, "dataset_summary.json"), data["summary"])
+#     dataset = build_dataset(args, data)
+#     protocol = data["protocol"]
+#     save_json(
+#         os.path.join(run_dir, "class_protocol.json"),
+#         {
+#             "phase_to_classes": protocol["phase_to_classes"],
+#             "class_order_input_ids": protocol["class_order"],
+#             "num_phases": int(protocol["num_phases"]),
+#             "execution": "base_plus_incremental" if not args.base_only else "base_only",
 #         },
-#         "base_geometry_certificate": getattr(model, "base_geometry_certificate", None),
-#         "base_handoff": getattr(model, "base_handoff", None),
-#         "runtime_contract": runtime_contract(args, phase_info),
-#         "method_identity": method_identity,
-#         "args_resolved": namespace_to_dict(args),
-#         "metrics": metrics,
-#         "history": history,
-#         "diagnostics": diagnostics,
+#     )
+#     retained_data = release_external_sample_payload(data)
+#     del protocol
+
+#     model = build_model(args)
+#     if bool(args.save_model_summary):
+#         save_model_summary(os.path.join(run_dir, "model_summary_initial.txt"), model)
+#     trainer = Trainer(model, dataset, args)
+
+#     start_phase = 0
+#     resume = str(args.resume_checkpoint).strip()
+#     if resume:
+#         restored_phase = _restore_checkpoint_dataset_purge(trainer, dataset, resume)
+#         start_phase = restored_phase + 1
+#         print(f"[Resume] restored phase {restored_phase}; next phase={start_phase}")
+
+#     final_phase = _phase_limit(args, dataset)
+#     if start_phase > final_phase:
+#         raise RuntimeError(
+#             f"Nothing to run: start_phase={start_phase}, final_phase={final_phase}"
+#         )
+
+#     phase_results: List[Dict[str, Any]] = []
+
+#     for phase in range(start_phase, final_phase + 1):
+#         phase_start = time.time()
+#         epochs = int(args.epochs_base if phase == 0 else args.epochs_inc)
+#         learning_rate = float(args.lr if phase == 0 else args.lr_inc)
+#         history = trainer.train_phase(
+#             phase=phase,
+#             epochs=epochs,
+#             batch_size=int(args.batch_size),
+#             lr=learning_rate,
+#         )
+#         phase_training_time = time.time() - phase_start
+
+#         status = str(history.get("status", "COMMITTED" if phase > 0 else "COMPLETE"))
+#         protocol_stop = bool(history.get("protocol_stop", False))
+#         committed = bool(history.get("committed", phase == 0))
+#         if phase > 0 and (status == "REJECTED" or protocol_stop or not committed):
+#             phase_result = {
+#                 "phase": phase,
+#                 "status": "REJECTED",
+#                 "protocol_stop": True,
+#                 "training_time_sec": phase_training_time,
+#                 "history": history,
+#                 "checkpoint": None,
+#             }
+#             phase_results.append(phase_result)
+#             save_json(
+#                 os.path.join(run_dir, f"phase_{phase}", "reports", "phase_result.json"),
+#                 phase_result,
+#             )
+#             print(f"[Protocol stop] phase {phase} candidate was not committed")
+#             break
+
+#         seen_classes = _seen_classes(dataset, phase)
+#         dataset.assert_non_exemplar()
+#         eval_start = time.time()
+#         metrics, y_true, y_pred, energy = evaluate_phase_geometry(
+#             model,
+#             dataset,
+#             phase,
+#             batch_size=int(args.eval_batch_size),
+#             device=torch.device(args.device),
+#             split="test",
+#         )
+#         evaluation_time = time.time() - eval_start
+#         replay = replay_health(
+#             model,
+#             seen_classes,
+#             samples_per_class=int(args.base_diagnostic_replay_samples_per_class),
+#         )
+#         diagnostics = model.geometry_diagnostics(seen_classes)
+#         phase_certificate = trainer.geometry_phase_certificate(
+#             phase,
+#             seen_classes,
+#             require_statistics=True,
+#             require_response=True,
+#             require_frozen=True,
+#         )
+
+#         reports_dir = os.path.join(run_dir, f"phase_{phase}", "reports")
+#         os.makedirs(reports_dir, exist_ok=True)
+#         save_json(os.path.join(reports_dir, "training_history.json"), history)
+#         save_json(os.path.join(reports_dir, "test_metrics.json"), metrics)
+#         save_json(os.path.join(reports_dir, "replay_health.json"), replay)
+#         save_json(os.path.join(reports_dir, "geometry_bank_diagnostics.json"), diagnostics)
+#         save_json(os.path.join(reports_dir, "phase_geometry_certificate.json"), phase_certificate)
+#         overlap_review = _save_overlap_review(
+#             model=model,
+#             dataset=dataset,
+#             metrics=metrics,
+#             reports_dir=reports_dir,
+#         )
+#         report_text = write_phase_report(
+#             os.path.join(reports_dir, "phase_geometry_report.txt"),
+#             phase=phase,
+#             metrics=metrics,
+#             diagnostics=diagnostics,
+#             replay=replay,
+#             training=history,
+#         )
+
+#         visualization_artifacts = save_phase_visualizations(
+#             args=args,
+#             model=model,
+#             dataset=dataset,
+#             retained_data=retained_data,
+#             phase=phase,
+#             history=history,
+#             metrics=metrics,
+#             run_dir=run_dir,
+#         )
+#         if bool(args.save_visualizations):
+#             figures_dir = os.path.join(run_dir, f"phase_{phase}", "figures")
+#             _safe_visualization(
+#                 visualization_artifacts,
+#                 "geometry_overlap",
+#                 save_geometry_pair_diagnostics,
+#                 review=overlap_review,
+#                 class_ids=seen_classes,
+#                 target_names=dataset.target_names,
+#                 save_path=os.path.join(figures_dir, "geometry_overlap_diagnostics.png"),
+#                 dpi=int(args.visualization_dpi),
+#             )
+
+#         if bool(args.save_raw_arrays):
+#             raw_dir = os.path.join(run_dir, f"phase_{phase}", "raw_arrays")
+#             os.makedirs(raw_dir, exist_ok=True)
+#             np.save(os.path.join(raw_dir, "test_true_labels.npy"), y_true)
+#             np.save(os.path.join(raw_dir, "test_predicted_labels.npy"), y_pred)
+#             torch.save(energy, os.path.join(raw_dir, "test_joint_energy.pt"))
+#             np.save(
+#                 os.path.join(raw_dir, "test_confusion_matrix.npy"),
+#                 to_numpy(metrics["confusion_matrix"], dtype=np.int64),
+#             )
+
+#         checkpoint = str(
+#             history.get(
+#                 "checkpoint_path",
+#                 os.path.join(run_dir, f"phase_{phase}", "checkpoint.pth"),
+#             )
+#         )
+#         if not os.path.isfile(checkpoint):
+#             raise RuntimeError(f"Phase {phase} checkpoint was not created: {checkpoint}")
+
+#         phase_result = {
+#             "phase": phase,
+#             "status": status,
+#             "protocol_stop": False,
+#             "committed": True,
+#             "seen_classes": seen_classes,
+#             "training_time_sec": phase_training_time,
+#             "evaluation_time_sec": evaluation_time,
+#             "test_metrics": metrics,
+#             "replay_health": replay,
+#             "geometry_bank_diagnostics": diagnostics,
+#             "phase_geometry_certificate": phase_certificate,
+#             "geometry_overlap_review": overlap_review,
+#             "checkpoint": checkpoint,
+#             "report_text": report_text,
+#             "visualization_artifacts": visualization_artifacts,
+#         }
+#         phase_results.append(phase_result)
+#         save_json(
+#             os.path.join(reports_dir, "phase_result.json"),
+#             phase_result,
+#         )
+
+#         print(
+#             f"[Phase {phase} Test] OA={metrics['overall_accuracy']:.2f}% | "
+#             f"AA={metrics['average_accuracy']:.2f}% | "
+#             f"Old={metrics['old_accuracy']:.2f}% | New={metrics['new_accuracy']:.2f}% | "
+#             f"H={metrics['old_new_harmonic_mean']:.2f}% | "
+#             f"Q05={metrics['q05_energy_gap']:.4f}"
+#         )
+#         print(
+#             f"               Old->New={100.0 * metrics['old_to_new_invasion_rate']:.2f}% | "
+#             f"New->Old={100.0 * metrics['new_to_old_invasion_rate']:.2f}% | "
+#             f"TangentHelp={metrics['conditional_tangent_help_rate']:.4f} | "
+#             f"TangentHarm={metrics['conditional_tangent_harm_rate']:.4f}"
+#         )
+
+#     completed = [item for item in phase_results if "test_metrics" in item]
+#     if not completed:
+#         raise RuntimeError("The run completed no committed/evaluated phase")
+#     continual = build_continual_summary(phase_results)
+#     save_json(os.path.join(run_dir, "continual_summary.json"), continual)
+#     if bool(args.save_model_summary):
+#         save_model_summary(os.path.join(run_dir, "model_summary_final.txt"), model)
+
+#     payload = {
+#         "stack_build_id": STACK_BUILD_ID,
+#         "method": METHOD_NAME,
+#         "schema_version": BANK_SCHEMA_VERSION,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "run_index": int(run_index),
+#         "seed": int(args.seed),
+#         "run_dir": run_dir,
+#         "data_loading_time_sec": float(load_time),
+#         "phase_results": phase_results,
+#         "continual_summary": continual,
+#         "final_checkpoint": completed[-1]["checkpoint"],
+#         "strict_non_exemplar_verified": bool(dataset.assert_non_exemplar()),
+#         "external_sample_payload_released": set(retained_data) == {
+#             "protocol",
+#             "summary",
+#             "target_names",
+#             "raw_target_names",
+#             "label_policy",
+#             "num_classes",
+#         },
 #     }
-#     required = ["phase", "model_state", "geometry_bank_state", "seen_classes", "class_mappings", "runtime_contract", "args_resolved", "metrics"]
-#     missing = [k for k in required if k not in payload or payload[k] is None]
-#     if missing:
-#         raise RuntimeError(f"Checkpoint missing critical fields: {missing}")
+#     save_json(os.path.join(run_dir, "final_run_summary.json"), payload)
+#     print(
+#         f"[Run complete] final_phase={continual['final_phase']} | "
+#         f"FinalOA={continual['final_overall_accuracy']:.2f}% | "
+#         f"Forgetting={continual['average_forgetting']:.2f} | "
+#         f"BWT={continual['average_backward_transfer']:.2f}"
+#     )
 #     return payload
 
 
-# def save_phase_artifacts(
-#     phase_dir: str,
-#     model: torch.nn.Module,
-#     args: argparse.Namespace,
-#     phase_info: Dict[str, Any],
-#     history: Any,
-#     metrics: Dict[str, Any],
-#     diagnostics: Dict[str, Any],
-#     method_identity: Dict[str, Any],
-#     classification_report: Optional[Dict[str, Any]] = None,
-# ) -> Dict[str, str]:
-#     os.makedirs(phase_dir, exist_ok=True)
-#     paths = {
-#         "metrics": save_json(os.path.join(phase_dir, "metrics.json"), metrics),
-#         "diagnostics": save_json(os.path.join(phase_dir, "diagnostics.json"), diagnostics),
-#         "runtime_contract": save_json(os.path.join(phase_dir, "runtime_contract.json"), runtime_contract(args, phase_info)),
-#     }
-#     if classification_report is not None:
-#         paths["classification_report_info"] = save_json(os.path.join(phase_dir, "classification_report_info.json"), classification_report)
-#     if int(phase_info["phase"]) == 0:
-#         cert = getattr(model, "base_geometry_certificate", None)
-#         if cert is not None:
-#             paths["geometry_certificate"] = save_json(os.path.join(phase_dir, "geometry_certificate.json"), cert)
-#     cm = metrics.get("confusion_matrix", None)
-#     if isinstance(cm, np.ndarray):
-#         cm_path = os.path.join(phase_dir, "confusion_matrix.npy")
-#         np.save(cm_path, cm)
-#         paths["confusion_matrix"] = cm_path
-#     ckpt = checkpoint_payload(model, args, phase_info, history, metrics, diagnostics, method_identity)
-#     ckpt_path = os.path.join(phase_dir, f"phase_{int(phase_info['phase'])}_checkpoint.pt")
-#     torch.save(ckpt, ckpt_path)
-#     paths["checkpoint"] = ckpt_path
-#     return paths
-
-
-# def collect_trainer_diagnostics(trainer: Any, phase: int, phase_dir: str) -> Dict[str, Any]:
-#     candidates = [
-#         f"_last_phase_{int(phase)}_geometry_diagnostics",
-#         "_last_incremental_geometry_diagnostics",
-#         "_last_phase_geometry_diagnostics",
-#         "_last_geometry_diagnostics",
-#     ]
-#     if int(phase) == 0:
-#         candidates.insert(0, "_last_base_geometry_diagnostics")
-#     for attr in candidates:
-#         diag = getattr(trainer, attr, None)
-#         if isinstance(diag, dict) and diag:
-#             return _json_safe(diag)
-#     json_path = os.path.join(phase_dir, f"phase_{int(phase)}_geometry_diagnostics.json")
-#     if os.path.exists(json_path):
-#         with open(json_path, "r", encoding="utf-8") as f:
-#             return json.load(f)
-#     return {}
-
-
-# def call_phase_map_compat(model: torch.nn.Module, dataset: Any, phase: int, target_names: List[str], phase_dir: str, args: argparse.Namespace) -> None:
-#     if bool(args.skip_phase_maps):
-#         return
-#     try:
-#         sig = inspect.signature(predict_phase_grid)
-#         kwargs = {
-#             "model": model,
-#             "dataset_manager": dataset,
-#             "phase": int(phase),
-#             "target_names": target_names,
-#             "save_dir": os.path.join(phase_dir, "maps"),
-#             "device": args.device,
-#             "patch_size": args.patch_size,
-#             "classifier_mode": args.eval_classifier_mode,
-#             "semantic_mode": "identity",
-#             "class_cmap": args.viz_class_cmap,
-#             "background_color": args.viz_background_color,
-#             "save_numpy": args.viz_save_numpy,
-#         }
-#         predict_phase_grid(**{k: v for k, v in kwargs.items() if k in sig.parameters})
-#     except Exception as exc:
-#         print(f"[WARN] phase map generation failed: {exc}")
-
-
-# def assert_base_handoff_ready(model: torch.nn.Module, trainer: Any) -> None:
-#     if hasattr(model, "assert_base_handoff_ready"):
-#         phases = getattr(trainer.dataset, "phase_to_classes", None)
-#         try:
-#             base_ids = phase_to_classes_as_list(trainer.dataset)[0]
-#             model.assert_base_handoff_ready(base_ids, freeze=True, strict=True)
-#             return
-#         except Exception:
-#             pass
-#     handoff = getattr(model, "base_handoff", None) or getattr(trainer, "base_handoff", None) or getattr(trainer, "_last_base_handoff", None)
-#     cert = getattr(model, "base_geometry_certificate", None) or getattr(trainer, "_last_base_geometry_certificate", None)
-#     if handoff is None and cert is None:
-#         raise RuntimeError("Base phase completed without base handoff/certificate. Incremental phase cannot be trusted.")
-
-
-# def assert_incremental_phase_complete(model: torch.nn.Module, phase_info: Dict[str, Any]) -> None:
-#     if geometry_bank_state(model) is None:
-#         raise RuntimeError("Incremental phase ended without GeometryBank state.")
-#     if int(phase_info["phase"]) > 0 and not phase_info.get("old_classes"):
-#         raise RuntimeError("Incremental phase missing old classes in phase_info.")
-
-
-# def run_phase(
-#     *,
-#     trainer: Trainer,
-#     model: torch.nn.Module,
-#     dataset: Any,
-#     evaluator: Any,
-#     args: argparse.Namespace,
-#     phase_info: Dict[str, Any],
-#     target_names: List[str],
-#     run_dir: str,
-#     method_identity: Dict[str, Any],
-# ) -> Dict[str, Any]:
-#     phase = int(phase_info["phase"])
-#     phase_dir = os.path.join(run_dir, f"phase_{phase}")
-#     os.makedirs(phase_dir, exist_ok=True)
-#     if hasattr(dataset, "start_phase"):
-#         dataset.start_phase(phase)
-#     set_model_phase(model, phase_info)
-#     print("\n" + "=" * 88)
-#     print(f"[Phase {phase}] old={phase_info['old_classes']} | new={phase_info['new_classes']} | seen={phase_info['seen_classes']}")
-#     print("=" * 88)
-
-#     epochs = int(args.epochs_base if phase == 0 else args.epochs_inc)
-#     lr = float(args.lr if phase == 0 else (args.lr_inc if args.lr_inc > 0 else args.lr))
-
-#     if phase > 0 and hasattr(trainer, "_assert_incremental_preflight"):
-#         trainer._assert_incremental_preflight(phase, int(len(phase_info["old_classes"])))
-#         print(f"[Incremental Preflight PASS] phase={phase}")
-
-#     t0 = time.time()
-#     if phase == 0 and hasattr(trainer, "train_base_phase"):
-#         history = trainer.train_base_phase(phase=0, epochs=epochs, batch_size=args.batch_size, lr=lr)
-#         assert_base_handoff_ready(model, trainer)
-#     elif phase > 0 and hasattr(trainer, "train_incremental_phase"):
-#         history = trainer.train_incremental_phase(phase=phase, epochs=epochs, batch_size=args.batch_size, lr=lr)
-#         assert_incremental_phase_complete(model, phase_info)
-#     else:
-#         history = trainer.train_phase(phase=phase, epochs=epochs, batch_size=args.batch_size, lr=lr)
-#     train_time = time.time() - t0
-
-#     print(f"[Eval] phase={phase} cumulative seen-class evaluation")
-#     e0 = time.time()
-#     y_pred, y_true, pred_diag = get_phase_predictions(model, dataset, phase_info, torch.device(args.device), args, batch_size=args.batch_size)
-#     eval_time = time.time() - e0
-
-#     metrics = compute_phase_metrics(y_true, y_pred, phase_info)
-#     metrics["train_time_sec"] = train_time
-#     metrics["eval_time_sec"] = eval_time
-#     metrics["prediction_histogram"] = pred_diag.get("prediction_histogram", {})
-#     evaluator_update_compat(evaluator, phase, y_true, y_pred, int(len(phase_info["old_classes"])), phase_info["seen_classes"])
-#     if hasattr(evaluator, "print_summary"):
-#         evaluator.print_summary()
-#     report = save_classification_report_compat(
-#         evaluator=evaluator,
-#         phase=phase,
-#         y_true=y_true,
-#         y_pred=y_pred,
-#         target_names=target_names,
-#         phase_dir=phase_dir,
-#         seen_classes=phase_info["seen_classes"],
-#         old_class_count=int(len(phase_info["old_classes"])),
-#         enabled=bool(args.save_classification_report),
-#         tr_time=train_time,
-#         te_time=eval_time,
-#     )
-#     diagnostics = collect_trainer_diagnostics(trainer, phase, phase_dir)
-#     diagnostics["prediction_histogram"] = pred_diag.get("prediction_histogram", {})
-#     diagnostics["phase_info"] = phase_info
-#     paths = save_phase_artifacts(phase_dir, model, args, phase_info, history, metrics, diagnostics, method_identity, classification_report=report)
-#     call_phase_map_compat(model, dataset, phase, target_names, phase_dir, args)
-#     return {
-#         "phase": phase,
-#         "phase_dir": phase_dir,
-#         "phase_info": phase_info,
-#         "history": history,
-#         "metrics": _json_safe(metrics),
-#         "diagnostics": diagnostics,
-#         "artifact_paths": paths,
-#         "classification_report": report,
-#         "train_time_sec": train_time,
-#         "eval_time_sec": eval_time,
-#     }
-
-
-# def determine_total_phases(dataset: Any, args: argparse.Namespace) -> int:
-#     phases = phase_to_classes_as_list(dataset)
-#     dataset_total = int(getattr(dataset, "num_phases", len(phases)))
-#     if dataset_total != len(phases):
-#         print(f"[WARN] dataset.num_phases={dataset_total} but len(phase_to_classes)={len(phases)}. Using phase_to_classes.")
-#         dataset_total = len(phases)
-#     if bool(args.base_only):
-#         return 1
-#     total = dataset_total
-#     if int(args.max_phases or 0) > 0:
-#         total = min(total, int(args.max_phases))
-#     elif int(args.max_train_phase or -1) >= 0:
-#         total = min(total, int(args.max_train_phase) + 1)
-#     return max(1, total)
-
-
-# def save_dataset_protocol_files(run_dir: str, data: Dict[str, Any], dataset: Any) -> Dict[str, str]:
-#     phases = phase_to_classes_as_list(dataset)
-#     phase_splits = {
-#         "num_phases": int(len(phases)),
-#         "class_order": _json_safe(getattr(dataset, "class_order", None)),
-#         "phase_to_classes": _json_safe(phases),
-#     }
-#     return {
-#         "dataset_summary": save_json(os.path.join(run_dir, "dataset_summary.json"), data["summary"]),
-#         "phase_splits": save_json(os.path.join(run_dir, "phase_splits.json"), phase_splits),
-#     }
-
-
-# def run_single_experiment(base_args: argparse.Namespace, run_idx: int, run_seed: int) -> Dict[str, Any]:
-#     raw_args = argparse.Namespace(**namespace_to_dict(base_args))
-#     raw_args.seed = int(run_seed)
-#     original = namespace_to_dict(raw_args)
-#     resolved, diff, method_identity = resolve_experiment_config(raw_args)
-#     validate_config(resolved)
-#     set_seed(resolved.seed, deterministic=bool(resolved.deterministic))
-
-#     run_tag = "base_only" if bool(resolved.base_only) else "pg_rga"
-#     run_dir = os.path.join(
-#         resolved.save_dir,
-#         resolved.dataset,
-#         f"patch_{resolved.patch_size}",
-#         f"{run_tag}_run_{run_idx + 1}_seed_{resolved.seed}",
-#     )
-#     os.makedirs(run_dir, exist_ok=True)
-#     resolved.run_dir = run_dir
-#     resolved.save_dir = run_dir
-
-#     save_config_files(run_dir, original, resolved, diff, method_identity)
-#     print("\n=== NECIL-HSI RUN ===")
-#     print(f"Run {run_idx + 1}/{base_args.num_runs} | seed={resolved.seed} | device={resolved.device}")
-#     print_config_summary(resolved, diff, method_identity)
-
-#     data = load_hsi_dataset(resolved)
-#     dataset = build_incremental_dataset(resolved, data)
-#     target_names = resolve_target_names(dataset, data["target_names"])
-#     if hasattr(dataset, "target_names"):
-#         dataset.target_names = target_names
-#     save_dataset_protocol_files(run_dir, data, dataset)
-
-#     device = torch.device(resolved.device)
-#     model = build_model(resolved, device)
-#     trainer = build_trainer(model, dataset, resolved, run_dir)
-#     evaluator = build_evaluator()
-
-#     phase_results: Dict[int, Dict[str, Any]] = {}
-#     total_phases = determine_total_phases(dataset, resolved)
-#     print(f"[Run] phases=0..{total_phases - 1} of dataset phases={getattr(dataset, 'num_phases', total_phases)}")
-#     start = time.time()
-#     for phase in range(total_phases):
-#         phase_info = get_phase_info(dataset, phase)
-#         phase_results[phase] = run_phase(
-#             trainer=trainer,
-#             model=model,
-#             dataset=dataset,
-#             evaluator=evaluator,
-#             args=resolved,
-#             phase_info=phase_info,
-#             target_names=target_names,
-#             run_dir=run_dir,
-#             method_identity=method_identity,
+# def aggregate_runs(results: Sequence[Mapping[str, Any]], root: str) -> Dict[str, Any]:
+#     if not results:
+#         raise ValueError("results is empty")
+#     rows: List[Dict[str, Any]] = []
+#     for result in results:
+#         summary = result["continual_summary"]
+#         rows.append(
+#             {
+#                 "run_index": int(result["run_index"]),
+#                 "seed": int(result["seed"]),
+#                 "final_phase": int(summary["final_phase"]),
+#                 "final_overall_accuracy": float(summary["final_overall_accuracy"]),
+#                 "final_average_accuracy": float(summary["final_average_accuracy"]),
+#                 "final_minimum_per_class_accuracy": float(
+#                     summary["final_minimum_per_class_accuracy"]
+#                 ),
+#                 "average_forgetting": float(summary["average_forgetting"]),
+#                 "average_backward_transfer": float(
+#                     summary["average_backward_transfer"]
+#                 ),
+#                 "protocol_stopped": bool(summary["protocol_stopped"]),
+#                 "run_dir": str(result["run_dir"]),
+#             }
 #         )
 
-#     elapsed = time.time() - start
-#     final_phase = max(phase_results)
-#     final_metrics = phase_results[final_phase]["metrics"]
-#     final_phase_info = get_phase_info(dataset, final_phase)
-#     final_results = {
-#         "run_idx": run_idx,
-#         "seed": int(resolved.seed),
-#         "run_dir": run_dir,
-#         "elapsed_sec": elapsed,
-#         "final_phase": int(final_phase),
-#         "final_metrics": final_metrics,
-#         "phase_results": _json_safe(phase_results),
-#         "method_identity": method_identity,
-#         "runtime_contract": runtime_contract(resolved, final_phase_info),
-#         "evaluator": evaluator.to_dict() if hasattr(evaluator, "to_dict") else None,
-#     }
-#     save_json(os.path.join(run_dir, "final_results.json"), final_results)
-#     torch.save(
-#         checkpoint_payload(model, resolved, final_phase_info, None, final_metrics, {}, method_identity),
-#         os.path.join(run_dir, "final_model.pt"),
-#     )
-#     try:
-#         history = {}
-#         for pr in phase_results.values():
-#             h = pr.get("history", {})
-#             if isinstance(h, dict):
-#                 for k, v in h.items():
-#                     if isinstance(v, list):
-#                         history.setdefault(k, []).extend(v)
-#         if history:
-#             plot_training_history(history, os.path.join(run_dir, "training_history.png"))
-#     except Exception as exc:
-#         print(f"[WARN] Could not plot training history: {exc}")
-#     write_run_report(os.path.join(run_dir, "PG_RGA_HSI_RUN_REPORT.txt"), resolved, final_results)
-#     print(f"[Done] run_dir={run_dir} | final_OA={float(final_metrics.get('overall_accuracy', 0.0)):.2f} | final_HM={float(final_metrics.get('hm', 0.0)):.2f}")
-#     return final_results
-
-
-# def write_run_report(path: str, args: argparse.Namespace, result: Dict[str, Any]) -> None:
-#     os.makedirs(os.path.dirname(path), exist_ok=True)
-#     with open(path, "w", encoding="utf-8") as f:
-#         f.write(f"NECIL-HSI Run Report - {args.dataset}\n")
-#         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-#         f.write("=" * 80 + "\n")
-#         f.write(json.dumps(_json_safe(result["method_identity"]), indent=2) + "\n\n")
-#         f.write("Phase metrics\n")
-#         f.write("-" * 80 + "\n")
-#         for p, pr in sorted((result.get("phase_results", {}) or {}).items(), key=lambda kv: int(kv[0])):
-#             m = pr.get("metrics", {}) or {}
-#             info = pr.get("phase_info", {}) or {}
-#             f.write(
-#                 f"Phase {p}: OA={float(m.get('overall_accuracy', 0.0)):.2f} | "
-#                 f"Old={float(m.get('old_accuracy', 0.0)):.2f} | New={float(m.get('new_accuracy', 0.0)):.2f} | "
-#                 f"HM={float(m.get('hm', 0.0)):.2f} | seen={info.get('seen_classes', [])}\n"
-#             )
-#         f.write("\nFinal metrics\n")
-#         f.write(json.dumps(_json_safe(result.get("final_metrics", {})), indent=2) + "\n")
-#     print(f"[Report] {path}")
-
-
-# def aggregate_runs(results: List[Dict[str, Any]], root_dir: str) -> Dict[str, Any]:
-#     os.makedirs(root_dir, exist_ok=True)
-#     rows = []
-#     for r in results:
-#         m = r.get("final_metrics", {}) or {}
-#         rows.append({
-#             "run_idx": int(r.get("run_idx", 0)),
-#             "seed": int(r.get("seed", 0)),
-#             "run_dir": r.get("run_dir", ""),
-#             "final_phase": int(r.get("final_phase", 0)),
-#             "overall_accuracy": float(m.get("overall_accuracy", 0.0)),
-#             "old_accuracy": float(m.get("old_accuracy", 0.0)),
-#             "new_accuracy": float(m.get("new_accuracy", 0.0)),
-#             "hm": float(m.get("hm", 0.0)),
-#         })
-
 #     def mean_std(key: str) -> Tuple[float, float]:
-#         arr = np.asarray([row[key] for row in rows], dtype=np.float64)
-#         return (float(arr.mean()), float(arr.std(ddof=0))) if arr.size else (0.0, 0.0)
+#         values = np.asarray([float(row[key]) for row in rows], dtype=np.float64)
+#         return float(values.mean()), float(values.std(ddof=0))
 
 #     summary = {
-#         "num_runs": len(results),
-#         "rows": rows,
-#         "overall_accuracy_mean_std": mean_std("overall_accuracy"),
-#         "old_accuracy_mean_std": mean_std("old_accuracy"),
-#         "new_accuracy_mean_std": mean_std("new_accuracy"),
-#         "hm_mean_std": mean_std("hm"),
+#         "stack_build_id": STACK_BUILD_ID,
+#         "method": METHOD_NAME,
+#         "joint_factorization": JOINT_FACTORIZATION,
+#         "num_runs": len(rows),
+#         "runs": rows,
+#         "final_overall_accuracy_mean_std": mean_std("final_overall_accuracy"),
+#         "final_average_accuracy_mean_std": mean_std("final_average_accuracy"),
+#         "final_minimum_class_accuracy_mean_std": mean_std(
+#             "final_minimum_per_class_accuracy"
+#         ),
+#         "average_forgetting_mean_std": mean_std("average_forgetting"),
+#         "average_backward_transfer_mean_std": mean_std(
+#             "average_backward_transfer"
+#         ),
 #     }
-#     save_json(os.path.join(root_dir, "runs_summary.json"), summary)
-#     csv_path = os.path.join(root_dir, "runs_summary.csv")
-#     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-#         fieldnames = list(rows[0].keys()) if rows else ["run_idx", "seed", "run_dir", "overall_accuracy", "old_accuracy", "new_accuracy", "hm"]
-#         writer = csv.DictWriter(f, fieldnames=fieldnames)
+#     os.makedirs(root, exist_ok=True)
+#     save_json(os.path.join(root, "multi_run_summary.json"), summary)
+#     csv_path = os.path.join(root, "multi_run_summary.csv")
+#     with open(csv_path, "w", newline="", encoding="utf-8") as stream:
+#         writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
 #         writer.writeheader()
-#         for row in rows:
-#             writer.writerow(row)
-#     summary["runs_summary_csv"] = csv_path
+#         writer.writerows(rows)
+#     summary["csv_path"] = csv_path
 #     return summary
 
 
-# def main(argv: Optional[List[str]] = None) -> None:
-#     args = parse_args(argv)
-#     preview_args = argparse.Namespace(**namespace_to_dict(args))
-#     resolved, _, _ = resolve_experiment_config(preview_args)
-#     seeds = parse_seed_list(getattr(resolved, "seed_list", "")) or [int(resolved.seed) + i for i in range(int(resolved.num_runs))]
-#     if len(seeds) != int(resolved.num_runs):
-#         raise ValueError("seed_list length must match num_runs.")
-
-#     results: List[Dict[str, Any]] = []
-#     for run_idx, seed in enumerate(seeds):
-#         run_args = argparse.Namespace(**namespace_to_dict(args))
-#         run_args.seed = int(seed)
-#         results.append(run_single_experiment(run_args, run_idx, int(seed)))
-
-#     root_dir = os.path.join(resolved.save_dir, resolved.dataset, f"patch_{resolved.patch_size}")
-#     summary = aggregate_runs(results, root_dir)
-#     print("\n=== MULTI-RUN SUMMARY ===")
-#     print(f"runs={summary['num_runs']} | OA={summary['overall_accuracy_mean_std'][0]:.2f}±{summary['overall_accuracy_mean_std'][1]:.2f} | HM={summary['hm_mean_std'][0]:.2f}±{summary['hm_mean_std'][1]:.2f}")
-#     print(f"Saved: {os.path.join(root_dir, 'runs_summary.json')}")
-#     print(f"Saved: {summary['runs_summary_csv']}")
+# def main(argv: Optional[Sequence[str]] = None) -> None:
+#     parsed = parse_args(argv)
+#     preview = resolve_config(parsed)
+#     validate_config(preview)
+#     seeds = parse_seed_list(preview.seed_list)
+#     if seeds is None:
+#         seeds = [int(preview.seed) + index for index in range(int(preview.num_runs))]
+#     results = [
+#         run_single_experiment(parsed, run_index=index, seed=seed)
+#         for index, seed in enumerate(seeds)
+#     ]
+#     root = os.path.join(
+#         os.path.abspath(str(preview.save_dir)),
+#         str(preview.dataset),
+#         f"base_{int(preview.base_classes)}_inc_{int(preview.increment)}",
+#     )
+#     summary = aggregate_runs(results, root)
+#     final_mean, final_std = summary["final_overall_accuracy_mean_std"]
+#     aa_mean, aa_std = summary["final_average_accuracy_mean_std"]
+#     forgetting_mean, forgetting_std = summary["average_forgetting_mean_std"]
+#     print("\n" + "=" * 104)
+#     print("PC-STGB STRICT NECIL MULTI-RUN SUMMARY")
+#     print("=" * 104)
+#     print(
+#         f"runs={summary['num_runs']} | FinalOA={final_mean:.2f}±{final_std:.2f} | "
+#         f"FinalAA={aa_mean:.2f}±{aa_std:.2f} | "
+#         f"Forgetting={forgetting_mean:.2f}±{forgetting_std:.2f}"
+#     )
+#     print(f"[Saved] {os.path.join(root, 'multi_run_summary.json')}")
 
 
 # if __name__ == "__main__":
 #     main()
+
 
